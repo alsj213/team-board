@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "team-board"
+version = "0.1.0"
+description = "Command-line board viewer for team tasks"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+team-board = "team_board.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
