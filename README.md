@@ -200,6 +200,20 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
 python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/python -m pytest -q
 ```
 
+### 本地跑静态检查
+
+装开发依赖（版本锁在 `pyproject.toml` 的 `dev` extras 里）：`pip install -e ".[dev]"`。
+
+```
+python -m ruff check src tests
+python -m mypy
+python -m bandit -r src -q --severity-level all --confidence-level all
+PYTHONPATH=src TZ=Asia/Shanghai python -m pytest -q
+```
+
+前三条分别是风格/未使用残留、类型、明显安全写法；CI 上同名三个 job（`ruff (3.12)` /
+`mypy (3.12)` / `bandit (3.12)`）会拦下这三类问题，pytest job 拦测试退化。
+
 跑真实库看效果：
 
 ```

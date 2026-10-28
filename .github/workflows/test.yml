@@ -29,3 +29,60 @@ jobs:
           PYTHONPATH: src
           TZ: Asia/Shanghai
         run: python -m pytest -q
+
+  ruff:
+    name: ruff (3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 工具版本只从 pyproject 的 [project.optional-dependencies].dev 来
+      - name: Install dev tools
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run ruff
+        run: python -m ruff check src tests
+
+  mypy:
+    name: mypy (3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev tools
+        run: python -m pip install -e ".[dev]"
+
+      # files / mypy_path 由 pyproject 的 [tool.mypy] 给
+      - name: Run mypy
+        run: python -m mypy
+
+  bandit:
+    name: bandit (3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev tools
+        run: python -m pip install -e ".[dev]"
+
+      # 只扫 src：pytest 断言的 B101 是噪声
+      - name: Run bandit
+        run: python -m bandit -r src -q --severity-level all --confidence-level all
