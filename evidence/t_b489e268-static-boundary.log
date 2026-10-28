@@ -1,0 +1,130 @@
+$ python -m ruff check no_such_path   # 不存在的路径 → 必须 rc=1
+E902 No such file or directory (os error 2)
+--> no_such_path:1:1
+
+Found 1 error.
+rc=1
+
+$ python -m mypy no_such_dir   # 不存在的目录 → 必须 rc=2
+no_such_dir: error: Cannot read file: No such file or directory
+Found 1 error in 1 file (errors prevented further checking)
+rc=2
+
+$ python -m bandit -r no_such_dir   # 不存在的目录 → bandit 只跳过，实测 rc=0（见下：带 B602 的探针才 rc=1）
+[main]	INFO	profile include tests: None
+[main]	INFO	profile exclude tests: None
+[main]	INFO	cli include tests: None
+[main]	INFO	cli exclude tests: None
+[main]	INFO	running on Python 3.14.7
+Run started:2026-10-28 16:04:59.340471+00:00
+
+Test results:
+	No issues identified.
+
+Code scanned:
+	Total lines of code: 0
+	Total lines skipped (#nosec): 0
+	Total potential issues skipped due to specifically being disabled (e.g., #nosec BXXX): 0
+
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 0
+		Medium: 0
+		High: 0
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 0
+		High: 0
+Files skipped (1):
+	./no_such_dir (No such file or directory)
+rc=0
+
+$ python -m ruff check /home/liu/.hermes/profiles/engineer/cache/scratch/bad_ruff_probe.py   # 故意 F401 → 必须 rc=1
+F401 [*] `os` imported but unused
+ --> /home/liu/.hermes/profiles/engineer/cache/scratch/bad_ruff_probe.py:3:8
+  |
+1 | """边界自检用的临时文件（不在仓库内）：故意留一个未使用导入，让 ruff 报 F401。"""
+2 |
+3 | import os
+  |        ^^
+help: Remove unused import: `os`
+  |
+2 |
+  - import os
+  |
+
+Found 1 error.
+[*] 1 fixable with `--fix`.
+rc=1
+
+$ python -m bandit -r /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py   # 故意 B602/B607 → 必须 rc=1
+[main]	INFO	profile include tests: None
+[main]	INFO	profile exclude tests: None
+[main]	INFO	cli include tests: None
+[main]	INFO	cli exclude tests: None
+[main]	INFO	running on Python 3.14.7
+Run started:2026-10-28 16:04:59.537756+00:00
+
+Test results:
+>> Issue: [B404:blacklist] Consider possible security implications associated with the subprocess module.
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:3:0
+2	
+3	import subprocess
+4	
+
+--------------------------------------------------
+>> Issue: [B607:start_process_with_partial_path] Starting a process with a partial executable path
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:5:0
+4	
+5	subprocess.run("echo probe", shell=True)
+
+--------------------------------------------------
+>> Issue: [B602:subprocess_popen_with_shell_equals_true] subprocess call with shell=True seems safe, but may be changed in the future, consider rewriting without shell
+   Severity: Low   Confidence: High
+   CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
+   More Info: https://bandit.readthedocs.io/en/1.9.4/plugins/b602_subprocess_popen_with_shell_equals_true.html
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:5:0
+4	
+5	subprocess.run("echo probe", shell=True)
+
+--------------------------------------------------
+
+Code scanned:
+	Total lines of code: 3
+	Total lines skipped (#nosec): 0
+	Total potential issues skipped due to specifically being disabled (e.g., #nosec BXXX): 0
+
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 3
+		Medium: 0
+		High: 0
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 0
+		High: 3
+Files skipped (0):
+rc=1
+
+$ python -m mypy /home/liu/.hermes/profiles/engineer/cache/scratch/bad_mypy_probe.py   # 故意类型错 → 必须 rc=1
+/home/liu/.hermes/profiles/engineer/cache/scratch/bad_mypy_probe.py:8: error: Argument 1 to "add" has incompatible type "str"; expected "int"  [arg-type]
+Found 1 error in 1 file (checked 1 source file)
+rc=1
+
+$ python -m pytest -q no_such_test_file.py   # 不存在的测试文件 → 必须 rc=4
+ERROR: file or directory not found: no_such_test_file.py
+
+
+no tests ran in 0.00s
+rc=4
+

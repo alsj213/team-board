@@ -42,7 +42,7 @@ def test_empty_board_returns_zero_and_empty_array(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """全 archive / 无卡 → stdout 就是 `[]`，rc 0（不是列表的空板文案）。"""
-    path, _ = board
+    _path, _ = board
     empty = tmp_path / "empty.db"
     conn = sqlite3.connect(str(empty))
     try:

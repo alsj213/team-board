@@ -88,7 +88,8 @@ def test_load_tasks_ordered_by_created_at_then_id(
 
     keys = [(t.created_at, t.id) for t in tasks]
     assert keys == sorted(keys)
-    assert [t.id for t in tasks][0] == "t_done_yesterday"
+    assert [t.id for t in tasks]
+    assert next(t.id for t in tasks) == "t_done_yesterday"
     assert [t.id for t in tasks][-1] == "t_review_fresh"
 
 

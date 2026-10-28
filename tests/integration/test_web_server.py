@@ -51,6 +51,7 @@ def _running_server(db_path: str | Path, *, clock: int = FIXTURE_NOW) -> Iterato
     thread.start()
     try:
         host, port = server.server_address[0], server.server_address[1]
+        assert isinstance(host, str)
         yield f"http://{host}:{port}"
     finally:
         server.shutdown()
@@ -115,7 +116,8 @@ def test_api_board_200_shape_and_grouping(
     all_ids = {card["id"] for cards in columns.values() for card in cards}
     assert "t_archived_old" not in all_ids
     # 75 分钟降序在前；archived/todo/review 一张都不出现
-    assert [card["id"] for card in columns["running"]][0] == "t_running_stale"
+    assert [card["id"] for card in columns["running"]]
+    assert next(card["id"] for card in columns["running"]) == "t_running_stale"
     assert all_ids == {
         "t_running_stale",
         "t_running_fresh",
@@ -359,6 +361,7 @@ def test_make_server_really_binds_whitelisted_address(
     thread.start()
     try:
         host, port = server.server_address[0], server.server_address[1]
+        assert isinstance(host, str)
         status, _, body = _http(f"http://{host}:{port}", "/api/board")
     finally:
         server.shutdown()
