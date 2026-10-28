@@ -4,6 +4,12 @@
 - 0：成功
 - 1：数据源有问题（db.BoardError，连接失败或 render_* 抛的 BoardError）
 - 2：argparse 自己判定参数/子命令非法（含 ``--now`` 越界、``--date`` 非 YYYY-MM-DD）
+
+``branch-audit`` 子命令自己的退出码：
+- 0：无偏差
+- 1：发现偏差（提交归属 / checkout 偏移）
+- 2：参数或环境错误（``branches.AuditError`` → stderr ``错误: …``、stdout 空、
+  不冒 traceback；argparse 级坏参数照旧 rc2）
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import sys
 import time
 from datetime import date, datetime
 
-from . import commands, db, web
+from . import branches, commands, db, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -130,6 +136,35 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "member":
             sub.add_argument("name", help="成员名（对应 tasks.assignee）")
 
+    audit_cmd = subparsers.add_parser(
+        "branch-audit",
+        help="稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 / 2 参数或环境错误）",
+    )
+    audit_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要稽核的 git 仓库路径（默认当前目录）",
+    )
+    audit_cmd.add_argument(
+        "--main-branch",
+        default="main",
+        metavar="NAME",
+        help="主分支名（默认 main）",
+    )
+    audit_cmd.add_argument(
+        "--branch",
+        default=None,
+        metavar="NAME",
+        help="只稽核这一条分支（接受 wt/t_xxx 或 t_xxx；默认查全部卡分支）",
+    )
+    audit_cmd.add_argument(
+        "--allow-file",
+        default=None,
+        metavar="PATH",
+        help="豁免表路径（默认 <repo>/.team-board/branch-audit-allow.txt）",
+    )
+
     serve = subparsers.add_parser(
         "serve", help="启动只读 Web 看板（默认 127.0.0.1:8787）"
     )
@@ -194,9 +229,30 @@ def _run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_branch_audit(args: argparse.Namespace) -> int:
+    """``branch-audit`` 子命令：AuditError → stderr ``错误: …`` + rc2，不冒 traceback。"""
+
+    try:
+        report = branches.audit(
+            args.repo,
+            main_branch=args.main_branch,
+            only_branch=args.branch,
+            allow_file=args.allow_file,
+        )
+    except branches.AuditError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    print(branches.render_report(report))
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "branch-audit":
+        return _run_branch_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)
