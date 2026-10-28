@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import socket
 import sqlite3
 import threading
 import urllib.error
@@ -476,3 +477,194 @@ def test_summary_dirty_completed_at_500_json(
     assert set(error) == {"error"}
     assert error["error"]
     assert "Traceback (most recent call last)" not in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# 11) 错误路径收口：BLOB 行 → 500（不是断连）、写出失败静默、HEAD/OPTIONS/TRACE
+# --------------------------------------------------------------------------- #
+
+
+def _raw(
+    base: str, method: str, path: str
+) -> tuple[bytes, dict[str, str], bytes]:
+    """裸 socket 发一条 HTTP/1.1 请求。
+
+    返回 ``(状态行, 头, 体)``；服务端一个字节都没回就关掉连接时状态行是 ``b""``
+    —— 这正是「断连（不是 500）」的可观测形态，``urllib`` 会把异常包装掉。
+    """
+    host, port = base.split("://", 1)[1].rsplit(":", 1)
+    request = (
+        f"{method} {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+
+    chunks: list[bytes] = []
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(request)
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+
+    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n") if head else []
+    if not lines:
+        return b"", {}, b""
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, _, value = line.decode("iso-8859-1").partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return lines[0], headers, body
+
+
+def _blob_title(path: Path, task_id: str, payload: bytes) -> None:
+    """把某卡的 ``title`` 改成 BLOB —— 正常库写不出来，但迁移/外部工具能写。
+
+    ``db.load_tasks`` 原样读出 ``bytes``，``json.dumps`` 会抛
+    ``TypeError: Object of type bytes is not JSON serializable``。
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET title = ? WHERE id = ?",
+            (sqlite3.Binary(payload), task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_blob_title_500_json_not_disconnect(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BLOB 行 → 客户端拿到 500 + 可解析 JSON（不是 RemoteDisconnected）。
+
+    pm 实测的旧行为：序列化在 ``try`` 之外，``json.dumps`` 抛 TypeError 穿出
+    ``do_GET``，socketserver 打 traceback，客户端一个字节都收不到。
+    """
+    path, _ = board
+    _blob_title(path, "t_running_stale", b"\x00\x01not-utf8")
+
+    with _running_server(path) as base:
+        capsys.readouterr()
+        status, headers, body = _http(base, "/api/board")
+        again_status, _, again_body = _http(base, "/api/board")
+        html_status, _, html_body = _http(base, "/")
+        captured = capsys.readouterr()
+
+    assert status == 500
+    assert headers["Content-Type"].startswith("application/json")
+    assert headers["Content-Type"].endswith("charset=utf-8")
+    assert headers["Cache-Control"] == CACHE_CONTROL
+    assert int(headers["Content-Length"]) == len(body)
+    error = json.loads(body.decode("utf-8"))
+    assert set(error) == {"error"}
+    assert "JSON serializable" in error["error"]
+
+    # 线程没崩：同一个库再请求一次仍然是 500 + JSON，静态页仍 200
+    assert again_status == 500
+    assert "JSON serializable" in json.loads(again_body.decode("utf-8"))["error"]
+    assert html_status == 200
+    assert b"team-board" in html_body
+
+    assert "Traceback (most recent call last)" not in captured.err
+
+
+def test_broken_pipe_is_silent_and_server_survives(
+    board: tuple[Path, dict[str, str]],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """写出失败（模拟客户端已断开）→ 不打 traceback、服务仍在，后续 GET 200。
+
+    只让第一次 ``_send_json`` 抛 ``BrokenPipeError``，之后走原实现；断言客户端
+    收到**零字节**（不是 200 也不是 500 —— 对端已断，500 也写不出去），且同一
+    进程的下一次请求照常 200。
+    """
+    path, _ = board
+    original = web.BoardRequestHandler._send_json
+    fired = {"count": 0}
+
+    def flaky(self: web.BoardRequestHandler, status: int, obj: object) -> None:
+        if fired["count"] == 0:
+            fired["count"] += 1
+            raise BrokenPipeError("client went away")
+        original(self, status, obj)
+
+    monkeypatch.setattr(web.BoardRequestHandler, "_send_json", flaky)
+
+    with _running_server(path) as base:
+        capsys.readouterr()
+        status_line, _, raw_body = _raw(base, "GET", "/api/board")
+        status, headers, body = _http(base, "/api/board")
+        captured = capsys.readouterr()
+
+    assert status_line == b""  # 断连形态：一个字节都没写出去
+    assert raw_body == b""
+    assert fired["count"] == 1
+
+    # 服务进程/线程存活，后续请求正常
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert list(json.loads(body.decode("utf-8"))["columns"]) == [
+        "running",
+        "queued",
+        "blocked",
+        "done",
+    ]
+    assert "Traceback (most recent call last)" not in captured.err
+    assert "BrokenPipeError" not in captured.err
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "TRACE"])
+def test_head_options_trace_405(
+    board: tuple[Path, dict[str, str]], method: str
+) -> None:
+    """README:102-103「非 GET 一律 405 + {"error": ...}」：HEAD 只给头。"""
+    path, _ = board
+    with _running_server(path) as base:
+        status_line, headers, body = _raw(base, method, "/api/board")
+
+    # BaseHTTPRequestHandler 默认 protocol_version 是 HTTP/1.0，只认状态码
+    assert status_line.split(b" ")[1] == b"405"
+    assert headers["cache-control"] == CACHE_CONTROL
+    if method == "HEAD":
+        # HTTP 语义：HEAD 不写响应体
+        assert body == b""
+        assert headers["content-length"] == "0"
+    else:
+        assert headers["content-type"].startswith("application/json")
+        assert json.loads(body.decode("utf-8")) == {"error": "method not allowed"}
+
+
+def test_index_html_guards_response_ok_and_renders_error_line() -> None:
+    """前端结构断言（不跑浏览器）：只渲染 2xx，失败显示带状态码的错误行。"""
+    html = web.index_html()
+
+    # 1) 错误行元素存在，且样式里是「默认隐藏、加类才显示」
+    assert 'id="error"' in html
+    assert "#error.visible { display: block; }" in html
+
+    # 2) 两个接口都必须查 response.ok，且渲染发生在检查之后
+    ok_check = html.index("if (!responses[0].ok || !responses[1].ok)")
+    assert "!response.ok" in html  # 逐个响应检查（grep 口径的 response.ok）
+    assert ok_check < html.index("return !response.ok;")
+    assert ok_check < html.index("const failed = responses.filter")
+    assert ok_check < html.index("renderSummary(summary)")
+    assert ok_check < html.index("renderBoard(board)")
+
+    # 3) 失败分支：文案带 HTTP 状态码 + return（不往下渲染）+ 用 textContent
+    assert html.index('"刷新失败（HTTP " + failed.status + "）"') > ok_check
+    assert html.index("return;", ok_check) < html.index("renderSummary(summary)")
+    assert "box.textContent = text;" in html
+    assert "innerHTML" not in html
+    assert "clearError();" in html  # 成功一次后错误行消失
+
+    # 4) 5s 周期与自动刷新开关原样保留
+    assert "const REFRESH_MS = 5000;" in html
+    assert web.REFRESH_MS == 5000
+    assert 'id="autorefresh" checked' in html
