@@ -44,11 +44,20 @@ jobs:
           python-version: "3.12"
       - name: Fetch all branches
         run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      # 为什么要先抓一份 src：pull_request 事件上 actions/checkout 检出的是一棵
+      # 树，接着为了让规则 B（主 checkout 必须在 main）成立要把检出切回 main ——
+      # 一切换，工作区里就是 main 的代码，`python -m team_board.cli` 会退化成
+      # 老版本（实测报 `invalid choice: 'branch-audit'`）。所以先把 PR 自己的
+      # 代码归档到 RUNNER_TEMP，切回 main 后再用这份 src 跑稽核。
+      - name: Stage the PR's own source (audit must run this build, not main)
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-src"
+          git archive HEAD src | tar -x -C "$RUNNER_TEMP/pr-src"
       - name: Put the runner checkout back on main
         run: git checkout -B main origin/main
       - name: Run branch audit
         env:
-          PYTHONPATH: src
+          PYTHONPATH: ${{ runner.temp }}/pr-src/src
           HEAD_REF: ${{ github.head_ref }}
         run: |
           if [ -n "$HEAD_REF" ]; then
