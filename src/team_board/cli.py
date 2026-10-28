@@ -13,8 +13,11 @@ import sys
 import time
 from datetime import date, datetime
 
-from . import commands, db
+from . import commands, db, web
 from .model import DEFAULT_DB
+
+#: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
+_LOCAL_BINDS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _parse_date(value: str) -> date:
@@ -42,6 +45,29 @@ def _parse_now(value: str) -> int:
             f"基准时间超出可表示范围: {value!r}"
         ) from exc
     return epoch
+
+
+def _parse_port(value: str) -> int:
+    """``serve --port``：整数且 1 <= n <= 65535，否则 rc2。
+
+    0 与负数都不放行（``0`` 只对 ``web.make_server`` 内部有意义，CLI 层不暴露）。
+    """
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"端口应为 1-65535 的整数: {value!r}") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"端口超出 1-65535: {value!r}")
+    return port
+
+
+def _parse_bind(value: str) -> str:
+    """``serve --bind``：只接受本机地址，其它（含 ``0.0.0.0``、空串）rc2。"""
+    if value not in _LOCAL_BINDS:
+        raise argparse.ArgumentTypeError(
+            f"只允许本机地址 127.0.0.1 / localhost / ::1: {value!r}"
+        )
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,12 +109,76 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "member":
             sub.add_argument("name", help="成员名（对应 tasks.assignee）")
 
+    serve = subparsers.add_parser(
+        "serve", help="启动只读 Web 看板（默认 127.0.0.1:8787）"
+    )
+    serve.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径（默认 {DEFAULT_DB}）",
+    )
+    serve.add_argument(
+        "--port",
+        type=_parse_port,
+        default=8787,
+        metavar="PORT",
+        help="监听端口（1-65535，默认 8787）",
+    )
+    serve.add_argument(
+        "--bind",
+        type=_parse_bind,
+        default="127.0.0.1",
+        metavar="ADDR",
+        help="监听地址（只允许 127.0.0.1 / localhost / ::1）",
+    )
+
     return parser
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    """``serve`` 子命令：先验库可读 → 起服务 → 阻塞到 Ctrl-C。
+
+    - 库不可读（BoardError）→ stderr ``错误: …`` + rc1，不进入 listen；
+    - 端口被占等 OSError → stderr ``错误: 无法监听 …`` + rc1；
+    - Ctrl-C 收尾 → rc0，``finally`` 里一定 ``server_close()``。
+    """
+    try:
+        db.connect(args.db).close()
+    except db.BoardError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        server = web.make_server(args.db, bind=args.bind, port=args.port)
+    except OSError as exc:
+        print(
+            f"错误: 无法监听 {args.bind}:{args.port}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        print(
+            f"服务已启动: http://{args.bind}:{args.port}/ "
+            f"（数据库 {args.db}，只读；Ctrl-C 退出）",
+            flush=True,
+        )
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        return _run_serve(args)
 
     now = args.now if args.now is not None else int(time.time())
 

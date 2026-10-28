@@ -1,14 +1,22 @@
-"""Web UI 的数据装配层：只做「算 + 拼数据」，不含任何 HTTP。
+"""Web 层：payload 装配（纯函数）+ 只读 HTTP 服务。
 
-本模块只对外提供三个 payload 构造函数与一个 HTML 常量函数，全部是纯函数：
-不读环境、不打印、不碰数据库、不 import ``http.server``。HTTP 层在 W2 里追加。
+上半部分是纯函数：三个 payload 构造函数与一个 HTML 常量函数，不读环境、
+不打印、不碰数据库。下半部分（``BoardRequestHandler`` / ``make_server``）是
+HTTP 适配：每个请求现开一条 ``mode=ro`` 连接、用完即关，只提供 GET，
+任何写接口都不存在。
 """
 
 from __future__ import annotations
 
 import datetime
+import http.server
+import json
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Callable
 
-from . import commands, fmt
+from . import commands, db, fmt
 from .model import TITLE_MAX, Task
 
 #: 页面上的四列，顺序即渲染顺序（不再有第五列）
@@ -249,3 +257,107 @@ start();
 </body>
 </html>
 """
+
+
+class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
+    """只读看板的 HTTP 入口：GET /、/api/board、/api/summary，其余一律拒绝。
+
+    - 路由只看 ``urlsplit(self.path).path``：查询串被忽略，``/api/board?x=1``
+      等同 ``/api/board``；
+    - 每个 API 请求现开一条只读连接、``finally`` 里 close，绝不把连接挂到
+      server 上长期复用；
+    - 数据库不可用（``db.BoardError``）→ 500 + ``{"error": ...}``，不打
+      traceback、不崩线程；
+    - 非 GET → 405 + ``{"error": "method not allowed"}``，没有任何写接口。
+    """
+
+    server_version = "team-board"
+
+    def _send_body(self, status: int, content_type: str, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status: int, obj: Any) -> None:
+        self._send_body(
+            status,
+            "application/json; charset=utf-8",
+            json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+        )
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
+        path = urllib.parse.urlsplit(self.path).path
+        server: Any = self.server
+
+        if path == "/":
+            self._send_body(
+                200, "text/html; charset=utf-8", index_html().encode("utf-8")
+            )
+            return
+
+        if path not in ("/api/board", "/api/summary"):
+            self._send_json(404, {"error": "not found"})
+            return
+
+        now = server.board_clock()
+        conn = None
+        try:
+            conn = db.connect(server.board_db_path)
+            tasks = db.load_tasks(conn)
+            if path == "/api/board":
+                payload = board_payload(tasks, now)
+            else:
+                rework = db.load_rework_counts(conn)
+                payload = summary_payload(
+                    tasks,
+                    rework,
+                    now,
+                    datetime.datetime.fromtimestamp(now).date(),
+                )
+        except db.BoardError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        self._send_json(200, payload)
+
+    def _method_not_allowed(self) -> None:
+        self._send_json(405, {"error": "method not allowed"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+
+def make_server(
+    db_path: str | Path,
+    *,
+    bind: str = "127.0.0.1",
+    port: int = 8787,
+    clock: Callable[[], int] | None = None,
+) -> http.server.ThreadingHTTPServer:
+    """建一个未启动的只读 HTTP server。
+
+    - 端口合法性不在这里拦：``port=0`` 表示由内核挑临时端口（测试用，取
+      ``server.server_address[1]``），范围校验归 CLI 层；
+    - ``clock`` 注入当前时间（epoch 秒），缺省 ``time.time()``，测试靠它固定
+      ``snapshot`` / ``date`` / 耗时。
+    """
+    server = http.server.ThreadingHTTPServer((bind, port), BoardRequestHandler)
+    server.daemon_threads = True
+    server.board_db_path = str(db_path)  # type: ignore[attr-defined]
+    server.board_clock = clock or (lambda: int(time.time()))  # type: ignore[attr-defined]
+    return server
