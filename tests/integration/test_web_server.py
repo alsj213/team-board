@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import datetime
 import hashlib
@@ -275,7 +276,11 @@ def test_broken_db_500_and_server_survives(
         assert headers["Cache-Control"] == CACHE_CONTROL
         error = json.loads(body.decode("utf-8"))
         assert set(error) == {"error"}
-        assert "不是合法的 SQLite 库" in error["error"]
+        # 500 响应体只给稳定类别 + 一句话：不带路径、表名、SQLite 原文
+        assert error["error"].startswith("source_unavailable: ")
+        assert str(path) not in error["error"]
+        assert "SQLite" not in error["error"]
+        assert "no such table" not in error["error"]
 
         # 库坏了不影响静态页：进程/线程没崩
         html_status, _, html_body = _http(base, "/")
@@ -563,15 +568,26 @@ def test_blob_title_500_json_not_disconnect(
     assert int(headers["Content-Length"]) == len(body)
     error = json.loads(body.decode("utf-8"))
     assert set(error) == {"error"}
-    assert "JSON serializable" in error["error"]
+    # 序列化细节（Object of type bytes is not JSON serializable）不进响应体
+    assert error["error"].startswith("internal_error: ")
+    assert "JSON serializable" not in error["error"]
+    assert str(path) not in error["error"]
 
     # 线程没崩：同一个库再请求一次仍然是 500 + JSON，静态页仍 200
     assert again_status == 500
-    assert "JSON serializable" in json.loads(again_body.decode("utf-8"))["error"]
+    assert json.loads(again_body.decode("utf-8"))["error"].startswith(
+        "internal_error: "
+    )
     assert html_status == 200
     assert b"team-board" in html_body
 
     assert "Traceback (most recent call last)" not in captured.err
+    # 细节落在 stderr 的一行日志里（含方法 + 路径 + 异常名 + 原文）
+    log_lines = [line for line in captured.err.splitlines() if "[team-board] 500" in line]
+    assert log_lines
+    assert all("GET /api/board" in line for line in log_lines)
+    assert any("TypeError" in line and "JSON serializable" in line for line in log_lines)
+
 
 
 def test_broken_pipe_is_silent_and_server_survives(
@@ -668,3 +684,212 @@ def test_index_html_guards_response_ok_and_renders_error_line() -> None:
     assert "const REFRESH_MS = 5000;" in html
     assert web.REFRESH_MS == 5000
     assert 'id="autorefresh" checked' in html
+
+
+# --------------------------------------------------------------------------- #
+# 12) 缺 task_events 表：两个接口都 200（summary 不再依赖无关表）
+# --------------------------------------------------------------------------- #
+
+
+def _drop_task_events(path: Path) -> None:
+    """造一张「缺 task_events」的库：只读工具本身永远写不出来，迁移能。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DROP TABLE task_events")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_missing_task_events_keeps_both_apis_200(
+    board: tuple[Path, dict[str, str]],
+) -> None:
+    """``/api/summary`` 与 ``/api/board`` 在缺 ``task_events`` 时行为一致（都 200）。
+
+    旧行为：``/api/summary`` → 500 ``读取 task_events 失败: no such table: task_events``，
+    同页面上「一半有数、一半报错」。
+    """
+    path, _ = board
+    _drop_task_events(path)
+
+    with _running_server(path) as base:
+        board_status, _, board_body = _http(base, "/api/board")
+        summary_status, headers, summary_body = _http(base, "/api/summary")
+
+    assert board_status == 200
+    assert summary_status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    columns = json.loads(board_body.decode("utf-8"))["columns"]
+    assert "t_running_stale" in [card["id"] for card in columns["running"]]
+    summary = json.loads(summary_body.decode("utf-8"))
+    assert list(summary) == [
+        "snapshot",
+        "date",
+        "completed",
+        "running",
+        "blocked",
+        "anomaly",
+        "anomalies",
+    ]
+    assert (summary["completed"], summary["running"], summary["blocked"]) == (1, 2, 1)
+    assert summary["anomaly"] == 2
+
+
+def test_missing_task_events_cli_summary_still_needs_it(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """README 写的「命令行 `summary` / `member` 仍会读 task_events」有测试锁住。"""
+    path, _ = board
+    _drop_task_events(path)
+
+    rc_summary = cli.main(["summary", "--db", str(path), "--now", str(FIXTURE_NOW)])
+    err_summary = capsys.readouterr().err
+    assert rc_summary == 1
+    assert err_summary.startswith("错误: ")
+    assert "读取 task_events 失败" in err_summary
+
+    rc_member = cli.main(
+        ["member", "engineer", "--db", str(path), "--now", str(FIXTURE_NOW)]
+    )
+    err_member = capsys.readouterr().err
+    assert rc_member == 1
+    assert "读取 task_events 失败" in err_member
+
+    # list 不读 task_events，照常 rc0
+    assert cli.main(["list", "--db", str(path), "--now", str(FIXTURE_NOW)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out
+    assert captured.err == ""
+
+
+# --------------------------------------------------------------------------- #
+# 13) 起点时间戳是 13 位毫秒：两个接口都 500 data_invalid（不再静默 0 分钟）
+# --------------------------------------------------------------------------- #
+
+
+def _dirty_created_at(path: Path, task_id: str, value: int) -> None:
+    """把一张卡的 ``created_at`` 改成 13 位毫秒（``started_at`` 保持 NULL）。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?", (value, task_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_dirty_created_at_ms_500_data_invalid_on_both_endpoints(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``created_at`` 是 13 位毫秒 → 500 ``data_invalid``，且响应体不泄内部值。
+
+    旧行为：``max(0, …)`` 静默算成 0 分钟、接口 200 —— 数据错了也看不出来。
+    """
+    path, _ = board
+    _dirty_created_at(path, "t_null_start", THIRTEEN_DIGIT_MS)
+
+    with _running_server(path) as base:
+        capsys.readouterr()
+        board_status, _, board_body = _http(base, "/api/board")
+        summary_status, _, summary_body = _http(base, "/api/summary")
+        captured = capsys.readouterr()
+
+    for status, body in ((board_status, board_body), (summary_status, summary_body)):
+        assert status == 500
+        error = json.loads(body.decode("utf-8"))
+        assert set(error) == {"error"}
+        assert error["error"].startswith("data_invalid: ")
+        assert str(THIRTEEN_DIGIT_MS) not in error["error"]
+        assert "t_null_start" not in error["error"]
+
+    log_lines = [
+        line for line in captured.err.splitlines() if "[team-board] 500 data_invalid" in line
+    ]
+    assert len(log_lines) == 2
+    assert "GET /api/board" in log_lines[0] or "GET /api/summary" in log_lines[0]
+    assert all("t_null_start" in line for line in log_lines)
+    assert "Traceback (most recent call last)" not in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# 14) --port 严格十进制：int() 原本会静默接受的写法全部 rc2
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("value", [" 8787", "+8787", "1_000", "١٢٣"])
+def test_parse_port_rejects_int_style_strings(value: str) -> None:
+    """``int()`` 会接受这四种写法（空白 / 正号 / 下划线 / 非 ASCII 数字）。"""
+    assert int(value) > 0  # 旧解析器就是靠 int() 放行的
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+        cli._parse_port(value)
+    assert "ASCII 十进制整数" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "value", [" 8787", "+8787", "1_000", "١٢٣", "8787\n", "0x10", "8 7", ""]
+)
+def test_serve_port_non_plain_decimal_exit_two(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["serve", "--port", value])
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# 15) README 与 --help 对齐：五个子命令、serve 无 --now
+# --------------------------------------------------------------------------- #
+
+
+def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
+    return {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+
+
+def test_readme_and_help_agree_on_five_subcommands() -> None:
+    """README「五个子命令」与实际 parser 一致；serve 只认 ``--db/--port/--bind``。"""
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    parser = cli.build_parser()
+    subparsers = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    assert sorted(subparsers.choices) == [
+        "export",
+        "list",
+        "member",
+        "serve",
+        "summary",
+    ]
+    assert "五个子命令" in readme
+    assert "两个参数四个子命令" not in readme
+
+    for name in ("list", "summary", "member", "export"):
+        assert {"--db", "--now"} <= _option_strings(subparsers.choices[name])
+    serve_options = _option_strings(subparsers.choices["serve"])
+    assert {"--db", "--port", "--bind"} <= serve_options
+    assert "--now" not in serve_options
+
+    # serve 没有 --now：真跑一次拿到 rc2，而不是只比 help 文本
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["serve", "--now", str(FIXTURE_NOW)])
+    assert excinfo.value.code == 2
+
+
+def test_help_text_lists_all_five_subcommands() -> None:
+    """``team-board --help`` 的 {list,summary,member,export,serve} 与 README 同一组。"""
+    help_text = cli.build_parser().format_help()
+    for name in ("list", "summary", "member", "export", "serve"):
+        assert f"    {name} " in help_text or f"    {name}\n" in help_text
+    assert "{list,summary,member,export,serve}" in help_text
+

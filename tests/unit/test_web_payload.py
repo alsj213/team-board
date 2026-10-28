@@ -151,7 +151,7 @@ def _text_counts(text: str) -> tuple[int, int, int, int]:
 def test_summary_payload_matches_render_summary(board: Board) -> None:
     tasks, rework, ids = board
     text = commands.render_summary(tasks, rework, FIXTURE_NOW, DAY)
-    payload = web.summary_payload(tasks, rework, FIXTURE_NOW, DAY)
+    payload = web.summary_payload(tasks, FIXTURE_NOW, DAY)
 
     assert list(payload) == [
         "snapshot",
@@ -197,9 +197,9 @@ def test_summary_payload_matches_render_summary(board: Board) -> None:
 
 def test_summary_payload_numbers_come_from_summary_stats(board: Board) -> None:
     """payload 的四个数字必须与 commands.summary_stats 完全一致（同一份计算）。"""
-    tasks, rework, _ = board
+    tasks, _rework, _ = board
     stats = commands.summary_stats(tasks, FIXTURE_NOW, DAY)
-    payload = web.summary_payload(tasks, rework, FIXTURE_NOW, DAY)
+    payload = web.summary_payload(tasks, FIXTURE_NOW, DAY)
     assert payload["snapshot"] == datetime.datetime.fromtimestamp(
         stats.snapshot_ts
     ).strftime("%Y-%m-%d %H:%M")
@@ -221,8 +221,8 @@ def test_summary_payload_empty_board(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    tasks, rework = _load(path)
-    payload = web.summary_payload(tasks, rework, FIXTURE_NOW, DAY)
+    tasks, _ = _load(path)
+    payload = web.summary_payload(tasks, FIXTURE_NOW, DAY)
     assert payload["completed"] == 0
     assert payload["running"] == 0
     assert payload["blocked"] == 0
@@ -256,3 +256,81 @@ def test_index_html_is_self_contained() -> None:
     assert "innerHTML" not in html
     assert "<style>" in html and "<script>" in html
     assert "clearInterval" in html and "setInterval" in html
+
+
+def test_index_html_refresh_ms_has_single_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """刷新间隔只有一个来源：改 ``web.REFRESH_MS``，HTML 里的 ``const`` 跟着变。
+
+    如果 HTML 里还留着一份写死的 5000，这条断言在 monkeypatch 后就挂了 ——
+    这是「单源」的可执行证明，不是靠 grep 自证。
+    """
+    assert "const REFRESH_MS = 5000;" in web.index_html()
+
+    monkeypatch.setattr(web, "REFRESH_MS", 1234)
+    html = web.index_html()
+    assert "const REFRESH_MS = 1234;" in html
+    assert "const REFRESH_MS = 5000;" not in html
+    # 渲染完不再有模板占位符残留
+    assert "${" not in html
+
+
+# --- 6. 越界时间戳：不再静默算成 0 分钟 --------------------------------
+
+
+def _with_dirty_start(board: Board, value: int) -> list[Task]:
+    """把一张卡的起点改成脏值（13 位毫秒），返回新的 Task 列表。"""
+    tasks, *_ = board
+    return [
+        Task(
+            id=task.id,
+            title=task.title,
+            assignee=task.assignee,
+            status=task.status,
+            created_at=value if task.id == "t_null_start" else task.created_at,
+            started_at=task.started_at,
+            completed_at=task.completed_at,
+        )
+        for task in tasks
+    ]
+
+
+def test_board_payload_rejects_out_of_range_start(board: Board) -> None:
+    """``created_at`` 是 13 位毫秒时 ``board_payload`` 报 PayloadError。
+
+    旧行为：``Task.duration_minutes`` 的 ``max(0, …)`` 把它静默夹成 0 分钟，
+    接口照常 200 —— 数据错了却看不出来。
+    """
+    tasks = _with_dirty_start(board, 1793160000000)
+    # 先确认脏值真的会被静默夹成 0 分钟（这就是要拦掉的行为）
+    dirty = next(task for task in tasks if task.id == "t_null_start")
+    assert dirty.duration_minutes(FIXTURE_NOW) == 0
+
+    with pytest.raises(web.PayloadError) as excinfo:
+        web.board_payload(tasks, FIXTURE_NOW)
+    assert "t_null_start" in str(excinfo.value)
+
+
+def test_summary_payload_rejects_out_of_range_start(board: Board) -> None:
+    """同一个脏值在 ``/api/summary`` 侧也必须报错（两个接口同口径）。"""
+    tasks = _with_dirty_start(board, 1793160000000)
+    with pytest.raises(web.PayloadError):
+        web.summary_payload(tasks, FIXTURE_NOW, DAY)
+
+
+def test_summary_payload_signature_has_no_rework() -> None:
+    """``summary_payload`` 不再收 ``rework``：本层用不上，HTTP 层也就不必查表。"""
+    import inspect
+
+    params = list(inspect.signature(web.summary_payload).parameters)
+    assert params == ["tasks", "now", "day"]
+
+
+def test_public_error_messages_do_not_leak() -> None:
+    """对外 500 文案里不许出现路径、表名、SQLite 原文。"""
+    for category, reason in web.PUBLIC_ERRORS.items():
+        assert category in {"source_unavailable", "data_invalid", "internal_error"}
+        for needle in ("/", "task_events", "tasks", "SQLite", "no such table", "sqlite3"):
+            assert needle not in reason, (category, needle, reason)
+

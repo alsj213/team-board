@@ -11,6 +11,8 @@ from __future__ import annotations
 import datetime
 import http.server
 import json
+import string
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -31,8 +33,47 @@ _STATUS_TO_COLUMN = {
     "done": "done",
 }
 
-#: 前端自动刷新间隔（毫秒），与 index_html 里的 REFRESH_MS 一致
+#: 前端自动刷新间隔（毫秒）。``index_html`` 里的 ``const REFRESH_MS`` 由它渲染，
+#: 全仓只有这一处可改（改常量页面就跟着变，不存在第二份字面量）。
 REFRESH_MS = 5000
+
+#: 500 响应体允许出现的稳定错误类别 → 一句话原因。
+#: 原因里**不含**绝对路径、表名、SQLite 原文，也不含 ``str(exc)``；
+#: 细节只写 stderr（一行，含请求方法与路径）。
+PUBLIC_ERRORS = {
+    "source_unavailable": "看板数据源不可用，细节见服务端日志",
+    "data_invalid": "看板数据里存在无法表示的时间戳，细节见服务端日志",
+    "internal_error": "看板数据构建失败，细节见服务端日志",
+}
+
+
+class PayloadError(Exception):
+    """payload 构建期的数据问题（时间戳超出 ``datetime`` 可表示范围）。
+
+    由 HTTP 层收口成 500 + ``data_invalid``：对外只说类别，``str(exc)``
+    （任务 id、具体数值）只进 stderr。
+    """
+
+
+def _check_time_range(tasks: list[Task]) -> None:
+    """卡上的时间戳必须能被 ``datetime.fromtimestamp`` 表示。
+
+    13 位毫秒（``1793160000000``）这类脏值落在起点上是**静默**夹成 0 分钟
+    （``Task.duration_minutes`` 的 ``max(0, …)``），落在 ``completed_at`` 上
+    却在 ``summary_stats`` 里抛 ``ValueError`` —— 同一类脏数据两种行为。
+    这里统一成前者也报错：起点与终点都校验，两个接口口径一致，不再返回一个
+    看起来正常的 0 分钟。
+    """
+    for task in tasks:
+        for value in (task.start_ts(), task.completed_at):
+            if value is None:
+                continue
+            try:
+                datetime.datetime.fromtimestamp(value)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise PayloadError(
+                    f"任务 {task.id} 的时间戳超出可表示范围: {value!r}"
+                ) from exc
 
 
 def card_payload(task: Task, now: int) -> dict:
@@ -57,8 +98,11 @@ def board_payload(tasks: list[Task], now: int) -> dict:
     - 分组只看 ``_STATUS_TO_COLUMN``；不在表里的卡（archived / triage / todo /
       review）不进任何列，也不新建第五列；
     - 列内排序统一 ``(-duration_minutes(now), id)`` 升序；
-    - ``columns`` 的键顺序恒为 ``COLUMNS``；空列是 ``[]``。
+    - ``columns`` 的键顺序恒为 ``COLUMNS``；空列是 ``[]``；
+    - 卡上的时间戳越界（13 位毫秒等）→ ``PayloadError``（HTTP 层收口成 500），
+      不静默按 0 分钟出数。
     """
+    _check_time_range(tasks)
     grouped: dict[str, list[Task]] = {name: [] for name in COLUMNS}
     for task in tasks:
         column = _STATUS_TO_COLUMN.get(task.status or "")
@@ -77,7 +121,6 @@ def board_payload(tasks: list[Task], now: int) -> dict:
 
 def summary_payload(
     tasks: list[Task],
-    rework: dict[str, int],
     now: int,
     day: datetime.date,
 ) -> dict:
@@ -87,8 +130,12 @@ def summary_payload(
     - ``date``：``day.isoformat()``；
     - ``anomaly``：``len(stats.anomalies)``；``anomalies`` 顺序即 ``stats.anomalies``
       顺序，标题按 ``TITLE_MAX`` 截断（与文本一致）；
-    - ``rework`` 本层不用，保留参数以便与 ``render_summary`` 签名对齐。
+    - **不读 ``task_events``**：``render_summary`` 的 ``rework`` 参数本层用不上，
+      所以这里不再接它、HTTP 层也不再查（缺 ``task_events`` 表时本接口与
+      ``/api/board`` 行为一致 —— 都不 500，见 README「Web 看板（serve）」）；
+    - 卡上的时间戳越界（13 位毫秒等）→ ``PayloadError``，与 ``/api/board`` 同口径。
     """
+    _check_time_range(tasks)
     stats = commands.summary_stats(tasks, now, day)
     return {
         "snapshot": datetime.datetime.fromtimestamp(stats.snapshot_ts).strftime(
@@ -112,18 +159,11 @@ def summary_payload(
     }
 
 
-def index_html() -> str:
-    """整页 HTML（单文件、零外部引用：样式与脚本都内联）。
-
-    - 顶部 ``#summary`` 放四个计数 + 异常数；
-    - ``#summary`` 相邻的 ``#error`` 是刷新失败提示行：只在有接口不满足
-      ``response.ok`` 时出现，文案带 HTTP 状态码；刷新失败**不清空**上一帧，
-      成功一次后自动消失；
-    - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
-    - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
-    - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML。
-    """
-    return """<!doctype html>
+#: 整页 HTML 模板。用 ``string.Template`` 而不是 f-string：页面里 CSS 有上百个
+#: ``{`` / ``}``，f-string 得逐个转义、且以后加样式就会忘；``${REFRESH_MS}`` 是
+#: 唯一需要渲染的占位符（刷新间隔只有 ``REFRESH_MS`` 一个来源）。
+_PAGE_TEMPLATE = string.Template(
+    """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -181,7 +221,7 @@ def index_html() -> str:
   <section class="col" data-col="done"><h2>done</h2><div class="cards"></div></section>
 </main>
 <script>
-const REFRESH_MS = 5000;
+const REFRESH_MS = ${REFRESH_MS};
 const COLUMN_NAMES = ["running", "queued", "blocked", "done"];
 let timer = null;
 
@@ -296,6 +336,23 @@ start();
 </body>
 </html>
 """
+)
+
+
+def index_html() -> str:
+    """整页 HTML（单文件、零外部引用：样式与脚本都内联）。
+
+    - 顶部 ``#summary`` 放四个计数 + 异常数；
+    - ``#summary`` 相邻的 ``#error`` 是刷新失败提示行：只在有接口不满足
+      ``response.ok`` 时出现，文案带 HTTP 状态码；刷新失败**不清空**上一帧，
+      成功一次后自动消失；
+    - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
+    - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
+    - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML；
+    - ``const REFRESH_MS`` 由模块常量 ``REFRESH_MS`` 渲染（模板占位
+      ``${REFRESH_MS}``）：页面里没有第二份字面量，改常量页面就跟着变。
+    """
+    return _PAGE_TEMPLATE.substitute(REFRESH_MS=REFRESH_MS)
 
 
 class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -305,11 +362,15 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
       等同 ``/api/board``；
     - 每个 API 请求现开一条只读连接、``finally`` 里 close，绝不把连接挂到
       server 上长期复用；
-    - 数据库不可用（``db.BoardError``）→ 500 + ``{"error": ...}``，不打
-      traceback、不崩线程；
-    - payload 构建期的其它异常（13 位毫秒时间戳的 ``ValueError``、``sorted``
-      遇到 NULL id 的 ``TypeError`` 等）由 ``except Exception`` 同样收口成
-      500 + ``{"error": ...}``：``str(exc)`` 为空时回 ``type(exc).__name__``；
+    - 数据库不可用（``db.BoardError``）→ 500 + ``{"error": "source_unavailable: …"}``，
+      不打 traceback、不崩线程；
+    - payload 构建期的其它异常（卡上时间戳超出可表示范围的 ``PayloadError``、
+      ``sorted`` 遇到 NULL id 的 ``TypeError``、payload 里混进 bytes 导致
+      ``json.dumps`` 抛 ``TypeError`` 等）同样收口成 500：``PayloadError`` →
+      ``data_invalid``，其余 → ``internal_error``；
+    - **500 响应体一律脱敏**：只有 ``{"error": "<类别>: <一句话原因>"}``，
+      不含绝对路径、表名、SQLite 原文，也不含 ``str(exc)``；异常细节
+      （类型 + 原文，含请求方法/路径）写**一行** stderr，供运维排查；
     - 200 的序列化与写出在同一段 ``try`` 里：序列化失败 → 500 + JSON（客户
       端拿到状态码，不是断连）；客户端已断开（``BrokenPipeError`` /
       ``ConnectionResetError``）静默丢弃、不打 traceback、不再写第二遍；
@@ -332,6 +393,21 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         # 外层才能干净地改回 500 + ``{"error": ...}``。
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self._send_body(status, "application/json; charset=utf-8", body)
+
+    def _send_server_error(self, category: str, exc: BaseException) -> None:
+        """500 + 脱敏响应体；细节写一行 stderr（含请求方法 + 路径）。
+
+        响应体固定 ``{"error": "<category>: <一句话>"}``，内容全部来自
+        ``PUBLIC_ERRORS`` —— 不含绝对路径、表名、SQLite 原文，也不含
+        ``str(exc)``（那里可能就是 ``no such table: task_events``）。
+        """
+        print(
+            f"[team-board] 500 {category} {self.command} {self.path} "
+            f"<- {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._send_json(500, {"error": f"{category}: {PUBLIC_ERRORS[category]}"})
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
         try:
@@ -363,10 +439,10 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/api/board":
                 payload = board_payload(tasks, now)
             else:
-                rework = db.load_rework_counts(conn)
+                # 不查 task_events：summary_payload 用不上 rework（见其 docstring），
+                # 每请求白做一次全表 GROUP BY 还会让缺表把整个接口拖成 500。
                 payload = summary_payload(
                     tasks,
-                    rework,
                     now,
                     datetime.datetime.fromtimestamp(now).date(),
                 )
@@ -375,15 +451,16 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             # 客户端已断开：静默丢弃，不再尝试写第二遍（500 也写不出去）。
             return
         except db.BoardError as exc:
-            self._send_json(500, {"error": str(exc)})
+            self._send_server_error("source_unavailable", exc)
+        except PayloadError as exc:
+            self._send_server_error("data_invalid", exc)
         except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
-            # payload 层任何非 BoardError 异常（如 completed_at 是 13 位毫秒时
-            # datetime.fromtimestamp 抛 ValueError、id 为 NULL 时 sorted 抛
-            # TypeError，以及 payload 里混进 bytes 导致 json.dumps 抛
-            # TypeError）都在这里收口：回 500 + JSON、不把 traceback 交给
-            # socketserver、不让异常穿出线程。
+            # payload 层任何非预期异常（id 为 NULL 时 sorted 抛 TypeError、
+            # payload 里混进 bytes 导致 json.dumps 抛 TypeError 等）都在这里
+            # 收口：回 500 + JSON、不把 traceback 交给 socketserver、不让异常
+            # 穿出线程。响应体只给类别，细节进 stderr。
             # BrokenPipeError / ConnectionResetError 由 do_GET 的 except 先接。
-            self._send_json(500, {"error": str(exc) or type(exc).__name__})
+            self._send_server_error("internal_error", exc)
         finally:
             if conn is not None:
                 conn.close()
