@@ -15,8 +15,9 @@ import string
 import sys
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import commands, db, fmt
 from .model import TITLE_MAX, Task
@@ -405,7 +406,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             action()
         except ConnectionError:
             return
-        except Exception as exc:  # noqa: BLE001 - 兜底，见 _respond_error
+        except Exception as exc:  # 兜底：任何异常交给 _respond_error 收口（BLE001 不启用，无需 noqa）
             self._respond_error(exc)
 
     def _respond_error(self, exc: BaseException) -> None:
@@ -464,7 +465,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         )
         self._send_json(500, {"error": f"{category}: {PUBLIC_ERRORS[category]}"})
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
+    def do_GET(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._get)
 
     def _get(self) -> None:
@@ -516,26 +517,36 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     def _reject_head(self) -> None:
         self._method_not_allowed(with_body=False)
 
-    def do_HEAD(self) -> None:  # noqa: N802
+    def do_HEAD(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject_head)
 
-    def do_OPTIONS(self) -> None:  # noqa: N802
+    def do_OPTIONS(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
 
-    def do_TRACE(self) -> None:  # noqa: N802
+    def do_TRACE(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
 
-    def do_PUT(self) -> None:  # noqa: N802
+    def do_PUT(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
 
-    def do_DELETE(self) -> None:  # noqa: N802
+    def do_DELETE(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
 
-    def do_PATCH(self) -> None:  # noqa: N802
+    def do_PATCH(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         self._dispatch(self._reject)
+
+
+class BoardHTTPServer(http.server.ThreadingHTTPServer):
+    """带看板数据源与时钟注入的 ThreadingHTTPServer。
+
+    只补类型声明，不改行为：``make_server`` 建完 server 后赋的正是这两个属性。
+    """
+
+    board_db_path: str
+    board_clock: Callable[[], int]
 
 
 def make_server(
@@ -544,7 +555,7 @@ def make_server(
     bind: str = "127.0.0.1",
     port: int = 8787,
     clock: Callable[[], int] | None = None,
-) -> http.server.ThreadingHTTPServer:
+) -> BoardHTTPServer:
     """建一个未启动的只读 HTTP server。
 
     - 端口合法性不在这里拦：``port=0`` 表示由内核挑临时端口（测试用，取
@@ -552,8 +563,8 @@ def make_server(
     - ``clock`` 注入当前时间（epoch 秒），缺省 ``time.time()``，测试靠它固定
       ``snapshot`` / ``date`` / 耗时。
     """
-    server = http.server.ThreadingHTTPServer((bind, port), BoardRequestHandler)
+    server = BoardHTTPServer((bind, port), BoardRequestHandler)
     server.daemon_threads = True
-    server.board_db_path = str(db_path)  # type: ignore[attr-defined]
-    server.board_clock = clock or (lambda: int(time.time()))  # type: ignore[attr-defined]
+    server.board_db_path = str(db_path)
+    server.board_clock = clock or (lambda: int(time.time()))
     return server

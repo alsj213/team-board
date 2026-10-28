@@ -118,7 +118,7 @@ def test_fixture_derived_numbers(tmp_path: Path) -> None:
 
     # 2026-10-28 当天完成 1 张
     done_days = [
-        time.strftime("%Y-%m-%d", time.gmtime(t.completed_at + 8 * 3600))  # type: ignore[operator]
+        time.strftime("%Y-%m-%d", time.gmtime(t.completed_at + 8 * 3600))
         for t in tasks
         if t.completed_at is not None
     ]

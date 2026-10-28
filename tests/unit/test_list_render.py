@@ -132,7 +132,7 @@ def test_duration_column_right_aligned(rendered: tuple[str, dict[str, str]]) -> 
     # 表头「耗时(分)」显示宽 8（半角括号），恰好填满该列，所以只看数据行能否右对齐
     assert _slice(lines[0], start, width) == "耗时(分)"
     assert width == 8
-    for line, (*_, minutes) in zip(lines[2:], EXPECTED):
+    for line, (*_, minutes) in zip(lines[2:], EXPECTED, strict=True):
         cell = str(minutes)
         assert _slice(line, start, width) == " " * (width - len(cell)) + cell
 
@@ -147,7 +147,7 @@ def test_table_look_rstrip_and_separator(rendered: tuple[str, dict[str, str]]) -
     sep = lines[1]
     widths = _column_widths(sep)
     assert len(widths) == 5
-    for seg, width in zip(sep.split("  "), widths):
+    for seg, width in zip(sep.split("  "), widths, strict=True):
         assert seg == "-" * width
     full = fmt.display_width(sep)
     assert full == sum(widths) + 2 * (len(widths) - 1)
@@ -163,7 +163,7 @@ def test_columns_aligned(rendered: tuple[str, dict[str, str]]) -> None:
     starts = _column_starts(widths)
 
     assert [_slice(lines[0], starts[j], widths[j]).strip() for j in range(5)] == HEADERS
-    for line, (_, assignee, status, minutes) in zip(lines[2:], EXPECTED):
+    for line, (_, assignee, status, minutes) in zip(lines[2:], EXPECTED, strict=True):
         assert _slice(line, starts[1], widths[1]).strip() == assignee
         assert _slice(line, starts[2], widths[2]).strip() == status
         assert _slice(line, starts[3], widths[3]).strip() == str(minutes)

@@ -46,7 +46,8 @@ def load_tasks(conn: sqlite3.Connection) -> list[Task]:
     由 ``cli.main`` 统一渲染成 ``错误: …`` + 退出码 1，不让裸 TypeError 泄到
     stderr。只缺 ``started_at`` 的卡仍按旧口径回退到 ``created_at``。
     """
-    sql = f"SELECT {_TASK_COLUMNS} FROM tasks ORDER BY created_at, id"
+    # 列名来自模块常量 _TASK_COLUMNS（无外部输入，不是注入面）→ bandit B608 假阳性
+    sql = f"SELECT {_TASK_COLUMNS} FROM tasks ORDER BY created_at, id"  # nosec B608
     try:
         rows = conn.execute(sql).fetchall()
     except sqlite3.Error as exc:
