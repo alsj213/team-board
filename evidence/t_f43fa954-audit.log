@@ -1,0 +1,91 @@
+### 验收 3：场景 A（跨卡提交，期望 rc1）
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/a
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/a
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（1 处）:
+  1. 卡 t_aaaaaaaa 的提交 8d7fda7 "feat: t_bbbbbbbb 的活跑到 A 分支" 申报的是卡 t_bbbbbbbb（跨卡提交）；证据：提交标题
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
+rc=1
+
+### 验收 4：绿色基线（期望 rc0）
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+rc=0
+
+### 验收 5：rc2 边界（每条记 rc）
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo 
+错误: 仓库路径为空
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /nonexistent
+错误: 仓库路径不存在: /nonexistent
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /tmp
+错误: 不是 git 工作树: /tmp
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --main-branch nope
+错误: 主分支不存在（本地与 origin 都没有）: nope
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --branch 
+错误: --branch 不能为空
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --branch nosuchbranch
+错误: 分支不存在（本地与 origin 都没有）: nosuchbranch
+rc=2
+
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --bogus
+usage: team-board [-h] {list,summary,member,export,branch-audit,serve} ...
+team-board: error: unrecognized arguments: --bogus
+rc=2
+
+### 验收 6：--branch main（不是卡分支 → rc0）
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --branch main
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g
+主分支: main
+检查的卡分支: （无）
+提示: main 不是卡分支，跳过提交归属检查
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+rc=0
+
+### 额外：--branch wt/t_aaaaaaaa 只查这一条（rc0）
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g --branch wt/t_aaaaaaaa
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.hkgtu71AEQ/g
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+rc=0
+

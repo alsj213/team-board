@@ -1,0 +1,41 @@
+### 步骤⑦ 前置条件核对
+$ gh pr view 8 -R alsj213/team-board --json state -q .state
+MERGED
+rc=0
+
+$ git -C /home/liu/project/team-board status --porcelain --untracked-files=all
+ M src/team_board/web.py
+ M tests/integration/test_web_server.py
+?? evidence/t_06c7b458-blob-methods-probe.log
+?? evidence/t_06c7b458-grep.log
+?? evidence/t_06c7b458-pytest.log
+?? evidence/t_1b200562-ci-final.log
+?? evidence/t_1b200562-red-before-fix.log
+rc=0
+
+$ git -C /home/liu/project/team-board worktree list
+/home/liu/project/team-board             de2a7d4 [wt/t_06c7b458]
+/home/liu/project/tb-wt/main_t_6d5fcf9d  80fbd99 (detached HEAD)
+/home/liu/project/tb-wt/t_37a51cf3       a50484c [wt/t_37a51cf3]
+/home/liu/project/tb-wt/t_b489e268       de2a7d4 [wt/t_b489e268]
+/home/liu/project/tb-wt/t_f43fa954       de2a7d4 [wt/t_f43fa954]
+rc=0
+
+$ git -C /home/liu/project/tb-wt/main_t_6d5fcf9d status --porcelain
+rc=0
+
+### 验收 7：真仓库 branch-audit
+$ cd /home/liu/project/team-board && PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src .venv/bin/python -m team_board.cli branch-audit
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/project/team-board
+主分支: main
+检查的卡分支: t_06c7b458、t_37a51cf3、t_41c252d2、t_67cd6c50、t_b489e268、t_b5fde972、t_f43fa954
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（2 处）:
+  1. /home/liu/project/team-board 当前在 wt/t_06c7b458（应为 main）
+  2. /home/liu/project/tb-wt/main_t_6d5fcf9d 当前在 detached@80fbd99（应为 main）
+豁免（0 条）:
+  （无）
+结论：发现 2 处偏差（提交归属 0 处 / checkout 2 处）
+rc=1
