@@ -1,0 +1,72 @@
+"""board.db 的只读访问层。
+
+一律用 URI ``mode=ro`` 打开，绝不写入、绝不建表。连接由调用方负责 close。
+只读 tasks 与 task_events 两张表（不假设 task_runs / task_links 存在）。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from .model import DEFAULT_DB, Task
+
+
+class BoardError(Exception):
+    """看板数据源不可用：找不到 / 打不开 / 不是合法库 / 读取失败。"""
+
+
+def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
+    """只读打开 SQLite 库；失败时抛 BoardError（一句话原因）。"""
+    db_path = Path(path)
+    if not db_path.exists():
+        raise BoardError(f"数据源不存在: {db_path}")
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise BoardError(f"打不开数据源 {db_path}: {exc}") from exc
+
+    # 连接本身是惰性的：真读一次才算确认它是个合法库
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise BoardError(f"不是合法的 SQLite 库 {db_path}: {exc}") from exc
+    return conn
+
+
+_TASK_COLUMNS = "id, title, assignee, status, created_at, started_at, completed_at"
+
+
+def load_tasks(conn: sqlite3.Connection) -> list[Task]:
+    """全部卡（含 archived），按 (created_at, id) 升序。"""
+    sql = f"SELECT {_TASK_COLUMNS} FROM tasks ORDER BY created_at, id"
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks 失败: {exc}") from exc
+    return [
+        Task(
+            id=row[0],
+            title=row[1],
+            assignee=row[2],
+            status=row[3],
+            created_at=row[4],
+            started_at=row[5],
+            completed_at=row[6],
+        )
+        for row in rows
+    ]
+
+
+def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """task_id -> 'changes_requested' 事件数；0 次的不进字典。"""
+    sql = (
+        "SELECT task_id, COUNT(*) FROM task_events "
+        "WHERE kind = 'changes_requested' GROUP BY task_id"
+    )
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 task_events 失败: {exc}") from exc
+    return {row[0]: int(row[1]) for row in rows if row[1]}
