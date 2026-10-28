@@ -1,0 +1,9 @@
+$ gh pr checks 11 -R alsj213/team-board
+bandit (3.12)	pass	15s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872681517	
+mypy (3.12)	pass	15s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682299	
+pytest (3.12)	pass	19s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682445	
+ruff (3.12)	pass	16s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682056	
+rc=0
+
+$ gh pr view 11 --json state,headRefName,baseRefName,mergeable
+{"baseRefName":"main","headRefName":"wt/t_b489e268","mergeable":"MERGEABLE","state":"OPEN"}
