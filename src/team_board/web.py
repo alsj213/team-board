@@ -116,6 +116,9 @@ def index_html() -> str:
     """整页 HTML（单文件、零外部引用：样式与脚本都内联）。
 
     - 顶部 ``#summary`` 放四个计数 + 异常数；
+    - ``#summary`` 相邻的 ``#error`` 是刷新失败提示行：只在有接口不满足
+      ``response.ok`` 时出现，文案带 HTTP 状态码；刷新失败**不清空**上一帧，
+      成功一次后自动消失；
     - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
     - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
     - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML。
@@ -140,6 +143,11 @@ def index_html() -> str:
     font-size: 13px; color: #444d56; margin: 10px 0 16px;
   }
   #summary .anomaly { color: #b35900; font-weight: 600; }
+  #error {
+    display: none; margin: 0 0 14px; padding: 6px 10px; border-radius: 6px;
+    font-size: 13px; background: #ffebe9; border: 1px solid #ffc1bc; color: #b31d28;
+  }
+  #error.visible { display: block; }
   #main {
     display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px; align-items: start;
@@ -165,6 +173,7 @@ def index_html() -> str:
   <label><input type="checkbox" id="autorefresh" checked> 自动刷新</label>
 </header>
 <div id="summary"></div>
+<div id="error" role="alert"></div>
 <main id="main">
   <section class="col" data-col="running"><h2>running</h2><div class="cards"></div></section>
   <section class="col" data-col="queued"><h2>queued</h2><div class="cards"></div></section>
@@ -215,18 +224,48 @@ function renderBoard(data) {
   }
 }
 
+function showError(text) {
+  const box = document.getElementById("error");
+  box.textContent = text;
+  box.className = "visible";
+}
+
+function clearError() {
+  const box = document.getElementById("error");
+  box.textContent = "";
+  box.className = "";
+}
+
 async function refresh() {
   try {
     const responses = await Promise.all([
       fetch("/api/summary"),
       fetch("/api/board")
     ]);
+    if (!responses[0].ok || !responses[1].ok) {
+      // 只有两个接口都是 2xx 才渲染；否则保留上一帧，只把错误行写出来。
+      // 500 的响应体是 {"error": ...}，直接 .json() 会解析成功并被当数据渲染。
+      const failed = responses.filter(function (response) {
+        return !response.ok;
+      })[0];
+      let detail = "";
+      try {
+        const body = await failed.json();
+        if (body && body.error) { detail = "：" + body.error; }
+      } catch (parseErr) {
+        detail = "";
+      }
+      showError("刷新失败（HTTP " + failed.status + "）" + detail + "，保留上一帧");
+      return;
+    }
     const summary = await responses[0].json();
     const board = await responses[1].json();
     renderSummary(summary);
     renderBoard(board);
+    clearError();
   } catch (err) {
-    // 刷新失败保留上一帧，等下一次定时器再试
+    // 网络层失败（断网、连接被重置、JSON 解析不通过）同样保留上一帧
+    showError("刷新失败（" + err + "），保留上一帧");
   }
 }
 
@@ -271,7 +310,11 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     - payload 构建期的其它异常（13 位毫秒时间戳的 ``ValueError``、``sorted``
       遇到 NULL id 的 ``TypeError`` 等）由 ``except Exception`` 同样收口成
       500 + ``{"error": ...}``：``str(exc)`` 为空时回 ``type(exc).__name__``；
-    - 非 GET → 405 + ``{"error": "method not allowed"}``，没有任何写接口。
+    - 200 的序列化与写出在同一段 ``try`` 里：序列化失败 → 500 + JSON（客户
+      端拿到状态码，不是断连）；客户端已断开（``BrokenPipeError`` /
+      ``ConnectionResetError``）静默丢弃、不打 traceback、不再写第二遍；
+    - 非 GET → 405 + ``{"error": "method not allowed"}``，没有任何写接口；
+      HEAD 按 HTTP 语义只给状态码与头、不写响应体。
     """
 
     server_version = "team-board"
@@ -285,13 +328,20 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_json(self, status: int, obj: Any) -> None:
-        self._send_body(
-            status,
-            "application/json; charset=utf-8",
-            json.dumps(obj, ensure_ascii=False).encode("utf-8"),
-        )
+        # 先序列化再发头：``json.dumps`` 失败时还没写出任何状态行，
+        # 外层才能干净地改回 500 + ``{"error": ...}``。
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._send_body(status, "application/json; charset=utf-8", body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
+        try:
+            self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端先走了：连接已经写不出去，静默收工（不重试、不打 traceback）。
+            # 靠「再包一层 except 变 500」是错的 —— 对端已断，500 也写不出去。
+            return
+
+    def _get(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         server: Any = self.server
 
@@ -320,24 +370,43 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
                     now,
                     datetime.datetime.fromtimestamp(now).date(),
                 )
+            self._send_json(200, payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端已断开：静默丢弃，不再尝试写第二遍（500 也写不出去）。
+            return
         except db.BoardError as exc:
             self._send_json(500, {"error": str(exc)})
-            return
         except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
             # payload 层任何非 BoardError 异常（如 completed_at 是 13 位毫秒时
             # datetime.fromtimestamp 抛 ValueError、id 为 NULL 时 sorted 抛
+            # TypeError，以及 payload 里混进 bytes 导致 json.dumps 抛
             # TypeError）都在这里收口：回 500 + JSON、不把 traceback 交给
             # socketserver、不让异常穿出线程。
+            # BrokenPipeError / ConnectionResetError 由 do_GET 的 except 先接。
             self._send_json(500, {"error": str(exc) or type(exc).__name__})
-            return
         finally:
             if conn is not None:
                 conn.close()
 
-        self._send_json(200, payload)
+    def _method_not_allowed(self, *, with_body: bool = True) -> None:
+        if with_body:
+            self._send_json(405, {"error": "method not allowed"})
+            return
+        # HEAD：与 GET 同头不同体，只给状态码与头
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
-    def _method_not_allowed(self) -> None:
-        self._send_json(405, {"error": "method not allowed"})
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._method_not_allowed(with_body=False)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self._method_not_allowed()
+
+    def do_TRACE(self) -> None:  # noqa: N802
+        self._method_not_allowed()
 
     def do_POST(self) -> None:  # noqa: N802
         self._method_not_allowed()
