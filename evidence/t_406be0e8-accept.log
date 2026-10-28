@@ -1,0 +1,30 @@
+$ .venv/bin/python -m pytest -q
+........................................................................ [ 81%]
+................................                                         [100%]
+176 passed in 9.34s
+rc=0
+
+$ ls -l evidence/
+total 40
+-rw-rw-r-- 1 liu liu  236 Oct 28 21:26 t_406be0e8-accept.log
+-rw-rw-r-- 1 liu liu  846 Oct 28 21:25 t_406be0e8-curl-board.txt
+-rw-rw-r-- 1 liu liu  230 Oct 28 21:25 t_406be0e8-curl-real-summary.txt
+-rw-rw-r-- 1 liu liu  648 Oct 28 21:25 t_406be0e8-curl-summary.txt
+-rw-rw-r-- 1 liu liu 1237 Oct 28 21:25 t_406be0e8-exitcodes.log
+-rw-rw-r-- 1 liu liu  709 Oct 28 21:25 t_406be0e8-http-checks.log
+-rw-rw-r-- 1 liu liu  265 Oct 28 21:25 t_406be0e8-pytest.log
+-rw-rw-r-- 1 liu liu  274 Oct 28 21:25 t_406be0e8-serve-real.log
+-rw-rw-r-- 1 liu liu  502 Oct 28 21:25 t_406be0e8-serve.log
+-rw-rw-r-- 1 liu liu  188 Oct 28 20:36 t_41c252d2-pytest.log
+rc=0
+
+$ pgrep -af '[t]eam-board serve'
+rc=1
+
+$ gh pr view 8 -R alsj213/team-board --json headRefName,url,state
+{"headRefName":"wt/t_b5fde972","state":"OPEN","url":"https://github.com/alsj213/team-board/pull/8"}
+rc=0
+
+$ gh pr checks 8 -R alsj213/team-board
+pytest (3.12)	pass	16s	https://github.com/alsj213/team-board/actions/runs/40696387002/job/122844165686	
+rc=0
