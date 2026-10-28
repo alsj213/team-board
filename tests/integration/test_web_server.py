@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -489,13 +489,11 @@ def test_summary_dirty_completed_at_500_json(
 # --------------------------------------------------------------------------- #
 
 
-def _raw(
-    base: str, method: str, path: str
-) -> tuple[bytes, dict[str, str], bytes]:
-    """裸 socket 发一条 HTTP/1.1 请求。
+def _raw_bytes(base: str, method: str, path: str) -> bytes:
+    """裸 socket 收发一条请求，返回服务端写回的**全部字节**（未解析）。
 
-    返回 ``(状态行, 头, 体)``；服务端一个字节都没回就关掉连接时状态行是 ``b""``
-    —— 这正是「断连（不是 500）」的可观测形态，``urllib`` 会把异常包装掉。
+    「一条连接上有几条状态行」只能看这段原始字节数 ``b"HTTP/1."`` 出现次数 ——
+    解析成 ``(状态行, 头, 体)`` 之后第二条状态行会混进 body，数不出来。
     """
     host, port = base.split("://", 1)[1].rsplit(":", 1)
     request = (
@@ -513,8 +511,18 @@ def _raw(
             if not data:
                 break
             chunks.append(data)
+    return b"".join(chunks)
 
-    head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+
+def _raw(
+    base: str, method: str, path: str
+) -> tuple[bytes, dict[str, str], bytes]:
+    """裸 socket 发一条 HTTP/1.1 请求。
+
+    返回 ``(状态行, 头, 体)``；服务端一个字节都没回就关掉连接时状态行是 ``b""``
+    —— 这正是「断连（不是 500）」的可观测形态，``urllib`` 会把异常包装掉。
+    """
+    head, _, body = _raw_bytes(base, method, path).partition(b"\r\n\r\n")
     lines = head.split(b"\r\n") if head else []
     if not lines:
         return b"", {}, b""
@@ -892,4 +900,118 @@ def test_help_text_lists_all_five_subcommands() -> None:
     for name in ("list", "summary", "member", "export", "serve"):
         assert f"    {name} " in help_text or f"    {name}\n" in help_text
     assert "{list,summary,member,export,serve}" in help_text
+
+
+# --------------------------------------------------------------------------- #
+# 16) 断连收口补齐：非 GET 写出失败静默；200 头已发后失败不写第二条状态行
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "TRACE", "POST"])
+def test_non_get_write_failure_is_silent_and_server_survives(
+    board: tuple[Path, dict[str, str]],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    """非 GET 方法在写 405 响应时对端已断 → 静默、无 traceback、服务存活。
+
+    缺陷出处（PR #10 的第二视角 Review，已实测复现）：断连护栏只装在
+    ``do_GET``，HEAD/OPTIONS/TRACE/POST 在 ``send_response``/``end_headers``
+    写状态行时抛 ``ConnectionResetError``，异常穿出 ``do_*`` 落进
+    ``socketserver.handle_error``，打整段 traceback（栈底 ``sendall``）。
+    """
+    path, _ = board
+    original = web.BoardRequestHandler.flush_headers
+    armed = {"on": True}
+
+    def flaky_flush_headers(self: web.BoardRequestHandler) -> None:
+        if armed["on"]:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        original(self)
+
+    monkeypatch.setattr(web.BoardRequestHandler, "flush_headers", flaky_flush_headers)
+
+    with _running_server(path) as base:
+        capsys.readouterr()  # 丢掉启动阶段噪声
+        replies = [_raw_bytes(base, method, "/api/board") for _ in range(4)]
+        armed["on"] = False
+        status, headers, body = _http(base, "/api/board")
+        captured = capsys.readouterr()
+
+    # 断连形态：一个字节都没写出去（不是 200 也不是 405）
+    assert replies == [b"", b"", b"", b""]
+    assert "Traceback (most recent call last)" not in captured.err
+    assert "ConnectionResetError" not in captured.err
+
+    # 服务进程/线程存活：后续 GET 照常 200
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert list(json.loads(body.decode("utf-8"))["columns"]) == [
+        "running",
+        "queued",
+        "blocked",
+        "done",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("make_exc", "expect_note"),
+    [
+        (lambda: ConnectionAbortedError(10053, "connection aborted"), False),
+        (lambda: OSError(28, "No space left on device"), True),
+    ],
+    ids=["connection-aborted", "other-oserror"],
+)
+def test_mid_write_failure_never_writes_second_status_line(
+    board: tuple[Path, dict[str, str]],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    make_exc: Callable[[], BaseException],
+    expect_note: bool,
+) -> None:
+    """200 头已发出后写出失败 → 客户端只收到 **1** 条状态行，不补 500。
+
+    缺陷出处（PR #10 新引入）：``ConnectionAbortedError``（Windows 10053）不是
+    ``BrokenPipeError``/``ConnectionResetError``，落进 ``except Exception`` 后
+    在**同一连接**上又写了一遍 500 —— 客户端实测收到
+    ``HTTP/1.0 200 OK …`` 紧跟 ``HTTP/1.0 500 Internal Server Error …``。
+
+    取舍：``ConnectionError`` 家族静默；其它 ``OSError`` 只在 stderr 留一行
+    （``写出中断``），绝不写第二条状态行。
+    """
+    path, _ = board
+    original = web.BoardRequestHandler.end_headers
+    armed = {"on": True}
+
+    def flaky_end_headers(self: web.BoardRequestHandler) -> None:
+        original(self)  # 200 的状态行与头真的写到 socket 上
+        if armed["on"]:
+            raise make_exc()
+
+    monkeypatch.setattr(web.BoardRequestHandler, "end_headers", flaky_end_headers)
+
+    with _running_server(path) as base:
+        capsys.readouterr()
+        replies = [_raw_bytes(base, "GET", "/api/board") for _ in range(2)]
+        armed["on"] = False
+        status, _, body = _http(base, "/api/board")
+        captured = capsys.readouterr()
+
+    for reply in replies:
+        assert reply.count(b"HTTP/1.") == 1  # 只有一条状态行
+        assert reply.startswith(b"HTTP/1.0 200 OK")
+        assert reply.partition(b"\r\n\r\n")[2] == b""  # 体没写出去
+    assert "Traceback (most recent call last)" not in captured.err
+    assert ("写出中断" in captured.err) is expect_note
+
+    # 头已发就放弃这条连接，但线程/进程没崩：下一个请求照常 200
+    assert status == 200
+    assert list(json.loads(body.decode("utf-8"))["columns"]) == [
+        "running",
+        "queued",
+        "blocked",
+        "done",
+    ]
+
 
