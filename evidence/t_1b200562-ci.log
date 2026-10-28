@@ -1,0 +1,11 @@
+# PR #8 head 52a2f93 CI 轮询（rc=8 表示 pending）
+[1] 21:46:01 rc=8
+pytest (3.12)	pending	0	https://github.com/alsj213/team-board/actions/runs/40699428463/job/122854879527	
+[2] 21:46:11 rc=8
+pytest (3.12)	pending	0	https://github.com/alsj213/team-board/actions/runs/40699428463/job/122854879527	
+[3] 21:46:23 rc=0
+pytest (3.12)	pass	18s	https://github.com/alsj213/team-board/actions/runs/40699428463/job/122854879527	
+$ gh pr checks 8 -R alsj213/team-board
+pytest (3.12)	pass	18s	https://github.com/alsj213/team-board/actions/runs/40699428463/job/122854879527	
+final rc=0
+# 说明：本文件记录 head 52a2f93 的 CI（gh pr checks 8），内容如下；随后只追加 evidence 日志的提交不含代码改动。

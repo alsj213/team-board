@@ -1,0 +1,16 @@
+$ .venv/bin/team-board serve --bind ::1 --port 18787
+usage: team-board serve [-h] [--db PATH] [--port PORT] [--bind ADDR]
+team-board serve: error: argument --bind: 只允许本机地址 127.0.0.1 / localhost: '::1'
+rc=2
+
+$ .venv/bin/team-board serve --bind 0.0.0.0 --port 18787
+usage: team-board serve [-h] [--db PATH] [--port PORT] [--bind ADDR]
+team-board serve: error: argument --bind: 只允许本机地址 127.0.0.1 / localhost: '0.0.0.0'
+rc=2
+
+$ .venv/bin/team-board serve --help  (bind 行)
+usage: team-board serve [-h] [--db PATH] [--port PORT] [--bind ADDR]
+
+--
+  --bind ADDR  监听地址（只允许 127.0.0.1 / localhost）
+rc=0

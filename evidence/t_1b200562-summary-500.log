@@ -1,0 +1,15 @@
+$ .venv/bin/python t_1b200562-probe-summary.py <fixture board.db>   # 真起 make_server，clock=1793160000000
+$ GET http://127.0.0.1:43920/api/summary   # clock=1793160000000（13 位毫秒）
+http=500
+body={"error": "year must be in 1..9999, not 58792"}
+  -> JSON 可解析: {'error': 'year must be in 1..9999, not 58792'}
+$ GET http://127.0.0.1:43920/api/board     # 同一进程，应仍 200
+http=200 columns=['running', 'queued', 'blocked', 'done'] running_ids=['t_running_stale', 't_running_fresh']
+rc=0
+
+--- 该次运行的 stderr（请求日志 + 任何异常）---
+127.0.0.1 - - [28/Oct/2026 21:44:04] "GET /api/summary HTTP/1.1" 500 -
+127.0.0.1 - - [28/Oct/2026 21:44:04] "GET /api/board HTTP/1.1" 200 -
+--- stderr 里 "Traceback (most recent call last)" 计数 ---
+0
+grep rc=1

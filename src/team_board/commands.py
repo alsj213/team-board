@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime
 import json
+from dataclasses import dataclass
 
 from . import db, fmt
 from .model import (
@@ -99,6 +100,64 @@ def render_export(tasks: list[Task], now: int) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+@dataclass(frozen=True)
+class SummaryStats:
+    """summary 的四个计数与异常清单（render_summary / Web 层共用的同一份计算）。
+
+    ``anomalies`` 每项为 ``(minutes, task, threshold)``，已按 ``(-minutes, id)`` 升序。
+    """
+
+    snapshot_ts: int
+    day: datetime.date
+    completed: int
+    running: int
+    blocked: int
+    anomalies: tuple[tuple[int, Task, int], ...]
+
+
+def summary_stats(tasks: list[Task], now: int, day: datetime.date) -> SummaryStats:
+    """算当日汇总的四个数字 + 异常清单（口径见 ``render_summary`` 文档）。
+
+    - 完成数：``status == "done"`` 且 ``completed_at`` 的本地自然日 == ``day``；
+    - 在跑 / 阻塞：按 ``status`` 计数，与 ``day`` 无关；
+    - 异常：``running`` 耗时 > DOING_STALE_MINUTES、``review`` 耗时
+      > REVIEW_STALE_MINUTES（严格大于），排序 ``(-minutes, id)``；
+    - ``snapshot_ts`` 原样等于传入的 ``now``，不做任何夹取。
+    """
+    completed = 0
+    running = 0
+    blocked = 0
+    anomalies: list[tuple[int, Task, int]] = []
+
+    for task in tasks:
+        if task.status == "done":
+            if (
+                task.completed_at is not None
+                and datetime.datetime.fromtimestamp(task.completed_at).date() == day
+            ):
+                completed += 1
+        elif task.status == "running":
+            running += 1
+        elif task.status == "blocked":
+            blocked += 1
+
+        minutes = task.duration_minutes(now)
+        if task.status == "running" and minutes > DOING_STALE_MINUTES:
+            anomalies.append((minutes, task, DOING_STALE_MINUTES))
+        elif task.status == "review" and minutes > REVIEW_STALE_MINUTES:
+            anomalies.append((minutes, task, REVIEW_STALE_MINUTES))
+
+    anomalies.sort(key=lambda item: (-item[0], item[1].id))
+    return SummaryStats(
+        snapshot_ts=now,
+        day=day,
+        completed=completed,
+        running=running,
+        blocked=blocked,
+        anomalies=tuple(anomalies),
+    )
+
+
 def render_summary(
     tasks: list[Task],
     rework: dict[str, int],
@@ -133,40 +192,17 @@ def render_summary(
     前置条件：``now`` 须为 ``datetime.fromtimestamp`` 可表示的 epoch 秒，
     越界由 CLI 的 ``--now`` 类型校验拒绝（本函数不做兜底、不夹取）。
     """
-    completed = 0
-    running = 0
-    blocked = 0
-    anomalies: list[tuple[int, Task, int]] = []
+    stats = summary_stats(tasks, now, day)
 
-    for task in tasks:
-        if task.status == "done":
-            if (
-                task.completed_at is not None
-                and datetime.datetime.fromtimestamp(task.completed_at).date() == day
-            ):
-                completed += 1
-        elif task.status == "running":
-            running += 1
-        elif task.status == "blocked":
-            blocked += 1
-
-        minutes = task.duration_minutes(now)
-        if task.status == "running" and minutes > DOING_STALE_MINUTES:
-            anomalies.append((minutes, task, DOING_STALE_MINUTES))
-        elif task.status == "review" and minutes > REVIEW_STALE_MINUTES:
-            anomalies.append((minutes, task, REVIEW_STALE_MINUTES))
-
-    anomalies.sort(key=lambda item: (-item[0], item[1].id))
-
-    snapshot = datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M")
+    snapshot = datetime.datetime.fromtimestamp(stats.snapshot_ts).strftime("%Y-%m-%d %H:%M")
     lines = [
         f"看板概览（快照 {snapshot}；完成按 {day.isoformat()}）",
-        f"完成: {completed}",
-        f"在跑: {running}",
-        f"阻塞: {blocked}",
-        f"异常: {len(anomalies)}",
+        f"完成: {stats.completed}",
+        f"在跑: {stats.running}",
+        f"阻塞: {stats.blocked}",
+        f"异常: {len(stats.anomalies)}",
     ]
-    for minutes, task, threshold in anomalies:
+    for minutes, task, threshold in stats.anomalies:
         title = fmt.truncate(task.title or "", TITLE_MAX)
         lines.append(
             f"  - {task.status} {minutes} 分钟（阈值 {threshold}）"

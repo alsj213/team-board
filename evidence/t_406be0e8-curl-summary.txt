@@ -1,0 +1,4 @@
+$ curl -s -w '\nhttp=%{http_code}\n' http://127.0.0.1:18787/api/summary   # summary
+{"snapshot": "2026-10-28 21:25", "date": "2026-10-28", "completed": 1, "running": 2, "blocked": 1, "anomaly": 4, "anomalies": [{"status": "running", "minutes": 640, "threshold": 60, "id": "t_running_stale", "title": "running_stale"}, {"status": "review", "minutes": 610, "threshold": 30, "id": "t_review_stale", "title": "review_stale"}, {"status": "running", "minutes": 575, "threshold": 60, "id": "t_running_fresh", "title": "running_fresh"}, {"status": "review", "minutes": 570, "threshold": 30, "id": "t_review_fresh", "title": "review_fresh"}]}
+http=200
+rc=0
