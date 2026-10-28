@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from datetime import date, datetime
@@ -24,6 +25,10 @@ from .model import DEFAULT_DB
 #: IPv6 支持属于另一件事，不做「文档说行、真跑起不来」的假选项 ——
 #: 拒绝行为有集成测试锁住。
 _LOCAL_BINDS = frozenset({"127.0.0.1", "localhost"})
+
+#: ``--port`` 只接受 ASCII 十进制数字：``int()`` 认空白、正负号、下划线与非
+#: ASCII 数字（``"١٢٣"`` → 123），比 README 表格的「1–65535 的整数」宽得多。
+_PORT_DIGITS = re.compile(r"[0-9]+", re.ASCII)
 
 
 def _parse_date(value: str) -> date:
@@ -54,14 +59,18 @@ def _parse_now(value: str) -> int:
 
 
 def _parse_port(value: str) -> int:
-    """``serve --port``：整数且 1 <= n <= 65535，否则 rc2。
+    """``serve --port``：纯 ASCII 十进制数字且 1 <= n <= 65535，否则 rc2。
 
-    0 与负数都不放行（``0`` 只对 ``web.make_server`` 内部有意义，CLI 层不暴露）。
+    只认 ``0-9``：``int()`` 会静默接受 ``" 8787"``（空白）、``"+8787"``（正号）、
+    ``"1_000"``（下划线）和 ``"١٢٣"``（阿拉伯-印度数字，= 123），比 README 的
+    「1–65535 的整数」宽得多，这里全部拒绝。
+    ``0`` 与负数也不放行（``0`` 只对 ``web.make_server`` 内部有意义，CLI 层不暴露）。
     """
-    try:
-        port = int(value)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(f"端口应为 1-65535 的整数: {value!r}") from exc
+    if not isinstance(value, str) or _PORT_DIGITS.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"端口应为 1-65535 的 ASCII 十进制整数: {value!r}"
+        )
+    port = int(value)
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError(f"端口超出 1-65535: {value!r}")
     return port
@@ -77,7 +86,13 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，四个子命令共享 --db / --now。"""
+    """建 CLI 前端：prog=team-board，共**五个**子命令。
+
+    - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
+      （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
+    - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
+      （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
+    """
     parser = argparse.ArgumentParser(
         prog="team-board",
         description="团队看板的只读命令行查看器",

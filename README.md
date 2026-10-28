@@ -5,7 +5,11 @@
 ## 数据源
 
 `/home/liu/.hermes/kanban/boards/devteam/kanban.db` —— SQLite，以 `mode=ro`
-**只读打开**，绝不写入、绝不建表；只读 `tasks` 与 `task_events` 两张表。
+**只读打开**，绝不写入、绝不建表。`tasks` 是必读表；`task_events` 只有
+`member`（被驳回次数）和 `summary`（沿用既有的加载路径，`render_summary`
+并不使用它的值）会读。**Web 的两个接口都不读 `task_events`**：缺这张表时
+`/api/board` 与 `/api/summary` 都照常 200，而命令行 `member` / `summary`
+按数据源错误退出（退出码 1）。
 文件不存在或不是合法 SQLite 库时，命令以退出码 1 结束并在 stderr 打印
 `错误: ...`，不会自动创建文件。
 
@@ -58,7 +62,7 @@ team-board serve
 
 | 参数 | 取值 | 说明 |
 | --- | --- | --- |
-| `--port PORT` | 1–65535，默认 `8787` | 监听端口；`0`、负数、`65536`、`abc` 一律 argparse 报错、退出码 2 |
+| `--port PORT` | 1–65535 的**纯 ASCII 十进制数字**，默认 `8787` | 监听端口；`0`、负数、`65536`、`abc` 一律 argparse 报错、退出码 2。只认 `0-9`：`" 8787"`（前导空白）、`"+8787"`、`"1_000"`、`"١٢٣"`（非 ASCII 数字，`int()` 会当成 123）同样退出码 2 |
 | `--db PATH` | 同其它子命令 | 看板 SQLite 路径，默认 `/home/liu/.hermes/kanban/boards/devteam/kanban.db` |
 | `--bind ADDR` | 只允许 `127.0.0.1` / `localhost`，默认 `127.0.0.1` | 其它值（含 `0.0.0.0`、空串）退出码 2；**不支持 0.0.0.0 / 对外暴露 / IPv6** |
 
@@ -67,6 +71,10 @@ team-board serve
 - 顶部一行统计（完成 / 在跑 / 阻塞 / 异常），下面四列 `running` / `queued` /
   `blocked` / `done`，卡上显示卡号、负责人、耗时（分）、标题。
 - 每 5 秒自动刷新，右上角开关可关闭自动刷新（关掉后只能手动重载页面）。
+  间隔只有一处来源：`web.py` 的 `REFRESH_MS`，页面里的 `const REFRESH_MS`
+  由它渲染（改常量页面就跟着变）。
+- 刷新失败（任一接口非 2xx 或网络层失败）时**保留上一帧**，在统计行下方显示
+  一行 `刷新失败（HTTP <状态码>）：<原因>，保留上一帧`，成功一次后自动消失。
 - 纯前端 `fetch` 两个 JSON 接口，无 CDN、无第三方 JS/CSS、无构建步骤，
   页面内容全部由服务端内联的单个 HTML 提供。
 
@@ -88,7 +96,8 @@ GET /api/summary
 实际响应是**单行 JSON**（无 indent、无 sort_keys），`ensure_ascii=False`（中文原样，
 不转义成 `\uXXXX`）；键顺序与上面逐字一致。`/api/summary` 与 `team-board summary`
 子命令**同口径**（共用同一份 `commands.summary_stats`），异常清单只算 `running`
-超过 60 分钟、`review` 超过 30 分钟的卡。
+超过 60 分钟、`review` 超过 30 分钟的卡；响应里**没有** `rework` 字段（本接口
+不读 `task_events`，缺这张表也照常 200）。
 
 分组口径：
 
@@ -99,10 +108,27 @@ GET /api/summary
 
 只读与安全边界：
 
-- 库以 `mode=ro` 打开，每个请求现开现关；**服务没有任何写接口**（非 GET 一律
-  405 + `{"error": "method not allowed"}`），未知路径 404。
+- 库以 `mode=ro` 打开，每个请求现开现关；**服务没有任何写接口**：`HEAD` /
+  `OPTIONS` / `TRACE` / `POST` / `PUT` / `DELETE` / `PATCH` 一律 405，其中
+  `OPTIONS` 等带 `{"error": "method not allowed"}` 体，`HEAD` 按 HTTP 语义只给
+  状态码与头、**响应体为空**；未知路径 404 + `{"error": "not found"}`。
 - 只绑本机回环地址、无鉴权、无多用户：**设计上不对公网暴露**，不要用反向代理
   或 `--bind 0.0.0.0` 把它放到外网。
+
+500 只说类别，细节只在服务端：
+
+| 类别 | 含义 |
+| --- | --- |
+| `source_unavailable` | 看板数据源不可用（不存在 / 打不开 / 不是合法库 / 读表失败） |
+| `data_invalid` | 卡上的时间戳超出 `datetime.fromtimestamp` 可表示范围（如 13 位毫秒） |
+| `internal_error` | payload 构建或序列化失败（如字段是 BLOB、`id` 为 NULL） |
+
+响应体固定为 `{"error": "<类别>: <一句话原因>"}`，**不含绝对路径、表名、SQLite
+原文，也不含异常原文**；异常类型与原文（带请求方法与路径）写一行 stderr：
+
+```
+[team-board] 500 source_unavailable GET /api/board <- BoardError: 不是合法的 SQLite 库 /…/b.db: file is not a database
+```
 
 退出码：
 
@@ -116,9 +142,16 @@ GET /api/summary
 `summary` 子命令一致）；耗时与超时判断用进程真实时钟，因此用固定 `--now` 建的
 fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的本意，不是 bug。
 
+卡上用于耗时口径的两个时间戳（起点 `started_at`，缺省回退 `created_at`；终点
+`completed_at`）必须是 `datetime.fromtimestamp` 能表示的 epoch 秒：13 位毫秒
+这类脏值在 Web 两个接口上一律 500 `data_invalid`（**不再**静默算成 0 分钟）；
+命令行子命令不做这个校验，耗时仍按「口径」段的规则夹到下限 0。
+
 ## 通用参数
 
-两个参数四个子命令都支持：
+共五个子命令：`list` / `summary` / `member` / `export` 支持下面两个参数；
+`serve` 只支持 `--db`（另有 `--port` / `--bind`，见上），**不接受 `--now`**
+（快照时刻取服务进程的真实时钟）。
 
 - `--db PATH` —— 看板库路径，默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
@@ -149,7 +182,8 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
 
 - **耗时**：从开始到结束的分钟数，向下取整。开始取 `started_at`，缺省回退
   `created_at`；结束取 `completed_at`，未结束则算到 `--now`；结束早于开始的
-  脏数据夹到 0。
+  脏数据夹到 0。时间戳**超出可表示范围**（13 位毫秒等）在 Web 两个接口上会被
+  拒成 500 `data_invalid`（见「已知限制」），命令行不做这个校验。
 - **交付数**：`status == "done"` 且负责人是该成员的卡数；`archived` 不算交付。
 - **被驳回**：`task_events` 里 `kind = 'changes_requested'` 的事件次数
   （一次打回一行事件；不看状态，含 `archived`，同名负责人的卡全部计入）。
