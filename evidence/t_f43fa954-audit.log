@@ -1,91 +1,121 @@
-### 验收 3：场景 A（跨卡提交，期望 rc1）
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/a
-分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/a
-主分支: main
-检查的卡分支: t_aaaaaaaa
-提交归属偏差（1 处）:
-  1. 卡 t_aaaaaaaa 的提交 5eaee65 "feat: t_bbbbbbbb 的活跑到 A 分支" 申报的是卡 t_bbbbbbbb（跨卡提交）；证据：提交标题
+# 验收 3/4/5/6 + 必修 1/2 的 rc 矩阵（造偏差的仓全在 mktemp -d 里）
+
+########## 验收 3：场景 A（跨卡提交）应 rc1，两条卡号都要点名 ##########
+### 跨卡提交
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/a
+rc=1
+--- stdout（末 5 行） ---
 checkout 偏移（0 处）:
   （无）
 豁免（0 条）:
   （无）
 结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
-rc=1
+--- stderr: 空 ---
 
-### 验收 4：绿色基线（期望 rc0）
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g
-分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g
-主分支: main
-检查的卡分支: t_aaaaaaaa
-提交归属偏差（0 处）:
-  （无）
+########## 验收 4：绿色基线应 rc0 ##########
+### 干净仓 + 卡 worktree 目录名=卡号
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green
+rc=0
+--- stdout（末 5 行） ---
 checkout 偏移（0 处）:
   （无）
 豁免（0 条）:
   （无）
 结论：无偏差
+--- stderr: 空 ---
+
+########## 验收 6：--branch main 应 rc0 + 不是卡分支 ##########
+### --branch main
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch main
 rc=0
+--- stdout（末 5 行） ---
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+--- stderr: 空 ---
 
-### 验收 5：rc2 边界（每条记 rc）
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo 
+########## 验收 5 + 必修 1/2：rc2 边界矩阵 ##########
+### --repo 空串
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo 
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 错误: 仓库路径为空
-rc=2
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /nonexistent
-错误: 仓库路径不存在: /nonexistent
+### --repo 不存在
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /nonexistent-audit-path
 rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
+错误: 仓库路径不存在: /nonexistent-audit-path
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /tmp
+### --repo /tmp（非 git）
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 错误: 不是 git 工作树: /tmp
-rc=2
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --main-branch nope
+### --main-branch nope
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --main-branch nope
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 错误: 主分支不存在（本地与 origin 都没有）: nope
-rc=2
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --branch 
+### --branch 空串
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch 
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 错误: --branch 不能为空
-rc=2
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --branch nosuchbranch
+### --branch nosuchbranch
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch nosuchbranch
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 错误: 分支不存在（本地与 origin 都没有）: nosuchbranch
-rc=2
 
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --bogus
+### --bogus（argparse）
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --bogus
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
 usage: team-board [-h] {list,summary,member,export,branch-audit,serve} ...
 team-board: error: unrecognized arguments: --bogus
+
+### --allow-file 坏行
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --allow-file /tmp/tmp.BUX6vOhwg6/bad-allow.txt
 rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
+错误: 豁免表 /tmp/tmp.BUX6vOhwg6/bad-allow.txt 第 1 行字段不足（至少要 <分支卡号> <对方卡号或-> <sha>）: 't_aaaaaaaa 52a2f93'
 
-### 验收 6：--branch main（不是卡分支 → rc0）
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --branch main
-分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g
-主分支: main
-检查的卡分支: （无）
-提示: main 不是卡分支，跳过提交归属检查
-提交归属偏差（0 处）:
-  （无）
-checkout 偏移（0 处）:
-  （无）
-豁免（0 条）:
-  （无）
-结论：无偏差
-rc=0
+### --allow-file 二进制（必修 1a）
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --allow-file /bin/ls
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
+错误: 豁免表 /bin/ls 不是 UTF-8 文本，无法解析（第 24 字节起解码失败）
 
-### 额外：--branch wt/t_aaaaaaaa 只查这一条（rc0）
-$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src .venv/bin/python -m team_board.cli branch-audit --repo /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g --branch wt/t_aaaaaaaa
-分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.7oK8qYxrHV/g
-主分支: main
-检查的卡分支: t_aaaaaaaa
-提交归属偏差（0 处）:
-  （无）
-checkout 偏移（0 处）:
-  （无）
-豁免（0 条）:
-  （无）
-结论：无偏差
-rc=0
+### --branch 裸卡号但只有裸分支（必修 2）
+$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/bare --branch t_aaaaaaaa
+rc=2
+--- stdout: 空 ---
+--- stderr（末 3 行） ---
+错误: 分支不存在（本地与 origin 都没有）: wt/t_aaaaaaaa（t_aaaaaaaa 只匹配到 heads/t_aaaaaaaa，卡分支必须是 wt/t_aaaaaaaa）
+
+### 必修 1b：PATH 里没有 git
+$ env PATH=/nonexistent PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo <tmp>
+rc=2
+错误: 找不到 git 可执行文件（PATH 里没有 git），无法稽核
+
+### 必修 1c：LC_ALL=C + PYTHONIOENCODING=ascii（报告含中文）
+$ env LC_ALL=C PYTHONIOENCODING=ascii PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo <场景A仓>
+rc=2
+stdout 字节数: 0
+错误: 当前 stdout 编码 'ascii' 无法表示稽核报告里的中文，请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）
 

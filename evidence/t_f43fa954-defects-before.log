@@ -1,0 +1,42 @@
+# 必修 1/2 修前 / 修后对照（同一脚本，SRC 分别指 HEAD 的 src 与工作树的 src）
+$ SRC=/workspace/headsrc/src   bash /workspace/repro-pm-defects.sh   # 修前：git archive HEAD src
+
+=== 缺陷 1a：--allow-file 指向二进制文件 → 期望 rc2 + stderr「错误: 」+ 无 Traceback ===
+rc=1
+--- stdout ---
+(空)
+--- stderr ---
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/headsrc/src/team_board/cli.py", line 280, in <module>
+
+=== 缺陷 1b：PATH 里没有 git → 期望 rc2 + stderr「错误: 」+ 无 Traceback ===
+rc=1
+--- stdout ---
+(空)
+--- stderr ---
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/headsrc/src/team_board/cli.py", line 280, in <module>
+
+=== 缺陷 1c：LC_ALL=C + PYTHONIOENCODING=ascii（有偏差，报告含中文）→ 期望 rc2 + 无 Traceback ===
+rc=1
+--- stdout ---
+(空)
+--- stderr ---
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/headsrc/src/team_board/cli.py", line 280, in <module>
+
+=== 缺陷 2：--branch <裸卡号> 只匹配到漏 wt/ 前缀的裸分支 → 期望 rc2，不许假绿 rc0 ===
+rc=0
+--- stdout ---
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /tmp/tmp.T9QreTMHvg/d
+主分支: main
+检查的卡分支: （无）
+--- stderr ---
+(空)

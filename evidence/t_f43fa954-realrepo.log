@@ -1,41 +1,37 @@
-### 步骤⑦ 前置条件核对
-$ gh pr view 8 -R alsj213/team-board --json state -q .state
-MERGED
-rc=0
+# 真仓库（宿主主 checkout）验收 7 / 9 —— 本轮 worker 跑在 docker 沙箱里
+# 沙箱内 /home/liu 不存在（宿主 home 未挂载），下面第 1 段是原命令的真实失败记录，
+# 第 2/3 段是在「同一个仓库的 clone（含全部 origin 卡分支）」上做的等价观测。
 
-$ git -C /home/liu/project/team-board status --porcelain --untracked-files=all
-?? evidence/t_06c7b458-blob-methods-probe.log
-?? evidence/t_06c7b458-grep.log
-?? evidence/t_06c7b458-pytest.log
-?? evidence/t_06c7b458-r6-r7.log
-?? evidence/t_1b200562-ci-final.log
-?? evidence/t_1b200562-red-before-fix.log
-rc=0
+## 1) 宿主路径（原验收命令）—— 沙箱内不可达
+$ cd /home/liu/project/team-board && PYTHONPATH=/workspace/team-board/src .venv/bin/python -m team_board.cli branch-audit
+bash: line 32: cd: /home/liu/project/team-board: No such file or directory
+exit 1
 
-$ git -C /home/liu/project/team-board worktree list
-/home/liu/project/team-board             1318367 [wt/t_06c7b458]
-/home/liu/project/tb-wt/main_t_6d5fcf9d  80fbd99 (detached HEAD)
-/home/liu/project/tb-wt/t_37a51cf3       a50484c [wt/t_37a51cf3]
-/home/liu/project/tb-wt/t_b489e268       de7f2d5 [wt/t_b489e268]
-/home/liu/project/tb-wt/t_f43fa954       db09a1a [wt/t_f43fa954]
-rc=0
-
-$ git -C /home/liu/project/tb-wt/main_t_6d5fcf9d status --porcelain
-rc=0
-
-### 验收 7：真仓库 branch-audit
-$ cd /home/liu/project/team-board && PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src .venv/bin/python -m team_board.cli branch-audit
+## 2) clone 全量扫描（= 同一份 origin 分支历史，规则 A 与宿主等价）
+$ cd /workspace/team-board && PYTHONPATH=src python3 -m team_board.cli branch-audit --repo /workspace/team-board
 分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/project/team-board
+仓库: /workspace/team-board
 主分支: main
 检查的卡分支: t_06c7b458、t_37a51cf3、t_41c252d2、t_67cd6c50、t_b489e268、t_b5fde972、t_f43fa954
 提交归属偏差（2 处）:
   1. 卡 t_06c7b458 的分支上，提交 1318367 "fix(web): 错误路径收口 —— 前端查 response.ok + 200 序列化/写出进 try + HEAD/OPTIONS/TRACE 405" 未声明卡号（无法归属）；证据：提交标题
   2. 卡 t_b489e268 的分支上，提交 36a0203 "chore(lint): 落 ruff/mypy/bandit 配置 + 三个 CI job + README 本地命令" 未声明卡号（无法归属）；证据：提交标题
-checkout 偏移（2 处）:
-  1. /home/liu/project/team-board 当前在 wt/t_06c7b458（应为 main）
-  2. /home/liu/project/tb-wt/main_t_6d5fcf9d 当前在 detached@80fbd99（应为 main）
+checkout 偏移（1 处）:
+  1. /workspace/team-board 当前在 wt/t_f43fa954（应为 main）
 豁免（0 条）:
   （无）
-结论：发现 4 处偏差（提交归属 2 处 / checkout 2 处）
-rc=1
+结论：发现 3 处偏差（提交归属 2 处 / checkout 1 处）
+exit 1
+
+## 3) 污染自查等价物：clone 的 status + worktree list（demo 前后一致由脚本自断言）
+$ git -C /workspace/team-board status --porcelain --untracked-files=all; git -C /workspace/team-board worktree list
+ M .github/workflows/test.yml
+ M evidence/t_f43fa954-pytest.log
+ M evidence/t_f43fa954-realrepo.log
+ M scripts/demo-branch-audit.sh
+ M src/team_board/branches.py
+ M src/team_board/cli.py
+ M tests/integration/test_cli_branch_audit.py
+ M tests/unit/test_branches.py
+/workspace/team-board  10b12b8 [wt/t_f43fa954]
+exit 0

@@ -1,25 +1,16 @@
-$ git clone -q --branch wt/t_f43fa954 https://github.com/alsj213/team-board.git /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo
-rc=0
-$ git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-rc=0
-$ mkdir -p /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src && git archive HEAD src | tar -x -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src
-rc=0
-$ git checkout -B main origin/main
-Switched to a new branch 'main'
-Branch 'main' set up to track remote branch 'main' from 'origin'.
-rc=0
-$ git worktree list
-/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo  de2a7d4 [main]
-$ PYTHONPATH=/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src/src python -m team_board.cli branch-audit --branch wt/t_f43fa954
-分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo
-主分支: main
-检查的卡分支: t_f43fa954
-提交归属偏差（0 处）:
-  （无）
-checkout 偏移（0 处）:
-  （无）
+# 必修 3：CI 里豁免表读的是谁的树（本地等价复现，仓全在 mktemp -d）
+$ SRC=/workspace/team-board/src bash /workspace/simci-allowlist.sh
+
+演示仓: /tmp/tmp.sFIxWDMbj5/repo（PR 分支 wt/t_aaaaaaaa，脏提交 f1d9915）
+
+=== 旧 CI 写法：只归档 src，切回 main 后不带 --allow-file（=读 main 的豁免表） ===
+rc=1
+  1. 卡 t_aaaaaaaa 的提交 f1d9915 "feat: t_bbbbbbbb 的活跑到 A 分支" 申报的是卡 t_bbbbbbbb（跨卡提交）；证据：提交标题
 豁免（0 条）:
-  （无）
-结论：无偏差
+结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
+
+=== 新 CI 写法：连 .team-board 一起归档 + 显式 --allow-file 指到 PR 那份 ===
 rc=0
+豁免（1 条）:
+  1. 豁免 t_aaaaaaaa 分支上的提交 f1d9915（对方卡 t_bbbbbbbb）：同卡族返工已确认（演示）
+结论：无偏差

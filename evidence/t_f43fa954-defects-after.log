@@ -1,0 +1,30 @@
+# 必修 1/2 修后（工作树 src）
+$ SRC=/workspace/team-board/src bash /workspace/repro-pm-defects.sh
+
+=== 缺陷 1a：--allow-file 指向二进制文件 → 期望 rc2 + stderr「错误: 」+ 无 Traceback ===
+rc=2
+--- stdout ---
+(空)
+--- stderr ---
+错误: 豁免表 /bin/ls 不是 UTF-8 文本，无法解析（第 24 字节起解码失败）
+
+=== 缺陷 1b：PATH 里没有 git → 期望 rc2 + stderr「错误: 」+ 无 Traceback ===
+rc=2
+--- stdout ---
+(空)
+--- stderr ---
+错误: 找不到 git 可执行文件（PATH 里没有 git），无法稽核
+
+=== 缺陷 1c：LC_ALL=C + PYTHONIOENCODING=ascii（有偏差，报告含中文）→ 期望 rc2 + 无 Traceback ===
+rc=2
+--- stdout ---
+(空)
+--- stderr ---
+错误: 当前 stdout 编码 'ascii' 无法表示稽核报告里的中文，请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）
+
+=== 缺陷 2：--branch <裸卡号> 只匹配到漏 wt/ 前缀的裸分支 → 期望 rc2，不许假绿 rc0 ===
+rc=2
+--- stdout ---
+(空)
+--- stderr ---
+错误: 分支不存在（本地与 origin 都没有）: wt/t_aaaaaaaa（t_aaaaaaaa 只匹配到 heads/t_aaaaaaaa，卡分支必须是 wt/t_aaaaaaaa）
