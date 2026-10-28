@@ -10,10 +10,30 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff==0.17.3", "mypy==2.4.0", "bandit==1.9.4"]
 
 [project.scripts]
 team-board = "team_board.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# 刻意不开 E501（行宽）与 N/ANN/D：那几类会要求一次性重排/补注释，
+# 属于把真改动淹掉的格式化 PR。规则集只覆盖"确定性、无需人判断"的缺陷类。
+select = ["E4", "E7", "E9", "F", "W", "B", "I", "UP", "SIM", "C4", "PIE", "RET", "RSE", "RUF"]
+# RUF001/2/3 报"全角标点有歧义"，本仓注释与文案是中文，全角标点是刻意的。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+files = ["src", "tests"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_equality = true
