@@ -1,0 +1,11 @@
+# 本卡 round 4 证据清单（仓库 evidence/ 下的原件；sha256 用于核对下载副本）
+# head 32a0adc，生成于 2026-10-28 23:23:40 CST
+730004f920e4455febc6e8515920eb97eb769fa79ebe1a082e2de618003cb31c  evidence/t_f43fa954-nonutf8-before.log
+2ddc987bb831fb3da39e36588e1adddd14b2c570df61622275cd2cef8c006e78  evidence/t_f43fa954-nonutf8-after.log
+6fa482d4795e5155f44325e87c6c51e4634724b3edbefe99ff4f70de37f56ab8  evidence/t_f43fa954-pytest.log
+6b6154dc772eecb7a66858710cb211b3bed3306d2eb6ff9f48cd45a087972853  evidence/t_f43fa954-demo.log
+422e717535ff791c8580444bf254cae6c7b3c7aa5f82dc9bda973bc55e742bd8  evidence/t_f43fa954-audit.log
+d71ceb48329366b479b5604d5c19dcb5e3c6d87c9b8e7f01293f0b44e19a3e36  evidence/t_f43fa954-realrepo.log
+ff52c69a5e2e9f2725ff31b16b4a2c9eb45716b576e968a630a41d00322c8fca  evidence/t_f43fa954-simci.log
+7bc1a4a033e16db816df3a7edfe6c26e9159e1e1b2cc14457a57c24bda5fcfa5  evidence/t_f43fa954-ci.log
+9e183bbfc07a20f74a200265d9898834a68a7742a7463c26227e720db755ebaa  evidence/t_f43fa954-regress.log
