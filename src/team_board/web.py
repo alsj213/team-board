@@ -126,7 +126,7 @@ def index_html() -> str:
   }
   header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   h1 { font-size: 18px; margin: 0; }
-  #autorefresh-label { font-size: 13px; color: #57606a; user-select: none; }
+  header label { font-size: 13px; color: #57606a; user-select: none; }
   #summary {
     display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
     font-size: 13px; color: #444d56; margin: 10px 0 16px;
@@ -154,7 +154,7 @@ def index_html() -> str:
 <body>
 <header>
   <h1>team-board</h1>
-  <label id="autorefresh-label"><input type="checkbox" id="autorefresh" checked> 自动刷新</label>
+  <label><input type="checkbox" id="autorefresh" checked> 自动刷新</label>
 </header>
 <div id="summary"></div>
 <main id="main">

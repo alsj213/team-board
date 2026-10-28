@@ -241,8 +241,10 @@ def test_index_html_is_self_contained() -> None:
         assert f'data-col="{name}"' in html
     assert "5000" in html
     assert str(web.REFRESH_MS) == "5000"
-    assert 'id="summary"' in html
-    assert '<input type="checkbox" id="autorefresh" checked>' in html
+    assert '<div id="summary">' in html
+    assert '<label><input type="checkbox" id="autorefresh" checked> 自动刷新</label>' in html
+    for name in ("running", "queued", "blocked", "done"):
+        assert f'<section class="col" data-col="{name}">' in html
     assert "/api/summary" in html
     assert "/api/board" in html
     # 零外部引用
