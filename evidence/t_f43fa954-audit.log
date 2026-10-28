@@ -1,121 +1,22 @@
-# 验收 3/4/5/6 + 必修 1/2 的 rc 矩阵（造偏差的仓全在 mktemp -d 里）
-
-########## 验收 3：场景 A（跨卡提交）应 rc1，两条卡号都要点名 ##########
-### 跨卡提交
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/a
-rc=1
---- stdout（末 5 行） ---
-checkout 偏移（0 处）:
-  （无）
-豁免（0 条）:
-  （无）
-结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
---- stderr: 空 ---
-
-########## 验收 4：绿色基线应 rc0 ##########
-### 干净仓 + 卡 worktree 目录名=卡号
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green
-rc=0
---- stdout（末 5 行） ---
-checkout 偏移（0 处）:
-  （无）
-豁免（0 条）:
-  （无）
-结论：无偏差
---- stderr: 空 ---
-
-########## 验收 6：--branch main 应 rc0 + 不是卡分支 ##########
-### --branch main
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch main
-rc=0
---- stdout（末 5 行） ---
-checkout 偏移（0 处）:
-  （无）
-豁免（0 条）:
-  （无）
-结论：无偏差
---- stderr: 空 ---
-
-########## 验收 5 + 必修 1/2：rc2 边界矩阵 ##########
-### --repo 空串
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo 
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 仓库路径为空
-
-### --repo 不存在
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /nonexistent-audit-path
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 仓库路径不存在: /nonexistent-audit-path
-
-### --repo /tmp（非 git）
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 不是 git 工作树: /tmp
-
-### --main-branch nope
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --main-branch nope
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 主分支不存在（本地与 origin 都没有）: nope
-
-### --branch 空串
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch 
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: --branch 不能为空
-
-### --branch nosuchbranch
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --branch nosuchbranch
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 分支不存在（本地与 origin 都没有）: nosuchbranch
-
-### --bogus（argparse）
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --bogus
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-usage: team-board [-h] {list,summary,member,export,branch-audit,serve} ...
-team-board: error: unrecognized arguments: --bogus
-
-### --allow-file 坏行
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --allow-file /tmp/tmp.BUX6vOhwg6/bad-allow.txt
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 豁免表 /tmp/tmp.BUX6vOhwg6/bad-allow.txt 第 1 行字段不足（至少要 <分支卡号> <对方卡号或-> <sha>）: 't_aaaaaaaa 52a2f93'
-
-### --allow-file 二进制（必修 1a）
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/green --allow-file /bin/ls
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 豁免表 /bin/ls 不是 UTF-8 文本，无法解析（第 24 字节起解码失败）
-
-### --branch 裸卡号但只有裸分支（必修 2）
-$ PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo /tmp/tmp.BUX6vOhwg6/bare --branch t_aaaaaaaa
-rc=2
---- stdout: 空 ---
---- stderr（末 3 行） ---
-错误: 分支不存在（本地与 origin 都没有）: wt/t_aaaaaaaa（t_aaaaaaaa 只匹配到 heads/t_aaaaaaaa，卡分支必须是 wt/t_aaaaaaaa）
-
-### 必修 1b：PATH 里没有 git
-$ env PATH=/nonexistent PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo <tmp>
-rc=2
-错误: 找不到 git 可执行文件（PATH 里没有 git），无法稽核
-
-### 必修 1c：LC_ALL=C + PYTHONIOENCODING=ascii（报告含中文）
-$ env LC_ALL=C PYTHONIOENCODING=ascii PYTHONPATH=/workspace/team-board/src /usr/bin/python3 -m team_board.cli branch-audit --repo <场景A仓>
-rc=2
-stdout 字节数: 0
-错误: 当前 stdout 编码 'ascii' 无法表示稽核报告里的中文，请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）
-
+$ PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src /home/liu/project/tb-wt/t_f43fa954/.venv/bin/python -m team_board.cli branch-audit <args>
+--- 绿色基线 / 场景 A / --branch main ---
+--repo <干净仓>                                       rc=0  stdout=317B  stderr首行=
+--repo <跨卡仓>                                       rc=1  stdout=519B  stderr首行=
+--repo <干净仓> --branch main                         rc=0  stdout=372B  stderr首行=
+--- rc2 矩阵（每行期望 rc=2、stdout 0B、stderr 以「错误:」开头或 argparse 报错、无 Traceback）---
+--repo ""                                                rc=2  stdout=0B  stderr首行=错误: 仓库路径为空
+--repo /nonexistent                                      rc=2  stdout=0B  stderr首行=错误: 仓库路径不存在: /nonexistent
+--repo /tmp（非 git）                                 rc=2  stdout=0B  stderr首行=错误: 不是 git 工作树: /tmp
+--main-branch nope                                       rc=2  stdout=0B  stderr首行=错误: 主分支不存在（本地与 origin 都没有）: nope
+--branch ""                                              rc=2  stdout=0B  stderr首行=错误: --branch 不能为空
+--branch nosuchbranch                                    rc=2  stdout=0B  stderr首行=错误: 分支不存在（本地与 origin 都没有）: nosuchbranch
+--bogus                                                  rc=2  stdout=0B  stderr首行=usage: team-board [-h] {list,summary,member,export,branch-audit,serve} ...
+--allow-file <坏行：字段不足>                     rc=2  stdout=0B  stderr首行=错误: 豁免表 /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NHCQaasjjC/bad-allow.txt 第 1 行字段不足（至少要 <分支卡号> <对方卡号或-> <sha>）: 't_aaaaaaaa t_bbbbbbbb'
+--allow-file /bin/ls（非 UTF-8）                      rc=2  stdout=0B  stderr首行=错误: 豁免表 /bin/ls 不是 UTF-8 文本，无法解析（第 24 字节起解码失败）
+--repo <非 UTF-8 仓：GBK 提交标题>                rc=2  stdout=0B  stderr首行=错误: git 输出不是 UTF-8，无法解析（第 60 字节起解码失败；常见原因：仓库配置 i18n.logOutputEncoding=GBK 或 core.quotePath=false 且提交信息/文件路径含非 UTF-8 字节；可执行 git config --unset i18n.logOutputEncoding 后重试）
+--tracked-but-not-a-repo 文件路径                    rc=2  stdout=0B  stderr首行=错误: 仓库路径不是目录: /home/liu/project/tb-wt/t_f43fa954/README.md
+--- 裸卡号（漏 wt/ 前缀）必修 2 复验 ---
+--branch t_aaaaaaaa（只有裸分支）                 rc=2  stdout=0B  stderr首行=错误: 分支不存在（本地与 origin 都没有）: wt/t_aaaaaaaa（t_aaaaaaaa 只匹配到 heads/t_aaaaaaaa，卡分支必须是 wt/t_aaaaaaaa）
+--- PATH 里没有 git ---
+env PATH=/nonexistent-bin-dir                            rc=2  stdout=0B  stderr首行=错误: 找不到 git 可执行文件（PATH 里没有 git），无法稽核
+--- 退出码约定：0 无偏差 / 1 发现偏差 / 2 参数或环境错误 ---

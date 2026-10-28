@@ -1,0 +1,47 @@
+######## 必修 4 修前（HEAD 的 src，只有 OSError 兜底） ########
+$ SRC=/home/liu/.hermes/profiles/engineer/cache/scratch/src-before-654523a/src bash repro4.sh    # (脚本内容见下)
+--- SRC 指: /home/liu/.hermes/profiles/engineer/cache/scratch/src-before-654523a/src   HEAD=654523a ---
+=== A: GBK 输出 + 中文提交标题 ===
+rc=1  stdout_bytes=0
+--- stdout ---
+--- stderr ---
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/liu/.hermes/profiles/engineer/cache/scratch/src-before-654523a/src/team_board/cli.py", line 325, in <module>
+    sys.exit(main())
+--- traceback? ---
+1
+=== B: core.quotePath=false + 非 UTF-8 文件名 ===
+rc=1  stdout_bytes=0
+--- stdout ---
+--- stderr ---
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/liu/.hermes/profiles/engineer/cache/scratch/src-before-654523a/src/team_board/cli.py", line 325, in <module>
+    sys.exit(main())
+--- traceback? ---
+1
+=== 对照 A: 未设 logOutputEncoding ===
+rc=1  stdout_bytes=464
+--- stdout ---
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.SGPS7yqlT4/a
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（0 处）:
+--- stderr ---
+--- traceback? ---
+0
+=== 对照 B: quotePath=true ===
+rc=1  stdout_bytes=464
+--- stdout ---
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.SGPS7yqlT4/b
+主分支: main
+检查的卡分支: t_bbbbbbbb
+提交归属偏差（0 处）:
+--- stderr ---
+--- traceback? ---
+0
