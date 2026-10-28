@@ -1,0 +1,19 @@
+DIFF: root --help
+1c1
+< usage: team-board [-h] {list,summary,member,export,serve} ...
+---
+> usage: team-board [-h] {list,summary,member,export,branch-audit,serve} ...
+6c6
+<   {list,summary,member,export,serve}
+---
+>   {list,summary,member,export,branch-audit,serve}
+10a11
+>     branch-audit        稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 / 2 参数或环境错误）
+same: list --help
+same: summary --help
+same: member --help
+same: export --help
+same: serve --help
+regression_fail=1
+
+--- 判读：root --help 的差异只有新增的 branch-audit 一行（预期）；四个既有子命令 + serve 的 --help 逐字节相同（same x5）---
