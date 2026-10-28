@@ -31,6 +31,20 @@ CACHE_CONTROL = "no-store"
 #: 会抛 ``ValueError: year ... is out of range``，不是 ``db.BoardError``
 THIRTEEN_DIGIT_MS = 1793160000000
 
+#: 全部子命令的唯一来源：README 的「<N>个子命令」与 ``--help`` 的 ``{…}`` 列表
+#: 都从这里取，个数由 ``len()`` 推出，不写死数字
+EXPECTED_SUBCOMMANDS = (
+    "list",
+    "summary",
+    "member",
+    "export",
+    "branch-audit",
+    "serve",
+)
+
+#: 中文数字：README 用汉字写个数（「六个子命令」），断言时由常量长度查表
+CN_DIGITS = {5: "五", 6: "六"}
+
 
 @pytest.fixture()
 def board(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -852,7 +866,7 @@ def test_serve_port_non_plain_decimal_exit_two(
 
 
 # --------------------------------------------------------------------------- #
-# 15) README 与 --help 对齐：五个子命令、serve 无 --now
+# 15) README 与 --help 对齐：子命令清单（常量）、serve 无 --now
 # --------------------------------------------------------------------------- #
 
 
@@ -864,8 +878,8 @@ def _option_strings(parser: argparse.ArgumentParser) -> set[str]:
     }
 
 
-def test_readme_and_help_agree_on_five_subcommands() -> None:
-    """README「五个子命令」与实际 parser 一致；serve 只认 ``--db/--port/--bind``。"""
+def test_readme_and_help_agree_on_subcommands() -> None:
+    """README 的子命令个数与 parser 一致；serve 只认 ``--db/--port/--bind``。"""
     readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(
         encoding="utf-8"
     )
@@ -875,14 +889,11 @@ def test_readme_and_help_agree_on_five_subcommands() -> None:
         for action in parser._actions
         if isinstance(action, argparse._SubParsersAction)
     )
-    assert sorted(subparsers.choices) == [
-        "export",
-        "list",
-        "member",
-        "serve",
-        "summary",
-    ]
-    assert "五个子命令" in readme
+    # 期望清单来自 EXPECTED_SUBCOMMANDS：个数不写死，增删子命令只改这一处
+    assert sorted(subparsers.choices) == sorted(EXPECTED_SUBCOMMANDS)
+    assert len(subparsers.choices) == len(EXPECTED_SUBCOMMANDS)
+    count_cn = CN_DIGITS[len(EXPECTED_SUBCOMMANDS)]
+    assert f"{count_cn}个子命令" in readme
     assert "两个参数四个子命令" not in readme
 
     for name in ("list", "summary", "member", "export"):
@@ -897,12 +908,12 @@ def test_readme_and_help_agree_on_five_subcommands() -> None:
     assert excinfo.value.code == 2
 
 
-def test_help_text_lists_all_five_subcommands() -> None:
-    """``team-board --help`` 的 {list,summary,member,export,serve} 与 README 同一组。"""
+def test_help_text_lists_all_subcommands() -> None:
+    """``team-board --help`` 的子命令表与 ``EXPECTED_SUBCOMMANDS`` 同一组。"""
     help_text = cli.build_parser().format_help()
-    for name in ("list", "summary", "member", "export", "serve"):
+    for name in EXPECTED_SUBCOMMANDS:
         assert f"    {name} " in help_text or f"    {name}\n" in help_text
-    assert "{list,summary,member,export,serve}" in help_text
+    assert "{" + ",".join(EXPECTED_SUBCOMMANDS) + "}" in help_text
 
 
 # --------------------------------------------------------------------------- #

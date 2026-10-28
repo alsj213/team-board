@@ -1,0 +1,39 @@
+时间: 2026-10-28 23:17:50 CST
+$ git -C /home/liu/project/team-board worktree list
+/home/liu/project/team-board             94be67a [wt/t_68b0a37a]
+/home/liu/project/tb-wt/main_t_6d5fcf9d  80fbd99 (detached HEAD)
+/home/liu/project/tb-wt/t_37a51cf3       a50484c [wt/t_37a51cf3]
+/home/liu/project/tb-wt/t_b489e268       de7f2d5 [wt/t_b489e268]
+/home/liu/project/tb-wt/t_f43fa954       654523a [wt/t_f43fa954]
+
+$ git -C /home/liu/project/team-board rev-parse --abbrev-ref HEAD
+wt/t_68b0a37a
+
+$ cd /home/liu/project/team-board && PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src .venv/bin/python -m team_board.cli branch-audit
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/project/team-board
+主分支: main
+检查的卡分支: t_06c7b458、t_37a51cf3、t_41c252d2、t_589cc33a、t_67cd6c50、t_68b0a37a、t_b489e268、t_b5fde972、t_c6e1f623、t_f43fa954
+提交归属偏差（7 处）:
+  1. 卡 t_589cc33a 的分支上，提交 28221cf "test(evidence): 故意违规样例 _red_demo.py（验证 ruff/mypy/bandit 三类闸门会红，合并前删除）" 未声明卡号（无法归属）；证据：提交标题
+  2. 卡 t_589cc33a 的提交 de7f2d5 "test(evidence): t_b489e268 四个 CI check 全 pass（ruff/mypy/bandit/pytest 3.12）" 申报的是卡 t_b489e268（跨卡提交）；证据：提交标题
+  3. 卡 t_589cc33a 的提交 1705f7d "fix(lint): 手改 21 处基线违规（ruff 15 / mypy 5 / bandit 1）" 申报的是卡 t_b489e268（跨卡提交）；证据：文件路径 evidence/t_b489e268-static-bandit.log
+  4. 卡 t_589cc33a 的分支上，提交 36a0203 "chore(lint): 落 ruff/mypy/bandit 配置 + 三个 CI job + README 本地命令" 未声明卡号（无法归属）；证据：提交标题
+  5. 卡 t_68b0a37a 的分支上，提交 94be67a "fix(web,cli): summary 不再依赖 task_events + 500 脱敏 + REFRESH_MS 单源 + --port 严解析 + README/help 对齐" 未声明卡号（无法归属）；证据：提交标题
+  6. 卡 t_b489e268 的分支上，提交 36a0203 "chore(lint): 落 ruff/mypy/bandit 配置 + 三个 CI job + README 本地命令" 未声明卡号（无法归属）；证据：提交标题
+  7. 卡 t_c6e1f623 的分支上，提交 94be67a "fix(web,cli): summary 不再依赖 task_events + 500 脱敏 + REFRESH_MS 单源 + --port 严解析 + README/help 对齐" 未声明卡号（无法归属）；证据：提交标题
+checkout 偏移（2 处）:
+  1. /home/liu/project/team-board 当前在 wt/t_68b0a37a（应为 main）
+  2. /home/liu/project/tb-wt/main_t_6d5fcf9d 当前在 detached@80fbd99（应为 main）
+豁免（0 条）:
+  （无）
+结论：发现 9 处偏差（提交归属 7 处 / checkout 2 处）
+exit=1
+
+--- 污染自查：真仓库 status（本工具只读，跑前跑后必须一致）---
+$ git -C /home/liu/project/team-board status --porcelain --untracked-files=all | sha256sum ; wc -l
+88e522a0ed1193bfdf96ad816455d09606a342ed7b182a42a91eec26b5b5b7e7  -
+37
+88e522a0ed1193bfdf96ad816455d09606a342ed7b182a42a91eec26b5b5b7e7  -
+37
+结论：跑前跑后 status 完全一致（37 行，均为他卡产物，本工具零写入）

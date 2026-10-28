@@ -1,0 +1,4 @@
+$ cd /home/liu/project/tb-wt/t_f43fa954 && PYTHONPATH=src TZ=Asia/Shanghai .venv/bin/python -m pytest -q
+exit=0
+--- 汇总行 ---
+248 passed in 19.68s

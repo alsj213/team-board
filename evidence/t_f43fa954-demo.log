@@ -1,0 +1,150 @@
+$ cd /home/liu/project/tb-wt/t_f43fa954 && bash scripts/demo-branch-audit.sh
+真仓库快照对象: /home/liu/project/team-board
+== 真仓库快照（开始） ==
+?? evidence/t_06c7b458-blob-methods-probe.log
+?? evidence/t_06c7b458-grep.log
+?? evidence/t_06c7b458-pytest.log
+?? evidence/t_06c7b458-r6-r7.log
+?? evidence/t_1b200562-ci-final.log
+?? evidence/t_1b200562-red-before-fix.log
+?? evidence/t_589cc33a-acceptance.log
+?? evidence/t_589cc33a-ci-bandit-fail.log
+?? evidence/t_589cc33a-ci-mypy-fail.log
+?? evidence/t_589cc33a-ci-pytest-summary.log
+?? evidence/t_589cc33a-ci-pytest.log
+?? evidence/t_589cc33a-ci-ruff-fail.log
+?? evidence/t_589cc33a-local-bandit.log
+?? evidence/t_589cc33a-local-mypy.log
+?? evidence/t_589cc33a-local-ruff.log
+?? evidence/t_589cc33a-pr-checks.log
+?? evidence/t_589cc33a-pytest.log
+?? evidence/t_589cc33a-red-bandit.log
+?? evidence/t_589cc33a-red-failed.log
+?? evidence/t_589cc33a-red-mypy.log
+?? evidence/t_589cc33a-red-ruff.log
+?? evidence/t_c6e1f623-acceptance-port.log
+?? evidence/t_c6e1f623-acceptance-refresh-help.log
+?? evidence/t_c6e1f623-acceptance-web.log
+?? evidence/t_c6e1f623-acceptance.log
+?? evidence/t_c6e1f623-acceptance.py
+?? evidence/t_c6e1f623-pr-checks.log
+?? evidence/t_c6e1f623-pytest-baseline.log
+?? evidence/t_c6e1f623-pytest-ci-mimic.log
+?? evidence/t_c6e1f623-pytest-focused.log
+?? evidence/t_c6e1f623-pytest.log
+?? evidence/t_c6e1f623-regression.log
+?? evidence/t_c6e1f623-regression.sh
+?? evidence/t_c6e1f623-ruff-baseline-vs-branch.log
+?? evidence/t_c6e1f623-static.log
+?? evidence/t_ce436613-merge.log
+---- worktree list ----
+/home/liu/project/team-board             94be67a [wt/t_68b0a37a]
+/home/liu/project/tb-wt/main_t_6d5fcf9d  80fbd99 (detached HEAD)
+/home/liu/project/tb-wt/t_37a51cf3       a50484c [wt/t_37a51cf3]
+/home/liu/project/tb-wt/t_b489e268       de7f2d5 [wt/t_b489e268]
+/home/liu/project/tb-wt/t_f43fa954       654523a [wt/t_f43fa954]
+
+== 场景 A：卡 t_aaaaaaaa 的分支上出现 t_bbbbbbbb 的提交 ==
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/a/repo
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（1 处）:
+  1. 卡 t_aaaaaaaa 的提交 3bcd824 "feat: t_bbbbbbbb 的活跑到 A 分支" 申报的是卡 t_bbbbbbbb（跨卡提交）；证据：提交标题
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
+  ✓ 场景 A（rc=1）
+
+== 场景 A'：卡分支上的提交没有写卡号 ==
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/ap/repo
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（1 处）:
+  1. 卡 t_aaaaaaaa 的分支上，提交 49ef307 "chore: 顺手改点东西（没写卡号）" 未声明卡号（无法归属）；证据：提交标题
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
+  ✓ 场景 A'（rc=1）
+
+== 场景 B：主 checkout 停在卡分支 + 卡 worktree 目录名不对 ==
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/b/repo
+主分支: main
+检查的卡分支: t_aaaaaaaa、t_bbbbbbbb
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（2 处）:
+  1. /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/b/repo 当前在 wt/t_aaaaaaaa（应为 main）
+  2. /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/b/wrongdir 当前在 wt/t_bbbbbbbb（应为 wt/wrongdir）
+豁免（0 条）:
+  （无）
+结论：发现 2 处偏差（提交归属 0 处 / checkout 2 处）
+  ✓ 场景 B（rc=1）
+
+== 绿色基线：main 干净 + 卡分支干净 + 卡 worktree 目录名=卡号 ==
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.yD3YemREmW/g/repo
+主分支: main
+检查的卡分支: t_aaaaaaaa
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+  ✓ 绿色基线（rc=0）
+
+== 真仓库快照（结束） ==
+?? evidence/t_06c7b458-blob-methods-probe.log
+?? evidence/t_06c7b458-grep.log
+?? evidence/t_06c7b458-pytest.log
+?? evidence/t_06c7b458-r6-r7.log
+?? evidence/t_1b200562-ci-final.log
+?? evidence/t_1b200562-red-before-fix.log
+?? evidence/t_589cc33a-acceptance.log
+?? evidence/t_589cc33a-ci-bandit-fail.log
+?? evidence/t_589cc33a-ci-mypy-fail.log
+?? evidence/t_589cc33a-ci-pytest-summary.log
+?? evidence/t_589cc33a-ci-pytest.log
+?? evidence/t_589cc33a-ci-ruff-fail.log
+?? evidence/t_589cc33a-local-bandit.log
+?? evidence/t_589cc33a-local-mypy.log
+?? evidence/t_589cc33a-local-ruff.log
+?? evidence/t_589cc33a-pr-checks.log
+?? evidence/t_589cc33a-pytest.log
+?? evidence/t_589cc33a-red-bandit.log
+?? evidence/t_589cc33a-red-failed.log
+?? evidence/t_589cc33a-red-mypy.log
+?? evidence/t_589cc33a-red-ruff.log
+?? evidence/t_c6e1f623-acceptance-port.log
+?? evidence/t_c6e1f623-acceptance-refresh-help.log
+?? evidence/t_c6e1f623-acceptance-web.log
+?? evidence/t_c6e1f623-acceptance.log
+?? evidence/t_c6e1f623-acceptance.py
+?? evidence/t_c6e1f623-pr-checks.log
+?? evidence/t_c6e1f623-pytest-baseline.log
+?? evidence/t_c6e1f623-pytest-ci-mimic.log
+?? evidence/t_c6e1f623-pytest-focused.log
+?? evidence/t_c6e1f623-pytest.log
+?? evidence/t_c6e1f623-regression.log
+?? evidence/t_c6e1f623-regression.sh
+?? evidence/t_c6e1f623-ruff-baseline-vs-branch.log
+?? evidence/t_c6e1f623-static.log
+?? evidence/t_ce436613-merge.log
+---- worktree list ----
+/home/liu/project/team-board             94be67a [wt/t_68b0a37a]
+/home/liu/project/tb-wt/main_t_6d5fcf9d  80fbd99 (detached HEAD)
+/home/liu/project/tb-wt/t_37a51cf3       a50484c [wt/t_37a51cf3]
+/home/liu/project/tb-wt/t_b489e268       de7f2d5 [wt/t_b489e268]
+/home/liu/project/tb-wt/t_f43fa954       654523a [wt/t_f43fa954]
+  ✓ 真仓库状态与演示前完全一致（未被污染）
+
+演示结论：4 个场景全部符合预期
+exit=0

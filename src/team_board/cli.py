@@ -4,6 +4,15 @@
 - 0：成功
 - 1：数据源有问题（db.BoardError，连接失败或 render_* 抛的 BoardError）
 - 2：argparse 自己判定参数/子命令非法（含 ``--now`` 越界、``--date`` 非 YYYY-MM-DD）
+
+``branch-audit`` 子命令自己的退出码：
+- 0：无偏差
+- 1：发现偏差（提交归属 / checkout 偏移）
+- 2：参数或环境错误（``branches.AuditError`` → stderr ``错误: …``、stdout 空、
+  不冒 traceback；argparse 级坏参数照旧 rc2）。环境错误包含：``PATH`` 里没有
+  ``git``、豁免表不是 UTF-8 文本、git 输出不是 UTF-8（``i18n.logOutputEncoding``
+  设成 GBK、``core.quotePath=false`` + 非 UTF-8 文件名）、stdout/stderr 编码
+  表示不了中文（``PYTHONIOENCODING=ascii``）
 """
 
 from __future__ import annotations
@@ -14,7 +23,7 @@ import sys
 import time
 from datetime import date, datetime
 
-from . import commands, db, web
+from . import branches, commands, db, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -130,6 +139,35 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "member":
             sub.add_argument("name", help="成员名（对应 tasks.assignee）")
 
+    audit_cmd = subparsers.add_parser(
+        "branch-audit",
+        help="稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 / 2 参数或环境错误）",
+    )
+    audit_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要稽核的 git 仓库路径（默认当前目录）",
+    )
+    audit_cmd.add_argument(
+        "--main-branch",
+        default="main",
+        metavar="NAME",
+        help="主分支名（默认 main）",
+    )
+    audit_cmd.add_argument(
+        "--branch",
+        default=None,
+        metavar="NAME",
+        help="只稽核这一条分支（接受 wt/t_xxx 或 t_xxx；默认查全部卡分支）",
+    )
+    audit_cmd.add_argument(
+        "--allow-file",
+        default=None,
+        metavar="PATH",
+        help="豁免表路径（默认 <repo>/.team-board/branch-audit-allow.txt）",
+    )
+
     serve = subparsers.add_parser(
         "serve", help="启动只读 Web 看板（默认 127.0.0.1:8787）"
     )
@@ -155,6 +193,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _write_stderr_error(message: str) -> None:
+    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。
+
+    用户可能跑在 ``LC_ALL=C PYTHONIOENCODING=ascii`` 下：这条消息里有中文，
+    直接 ``print(..., file=sys.stderr)`` 会 ``UnicodeEncodeError``（于是 rc1 +
+    traceback，跟「发现偏差」同码），或者被 Python 默认的 ``backslashreplace``
+    转成 ``\\u9519\\u8bef: …``（那就不是 ``错误: `` 了）。所以先问 stderr 的编码
+    能不能表示整行，能就正常写；不能就按 UTF-8 字节直写 ``stderr.buffer``。
+    """
+
+    line = f"错误: {message}\n"
+    encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
+    try:
+        line.encode(encoding)
+    except UnicodeEncodeError:
+        data = line.encode("utf-8")
+        buffer = getattr(sys.stderr, "buffer", None)
+        if buffer is not None:
+            buffer.write(data)
+            buffer.flush()
+        else:  # pragma: no cover - 没有 buffer 的替身对象（极少见）
+            sys.stderr.write(data.decode("utf-8", "backslashreplace"))
+        return
+    sys.stderr.write(line)
+    sys.stderr.flush()
 
 
 def _run_serve(args: argparse.Namespace) -> int:
@@ -194,9 +259,46 @@ def _run_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_branch_audit(args: argparse.Namespace) -> int:
+    """``branch-audit`` 子命令：AuditError → stderr ``错误: …`` + rc2，不冒 traceback。
+
+    报告整块生成后再一次性写出：stdout 编码表示不了中文（如
+    ``PYTHONIOENCODING=ascii``）属于环境级错误 → rc2、stdout 空、stderr
+    ``错误: …``，不许退化成 rc1 + traceback（rc1 是「发现偏差」的专用码）。
+    """
+
+    try:
+        report = branches.audit(
+            args.repo,
+            main_branch=args.main_branch,
+            only_branch=args.branch,
+            allow_file=args.allow_file,
+        )
+    except branches.AuditError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    text = branches.render_report(report)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # TextIOWrapper 先整体编码再写出：编码失败时 stdout 里一个字节都没落
+        _write_stderr_error(
+            "当前 stdout 编码 "
+            f"{getattr(sys.stdout, 'encoding', None)!r} 无法表示稽核报告里的中文，"
+            "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
+        )
+        return 2
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "branch-audit":
+        return _run_branch_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)

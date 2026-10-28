@@ -1,0 +1,44 @@
+########## 部件 1：老分支（本 job 合入前切出来的树，没有 .team-board）##########
+$ git -C <老分支树> archive HEAD src .team-board   # 旧写法（会 fatal）
+旧写法 exit=128
+fatal: pathspec '.team-board' did not match any files
+
+$ 新写法（workflow 第 57-68 行那几行，原样）
+新写法 exit=0
+暂存内容：./src 
+豁免表存在？ 否-按空表处理
+
+########## 部件 2：本 PR 的树（带 .team-board），按 workflow 全流程 ##########
+暂存内容：./.team-board ./src 
+切回 main 后 main
+
+$ PYTHONPATH=$RUNNER_TEMP/pr-src/src python -m team_board.cli branch-audit --repo <PR> --branch wt/t_bbbbbbbb --allow-file $RUNNER_TEMP/pr-src/.team-board/branch-audit-allow.txt   # PR 只看自己
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.a48KCUo02f/pr
+主分支: main
+检查的卡分支: t_bbbbbbbb
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+exit=0
+
+$ 同一棵树不带 --branch（push→main 全量）
+  （无）
+豁免（0 条）:
+  （无）
+结论：发现 1 处偏差（提交归属 1 处 / checkout 0 处）
+exit=1
+
+$ PYTHONPATH=<origin/main 的 src>（错误做法：不归档 PR 的 src 会怎样）
+usage: team-board [-h] {list,summary,member,export,serve} ...
+team-board: error: argument command: invalid choice: 'branch-audit' (choose from 'list', 'summary', 'member', 'export', 'serve')
+exit=2
+
+########## 部件 3：本 PR 的豁免表必须只有注释头 ##########
+$ grep -vc '^\s*\(#\|$\)' /home/liu/project/tb-wt/t_f43fa954/.team-board/branch-audit-allow.txt
+0
+（非注释行数如上；grep 无匹配时 rc1 属正常）
