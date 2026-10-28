@@ -208,3 +208,54 @@ def test_console_script_exit_codes(board: tuple[Path, dict[str, str]]) -> None:
         [str(exe), "list", "--bogus"], capture_output=True, text=True, check=False
     )
     assert bad_arg.returncode == 2
+
+
+def _make_double_null_db(path: Path) -> None:
+    """只建临时库：一张 tasks（含双 NULL 脏行）+ 空 task_events。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
+                created_at INTEGER, started_at INTEGER, completed_at INTEGER
+            );
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, created_at INTEGER
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES"
+            " ('t_null_ts', 'NULL 时间戳卡', 'pm', 'running', NULL, NULL, NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("sub", ["list", "export", "summary"])
+def test_double_null_timestamps_exits_one_without_traceback(
+    tmp_path: Path, sub: str
+) -> None:
+    """真进程：双 NULL 时间戳的库，三个子命令都走「错误: …」+ rc1，不冒 traceback。"""
+    exe = Path(__file__).resolve().parents[2] / ".venv/bin/team-board"
+    if not exe.exists():  # pragma: no cover - 环境里没有 console script 时跳过
+        pytest.skip("console script 不存在")
+
+    db = tmp_path / "null_ts.db"
+    _make_double_null_db(db)
+
+    run = subprocess.run(
+        [str(exe), sub, "--db", str(db)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 1, run.stderr
+    assert run.stdout == ""
+    assert run.stderr.startswith("错误: "), run.stderr
+    assert "t_null_ts" in run.stderr
+    assert "缺少 created_at/started_at" in run.stderr
+    assert "Traceback" not in run.stderr
+    assert "TypeError" not in run.stderr

@@ -39,24 +39,37 @@ _TASK_COLUMNS = "id, title, assignee, status, created_at, started_at, completed_
 
 
 def load_tasks(conn: sqlite3.Connection) -> list[Task]:
-    """全部卡（含 archived），按 (created_at, id) 升序。"""
+    """全部卡（含 archived），按 (created_at, id) 升序。
+
+    ``created_at`` 与 ``started_at`` 同时为 NULL 的卡是脏数据：耗时口径
+    （``model.Task.start_ts`` 回退链）无从取值，在这里直接抛 BoardError，
+    由 ``cli.main`` 统一渲染成 ``错误: …`` + 退出码 1，不让裸 TypeError 泄到
+    stderr。只缺 ``started_at`` 的卡仍按旧口径回退到 ``created_at``。
+    """
     sql = f"SELECT {_TASK_COLUMNS} FROM tasks ORDER BY created_at, id"
     try:
         rows = conn.execute(sql).fetchall()
     except sqlite3.Error as exc:
         raise BoardError(f"读取 tasks 失败: {exc}") from exc
-    return [
-        Task(
-            id=row[0],
-            title=row[1],
-            assignee=row[2],
-            status=row[3],
-            created_at=row[4],
-            started_at=row[5],
-            completed_at=row[6],
+
+    tasks: list[Task] = []
+    for row in rows:
+        if row[4] is None and row[5] is None:
+            raise BoardError(
+                f"任务 {row[0]} 缺少 created_at/started_at，无法计算耗时"
+            )
+        tasks.append(
+            Task(
+                id=row[0],
+                title=row[1],
+                assignee=row[2],
+                status=row[3],
+                created_at=row[4],
+                started_at=row[5],
+                completed_at=row[6],
+            )
         )
-        for row in rows
-    ]
+    return tasks
 
 
 def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
