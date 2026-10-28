@@ -1,0 +1,30 @@
+#!/bin/sh
+# pre-push：禁止直接 push 到 main / master，其余分支放行。
+# 起因：私有仓免费计划下无法开分支保护（API 403），护栏只能放在客户端。
+# 绕过方式：git push --no-verify（应仅限紧急回滚，且事后补 PR）。
+
+blocked=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/main | refs/heads/master)
+            blocked=1
+            printf '\n[pre-push] 拒绝：不允许直接 push 到 %s\n' "${remote_ref#refs/heads/}" >&2
+            if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+                printf '[pre-push] 这是删除远端分支的操作，同样禁止。\n\n' >&2
+            else
+                printf '[pre-push] 正确做法：走分支 + PR\n' >&2
+                printf '  git switch -c wt/<主题>\n' >&2
+                printf '  git push -u origin wt/<主题>\n' >&2
+                printf '  gh pr create --base main --head wt/<主题>\n\n' >&2
+            fi
+            ;;
+    esac
+done
+
+if [ "$blocked" -ne 0 ]; then
+    printf '[pre-push] 本次 push 已中止（远端未被修改）。\n' >&2
+    exit 1
+fi
+
+exit 0
