@@ -147,11 +147,59 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
 这类脏值在 Web 两个接口上一律 500 `data_invalid`（**不再**静默算成 0 分钟）；
 命令行子命令不做这个校验，耗时仍按「口径」段的规则夹到下限 0。
 
+## 分支稽核（branch-audit）
+
+一条命令查两类偏差：**卡分支上的提交归属**与 **checkout 偏移**。只读 git，不改任何
+分支、不碰工作区。
+
+```
+team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--allow-file PATH]
+```
+
+- `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
+- `--main-branch NAME` —— 主分支名（默认 `main`）；本地没有就退回 `origin/<NAME>`。
+- `--branch NAME` —— 只查这一条分支（`wt/t_xxx` 或 `t_xxx` 两种写法都行）；
+  CI 用它让每张 PR 只对自己的分支负责。指定的分支存在但不是卡分支 → 输出
+  `… 不是卡分支，跳过提交归属检查`，只做 checkout 检查。
+- `--allow-file PATH` —— 豁免表（默认 `<repo>/.team-board/branch-audit-allow.txt`）。
+
+**规则 A：卡分支上的提交归属。** 卡分支指名字精确等于 `wt/t_<8 位卡号>` 的本地
+分支与 `origin/` 远端分支（`main`、`pm/ci-check`、`wt/ci-setup` 一律跳过）。对
+`main..<卡分支>` 的每个非合并提交，申报卡号 = 提交标题里的卡号 ∪ 改动文件路径里的
+卡号（**不看正文**）。两种判红：集合为空 → `未声明卡号（无法归属）`；集合里有别的
+卡号 → `跨卡提交`，两张卡号都点名。豁免只能按「分支卡号 + 对方卡号（或 `-`）+
+提交 sha7..40 + 理由」逐条登记，命中时输出里回显理由，不会静默吞掉。
+
+豁免表格式（`#` 开头为注释；文件不存在视为空表；少字段 / 缺理由 / sha 不是 7–40 位
+小写十六进制 → 退出码 2）：
+
+```
+# <分支卡号> <对方卡号或 -> <提交sha7..40> <理由，必填>
+# 例：t_b5fde972 t_1b200562 52a2f93  W1 的返工卡 t_1b200562 修原卡 P2，同一卡族
+```
+
+**规则 B：checkout 偏移。** 主 checkout（`git rev-parse --git-common-dir` 的父目录）
+必须停在 `<main-branch>`；其它 worktree 的 detached HEAD 一律判红，分支是
+`wt/t_<X>` 时目录名必须精确是 `t_<X>`，其它分支也必须是 `main`。豁免不适用于规则 B。
+
+退出码：
+
+- `0` —— 无偏差（打印人类可读结论，结尾 `结论：无偏差`）。
+- `1` —— 发现偏差（结尾 `结论：发现 N 处偏差（提交归属 M 处 / checkout K 处）`）。
+- `2` —— 参数或环境错误：仓库路径不存在 / 不是 git 工作树、主分支不存在、
+  `--branch` 指定的 ref 不存在、豁免表某行格式非法；stderr 以 `错误: ` 开头、
+  stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
+
+故意造偏差的演示（全部在 `mktemp -d` 里造仓，跑完自动清理，真仓库状态前后一致）：
+
+```
+bash scripts/demo-branch-audit.sh
+```
+
 ## 通用参数
 
-共五个子命令：`list` / `summary` / `member` / `export` 支持下面两个参数；
-`serve` 只支持 `--db`（另有 `--port` / `--bind`，见上），**不接受 `--now`**
-（快照时刻取服务进程的真实时钟）。
+`list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` 与
+`branch-audit` 各有自己的参数）：
 
 - `--db PATH` —— 看板库路径，默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
@@ -177,6 +225,9 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
   stderr 以 `错误: ` 开头，stdout 为空。
 - `2` —— 参数错误（未知子命令、`--date` 格式非法、`member` 缺名字等），
   由 argparse 报错。
+
+`branch-audit` 沿用同一组数字但语义不同：`1` 表示**发现偏差**（不是数据源错误），
+`2` 表示参数或环境错误；详见上面「分支稽核」一节。
 
 ## 口径
 

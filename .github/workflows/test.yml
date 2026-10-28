@@ -30,6 +30,33 @@ jobs:
           TZ: Asia/Shanghai
         run: python -m pytest -q
 
+  branch-audit:
+    name: branch-audit (卡分支/checkout)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch all branches
+        run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      - name: Put the runner checkout back on main
+        run: git checkout -B main origin/main
+      - name: Run branch audit
+        env:
+          PYTHONPATH: src
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ -n "$HEAD_REF" ]; then
+            python -m team_board.cli branch-audit --branch "$HEAD_REF"
+          else
+            python -m team_board.cli branch-audit
+          fi
+
   ruff:
     name: ruff (3.12)
     runs-on: ubuntu-latest
