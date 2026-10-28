@@ -22,6 +22,9 @@ team-board member engineer
 team-board export
 ```
 
+共六个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `serve`
+（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节）。
+
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
   review → done）→ 同状态内耗时降序 → id 升序；`archived` 不显示。
@@ -190,9 +193,10 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 - `1` —— 发现偏差（结尾 `结论：发现 N 处偏差（提交归属 M 处 / checkout K 处）`）。
 - `2` —— 参数或环境错误：仓库路径不存在 / 不是 git 工作树、主分支不存在、
   `--branch` 指定的 ref 不存在（含裸卡号解析不到 `wt/t_xxx`）、豁免表某行格式
-  非法、豁免表不是 UTF-8 文本、`PATH` 里没有 `git`、stdout/stderr 编码表示不了
-  中文；stderr 以 `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数
-  照旧 rc2）。崩溃绝不会和「发现偏差」同码。
+  非法、豁免表不是 UTF-8 文本、`PATH` 里没有 `git`、**git 输出不是 UTF-8**
+  （`i18n.logOutputEncoding=GBK` 或 `core.quotePath=false` + 非 UTF-8 文件名）、
+  stdout/stderr 编码表示不了中文；stderr 以 `错误: ` 开头、stdout 为空、不冒
+  traceback（argparse 级坏参数照旧 rc2）。崩溃绝不会和「发现偏差」同码。
 
 故意造偏差的演示（全部在 `mktemp -d` 里造仓，跑完自动清理，真仓库状态前后一致）：
 

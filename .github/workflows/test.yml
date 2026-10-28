@@ -57,7 +57,14 @@ jobs:
       - name: Stage the PR's own source and allowlist (audit must run this build)
         run: |
           mkdir -p "$RUNNER_TEMP/pr-src"
-          git archive HEAD src .team-board | tar -x -C "$RUNNER_TEMP/pr-src"
+          # 老分支（本 job 合入前切出来的）树里没有 .team-board：把它硬塞进
+          # pathspec 会让 git archive 直接 fatal（跟稽核毫无关系的失败 → 假红），
+          # 所以先探一下再决定要不要带上；没有就当空表（缺文件=空表，语义已有）。
+          PATHS="src"
+          if git cat-file -e HEAD:.team-board 2>/dev/null; then
+            PATHS="$PATHS .team-board"
+          fi
+          git archive HEAD $PATHS | tar -x -C "$RUNNER_TEMP/pr-src"
       - name: Put the runner checkout back on main
         run: git checkout -B main origin/main
       - name: Run branch audit

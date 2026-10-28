@@ -401,8 +401,70 @@ def test_ascii_stdout_returns_two(
 
     assert proc.returncode == 2, proc.stderr
     assert proc.stdout == b""
-    assert proc.stderr.startswith("错误: ".encode("utf-8"))
+    assert proc.stderr.startswith("错误: ".encode())
     assert b"Traceback" not in proc.stderr
+
+
+# ------------------- 必修 4：git 输出不是 UTF-8 也一律 rc2（不许 rc1 + traceback）
+# 判据同必修 1：rc1 只表示「发现偏差」，解码失败是环境错误 → rc2 + `错误: ` +
+# stdout 空 + 无 traceback。崩溃发生在第一条 git log，不兜住就整轮稽核中断。
+
+
+def test_git_output_non_utf8_returns_two_gbk_log_encoding(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``i18n.logOutputEncoding=GBK`` + 中文提交标题 → rc2；去掉该配置后 rc0。"""
+
+    git(repo, "config", "i18n.logOutputEncoding", "GBK")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "gbk.txt", "feat(t_aaaaaaaa): 中文标题的提交")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "UTF-8" in err
+    assert "Traceback" not in err
+
+    # 对照：同一棵树去掉 logOutputEncoding → 正常稽核，rc0
+    git(repo, "config", "--unset", "i18n.logOutputEncoding")
+    rc_ok, out_ok, err_ok = run(["--repo", str(repo)], capsys)
+
+    assert rc_ok == 0, (rc_ok, out_ok, err_ok)
+    assert err_ok == ""
+    assert "结论：无偏差" in out_ok
+
+
+def test_git_output_non_utf8_returns_two_raw_path_bytes(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``core.quotePath=false`` + 文件名含非 UTF-8 字节 → rc2；quotePath 恢复后 rc0。"""
+
+    git(repo, "config", "core.quotePath", "false")
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    weird_name = os.fsdecode(b"bad_\xff\xfe.txt")
+    (repo / weird_name).write_bytes(b"x\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feat(t_bbbbbbbb): 非 UTF-8 文件名")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "UTF-8" in err
+    assert "Traceback" not in err
+
+    # 对照：quotePath 恢复成默认值 → 同一棵树正常稽核，rc0
+    git(repo, "config", "core.quotePath", "true")
+    rc_ok, out_ok, err_ok = run(["--repo", str(repo)], capsys)
+
+    assert rc_ok == 0, (rc_ok, out_ok, err_ok)
+    assert err_ok == ""
+    assert "结论：无偏差" in out_ok
 
 
 # ------------------------------------------------- --branch 只看一条分支

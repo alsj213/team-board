@@ -10,8 +10,9 @@
 - 1：发现偏差（提交归属 / checkout 偏移）
 - 2：参数或环境错误（``branches.AuditError`` → stderr ``错误: …``、stdout 空、
   不冒 traceback；argparse 级坏参数照旧 rc2）。环境错误包含：``PATH`` 里没有
-  ``git``、豁免表不是 UTF-8 文本、stdout/stderr 编码表示不了中文
-  （``PYTHONIOENCODING=ascii``）
+  ``git``、豁免表不是 UTF-8 文本、git 输出不是 UTF-8（``i18n.logOutputEncoding``
+  设成 GBK、``core.quotePath=false`` + 非 UTF-8 文件名）、stdout/stderr 编码
+  表示不了中文（``PYTHONIOENCODING=ascii``）
 """
 
 from __future__ import annotations

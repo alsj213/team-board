@@ -28,14 +28,18 @@
 - 其它 worktree：detached HEAD 一律判红；分支为 ``wt/t_<X>`` 时目录名必须
   精确等于 ``t_<X>``；分支为 ``<main_branch>`` 通过；其它分支判红。
 
-退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``）。
+退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``，
+含 ``PATH`` 里没有 ``git``、豁免表不是 UTF-8、**git 输出不是 UTF-8**）。
 """
 
 from __future__ import annotations
 
 import os
 import re
-import subprocess
+
+# bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git），
+# 调用形式为 argv 列表、shell=False，不拼 shell 字符串
+import subprocess  # nosec B404
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -121,21 +125,42 @@ class Report:
 def _git(repo: str | Path, *args: str) -> subprocess.CompletedProcess[str]:
     """在 ``repo`` 里跑 git，不抛 CalledProcessError，交给调用方判 rc。
 
-    ``PATH`` 里没有 ``git``（``FileNotFoundError``）或其它 ``OSError``
-    （权限、进程数上限等）都是环境级错误 → ``AuditError``（CLI 转 rc2），
-    不许冒 ``FileNotFoundError`` 给用户。
+    两类环境级错误一律 ``AuditError``（CLI 转 rc2），不许冒 traceback 给用户：
+
+    - ``PATH`` 里没有 ``git``（``FileNotFoundError``）或其它 ``OSError``
+      （权限、进程数上限等）；
+    - git 输出**不是 UTF-8**：``i18n.logOutputEncoding=GBK``（中文 Windows
+      常见）下 ``git log`` 会把提交标题转码输出，``core.quotePath=false``
+      下 ``--name-only`` 会吐原始字节，``subprocess`` 的严格解码于是抛
+      ``UnicodeDecodeError``（``ValueError`` 系，不是 ``OSError``，会直接逃出）。
+      rc1 是「发现偏差」的专用码，崩溃必须与它分开 —— 这里的解码失败意味着
+      整轮稽核没法进行，属环境错误。
+
+    解码固定用 UTF-8（不随 ``locale`` 漂移），因此同样的仓库在任何机器上
+    得到同样的 rc。
     """
 
     try:
-        return subprocess.run(
+        # bandit B603/B607 假阳性：可执行文件名写死为 "git"（走 PATH 以保证
+        # 跨平台一致）；参数以 argv 列表传入、shell=False（默认），用户给的
+        # 仓库路径/分支名只作为独立 argv 元素，不经 shell 解释，无注入面
+        return subprocess.run(  # nosec B603 B607
             ["git", "-C", os.fspath(repo), *args],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="strict",
             check=False,
         )
     except FileNotFoundError as exc:
         raise AuditError(
             "找不到 git 可执行文件（PATH 里没有 git），无法稽核"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise AuditError(
+            f"git 输出不是 UTF-8，无法解析（第 {exc.start} 字节起解码失败；"
+            "常见原因：仓库配置 i18n.logOutputEncoding=GBK 或 "
+            "core.quotePath=false 且提交信息/文件路径含非 UTF-8 字节；"
+            "可执行 git config --unset i18n.logOutputEncoding 后重试）"
         ) from exc
     except OSError as exc:
         raise AuditError(f"无法执行 git: {exc}") from exc
@@ -299,10 +324,11 @@ def _make_findings(
             continue
 
         for foreign in sorted(claimed - {branch_card}):
-            if foreign in from_subject:
-                evidence = "提交标题"
-            else:
-                evidence = f"文件路径 {path_hit[foreign]}"
+            evidence = (
+                "提交标题"
+                if foreign in from_subject
+                else f"文件路径 {path_hit[foreign]}"
+            )
             findings.append(
                 Finding(
                     kind=KIND_FOREIGN,
@@ -375,7 +401,12 @@ def _checkout_drifts(
                 f"wt/{basename}" if BRANCH_RE.match(f"wt/{basename}") else main_branch
             )
         else:
-            assert branch_ref is not None
+            if branch_ref is None:
+                # 不变量：非 detached 的 worktree 必有 branch 字段。写成显式
+                # raise 而不是 assert —— assert 在 -O 下会被剥掉（bandit B101）
+                raise AuditError(
+                    "内部不变量被破坏：worktree 既不是 detached 也没有 branch 字段"
+                )
             actual = branch_ref.removeprefix("refs/heads/")
             card_match = BRANCH_RE.match(actual)
             basename = path.name
@@ -400,7 +431,11 @@ def _checkout_drifts(
             )
             continue
 
-        assert branch_ref is not None
+        if branch_ref is None:
+            # 同上：非 detached 分支走到这里必有 branch 字段（bandit B101）
+            raise AuditError(
+                "内部不变量被破坏：非 detached 的 worktree 缺少 branch 字段"
+            )
         branch_name = branch_ref.removeprefix("refs/heads/")
         if branch_name == main_branch:
             continue
