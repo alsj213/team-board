@@ -1,23 +1,24 @@
-$ git clone -q /home/liu/project/team-board /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone   # 真仓数据；clone 会跟随源仓 HEAD，先切回 main
+$ git clone -q /home/liu/project/team-board /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone   # 真仓数据；clone 会跟随源仓 HEAD，先切回 main
 rc=0
 
-$ git -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone checkout -q main
+$ git -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone checkout -q main
 rc=0
 
-$ git -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone worktree list
-/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone  de2a7d4 [main]
+$ git -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone worktree list
+/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone  de2a7d4 [main]
 rc=0
 
-$ cd /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone && PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src /home/liu/project/tb-wt/t_f43fa954/.venv/bin/python -m team_board.cli branch-audit
+$ cd /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone && PYTHONPATH=/home/liu/project/tb-wt/t_f43fa954/src /home/liu/project/tb-wt/t_f43fa954/.venv/bin/python -m team_board.cli branch-audit
 分支稽核（卡分支提交归属 + checkout 偏移）
-仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.NjCv2xttLm/clone
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.73e1I1TInk/clone
 主分支: main
 检查的卡分支: t_06c7b458、t_37a51cf3、t_41c252d2、t_67cd6c50、t_b489e268、t_b5fde972、t_f43fa954
-提交归属偏差（0 处）:
-  （无）
+提交归属偏差（2 处）:
+  1. 卡 t_06c7b458 的分支上，提交 1318367 "fix(web): 错误路径收口 —— 前端查 response.ok + 200 序列化/写出进 try + HEAD/OPTIONS/TRACE 405" 未声明卡号（无法归属）；证据：提交标题
+  2. 卡 t_b489e268 的分支上，提交 36a0203 "chore(lint): 落 ruff/mypy/bandit 配置 + 三个 CI job + README 本地命令" 未声明卡号（无法归属）；证据：提交标题
 checkout 偏移（0 处）:
   （无）
 豁免（0 条）:
   （无）
-结论：无偏差
-rc=0
+结论：发现 2 处偏差（提交归属 2 处 / checkout 0 处）
+rc=1
