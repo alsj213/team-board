@@ -54,6 +54,16 @@ team-board export
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
 - `--now EPOCH` —— 基准时刻（epoch 秒），默认当前时间。所有「算到此刻」
   的耗时都以它为准；固定成 fixture 的 `1793160000` 即可得到可重复的输出。
+  取值必须是本平台 `datetime.fromtimestamp()` 能表示的 epoch 秒，负数合法
+  （表示 1970 年之前，不拦）；13 位毫秒（`1793160000000`）、天文数字
+  （`99999999999999`）、非整数（`abc`）与空串都算越界，由 argparse 报错、
+  退出码 2，stderr 含 `基准时间超出可表示范围`；实测：
+
+  ```
+  team-board list --now 1793160000000     # 退出码 2
+  team-board list --now 99999999999999    # 退出码 2
+  team-board list --now -86400            # 退出码 0，正常输出
+  ```
 
 `summary` 另有 `--date YYYY-MM-DD`（默认取 `--now` 所在日期）。
 
