@@ -371,21 +371,76 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     - **500 响应体一律脱敏**：只有 ``{"error": "<类别>: <一句话原因>"}``，
       不含绝对路径、表名、SQLite 原文，也不含 ``str(exc)``；异常细节
       （类型 + 原文，含请求方法/路径）写**一行** stderr，供运维排查；
-    - 200 的序列化与写出在同一段 ``try`` 里：序列化失败 → 500 + JSON（客户
-      端拿到状态码，不是断连）；客户端已断开（``BrokenPipeError`` /
-      ``ConnectionResetError``）静默丢弃、不打 traceback、不再写第二遍；
+    - 序列化在发状态行之前：``json.dumps`` 失败时一个字节都还没出去，因此还能
+      干净地改回 500 + JSON（客户端拿到状态码，不是断连）；
+    - **所有方法**（GET / HEAD / OPTIONS / TRACE / POST / PUT / DELETE / PATCH）
+      都经 ``_dispatch``：客户端断开属于 ``ConnectionError`` 家族
+      （``BrokenPipeError`` / ``ConnectionResetError`` / ``ConnectionAbortedError``
+      ……），此时写什么都写不出去 —— 静默丢弃、不打 traceback、不重试、不让
+      ``socketserver.handle_error`` 打出整段栈；
+    - **一条连接只写一条状态行**：``_start_response`` 一进来就置
+      ``_response_started``，此后任何写出失败都不再补 500（否则客户端会收到
+      ``200 …`` 紧跟 ``500 …`` 两条状态行，代理直接判协议错），只留一行 stderr；
     - 非 GET → 405 + ``{"error": "method not allowed"}``，没有任何写接口；
       HEAD 按 HTTP 语义只给状态码与头、不写响应体。
     """
 
     server_version = "team-board"
 
-    def _send_body(self, status: int, content_type: str, body: bytes) -> None:
+    #: 状态行是否已经进入写出流程。``_start_response`` 一进来就置 True：从这里
+    #: 起只允许这一条响应 —— 写出中途再失败**不能**改写成 500，否则同一连接上
+    #: 会出现两条状态行。这是「不许写第二遍」的唯一判据。
+    _response_started = False
+
+    def _dispatch(self, action: Callable[[], None]) -> None:
+        """所有 ``do_*`` 的公共入口：断连与写出失败在这里收口。
+
+        - ``ConnectionError`` 家族（``BrokenPipeError`` / ``ConnectionResetError``
+          / Windows 常见的 ``ConnectionAbortedError(10053)``）都是「对端已经走
+          了」：静默丢弃，不重试、不打 traceback；
+        - 其它异常交给 ``_respond_error``：状态行还没发才补 500。
+        """
+        self._response_started = False
+        try:
+            action()
+        except ConnectionError:
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底，见 _respond_error
+            self._respond_error(exc)
+
+    def _respond_error(self, exc: BaseException) -> None:
+        """异常的统一收口：头未发 → 500 + 脱敏 JSON；头已发 → 只留一行 stderr。"""
+        if self._response_started:
+            print(
+                f"[team-board] 写出中断 {self.command} {self.path} "
+                f"<- {type(exc).__name__}: {exc}，已放弃本连接",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        if isinstance(exc, db.BoardError):
+            category = "source_unavailable"
+        elif isinstance(exc, PayloadError):
+            category = "data_invalid"
+        else:
+            category = "internal_error"
+        try:
+            self._send_server_error(category, exc)
+        except ConnectionError:
+            # 连 500 都写不出去：对端已断，静默。
+            return
+
+    def _start_response(self, status: int, content_type: str, length: int) -> None:
+        """写状态行与头，并置 ``_response_started``（见其注释）。"""
+        self._response_started = True
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def _send_body(self, status: int, content_type: str, body: bytes) -> None:
+        self._start_response(status, content_type, len(body))
         self.wfile.write(body)
 
     def _send_json(self, status: int, obj: Any) -> None:
@@ -410,12 +465,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(500, {"error": f"{category}: {PUBLIC_ERRORS[category]}"})
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
-        try:
-            self._get()
-        except (BrokenPipeError, ConnectionResetError):
-            # 客户端先走了：连接已经写不出去，静默收工（不重试、不打 traceback）。
-            # 靠「再包一层 except 变 500」是错的 —— 对端已断，500 也写不出去。
-            return
+        self._dispatch(self._get)
 
     def _get(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
@@ -447,21 +497,9 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
                     datetime.datetime.fromtimestamp(now).date(),
                 )
             self._send_json(200, payload)
-        except (BrokenPipeError, ConnectionResetError):
-            # 客户端已断开：静默丢弃，不再尝试写第二遍（500 也写不出去）。
-            return
-        except db.BoardError as exc:
-            self._send_server_error("source_unavailable", exc)
-        except PayloadError as exc:
-            self._send_server_error("data_invalid", exc)
-        except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
-            # payload 层任何非预期异常（id 为 NULL 时 sorted 抛 TypeError、
-            # payload 里混进 bytes 导致 json.dumps 抛 TypeError 等）都在这里
-            # 收口：回 500 + JSON、不把 traceback 交给 socketserver、不让异常
-            # 穿出线程。响应体只给类别，细节进 stderr。
-            # BrokenPipeError / ConnectionResetError 由 do_GET 的 except 先接。
-            self._send_server_error("internal_error", exc)
         finally:
+            # 这里的异常一律交给 ``_dispatch`` 收口（断连静默 / 头未发才补 500）：
+            # 先把只读连接关掉，免得写响应期间一直占着它。
             if conn is not None:
                 conn.close()
 
@@ -469,33 +507,35 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         if with_body:
             self._send_json(405, {"error": "method not allowed"})
             return
-        # HEAD：与 GET 同头不同体，只给状态码与头
-        self.send_response(405)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", "0")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        # HEAD：与 GET 同头不同体，只给状态码与头（Content-Length 恒 0）
+        self._start_response(405, "application/json; charset=utf-8", 0)
 
-    def do_HEAD(self) -> None:  # noqa: N802
+    def _reject(self) -> None:
+        self._method_not_allowed()
+
+    def _reject_head(self) -> None:
         self._method_not_allowed(with_body=False)
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._dispatch(self._reject_head)
+
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
     def do_TRACE(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
     def do_POST(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
     def do_PUT(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
     def do_DELETE(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
     def do_PATCH(self) -> None:  # noqa: N802
-        self._method_not_allowed()
+        self._dispatch(self._reject)
 
 
 def make_server(
