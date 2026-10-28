@@ -23,7 +23,9 @@ jobs:
         run: python -m pip install pytest
 
       # src 布局：包在 src/team_board 下且未安装，必须把 src 放进 sys.path
+      # TZ：summary 的断言是本地时间快照（CST），runner 默认 UTC 会让 5 条快照测试红
       - name: Run pytest
         env:
           PYTHONPATH: src
+          TZ: Asia/Shanghai
         run: python -m pytest -q
