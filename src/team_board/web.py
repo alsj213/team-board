@@ -13,8 +13,9 @@ import http.server
 import json
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from . import commands, db, fmt
 from .model import TITLE_MAX, Task
@@ -291,7 +292,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             json.dumps(obj, ensure_ascii=False).encode("utf-8"),
         )
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的约定名
+    def do_GET(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定（N802 不启用，无需 noqa）
         path = urllib.parse.urlsplit(self.path).path
         server: Any = self.server
 
@@ -323,7 +324,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         except db.BoardError as exc:
             self._send_json(500, {"error": str(exc)})
             return
-        except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
+        except Exception as exc:  # 兜底：payload 层任何非 BoardError 异常都在这里收口
             # payload 层任何非 BoardError 异常（如 completed_at 是 13 位毫秒时
             # datetime.fromtimestamp 抛 ValueError、id 为 NULL 时 sorted 抛
             # TypeError）都在这里收口：回 500 + JSON、不把 traceback 交给
@@ -339,17 +340,27 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
     def _method_not_allowed(self) -> None:
         self._send_json(405, {"error": "method not allowed"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定
         self._method_not_allowed()
 
-    def do_PUT(self) -> None:  # noqa: N802
+    def do_PUT(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定
         self._method_not_allowed()
 
-    def do_DELETE(self) -> None:  # noqa: N802
+    def do_DELETE(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定
         self._method_not_allowed()
 
-    def do_PATCH(self) -> None:  # noqa: N802
+    def do_PATCH(self) -> None:  # 必需名：BaseHTTPRequestHandler 约定
         self._method_not_allowed()
+
+
+class BoardHTTPServer(http.server.ThreadingHTTPServer):
+    """带看板数据源与时钟注入的 ThreadingHTTPServer。
+
+    只补类型声明，不改行为：``make_server`` 建完 server 后赋的正是这两个属性。
+    """
+
+    board_db_path: str
+    board_clock: Callable[[], int]
 
 
 def make_server(
@@ -358,7 +369,7 @@ def make_server(
     bind: str = "127.0.0.1",
     port: int = 8787,
     clock: Callable[[], int] | None = None,
-) -> http.server.ThreadingHTTPServer:
+) -> BoardHTTPServer:
     """建一个未启动的只读 HTTP server。
 
     - 端口合法性不在这里拦：``port=0`` 表示由内核挑临时端口（测试用，取
@@ -366,8 +377,8 @@ def make_server(
     - ``clock`` 注入当前时间（epoch 秒），缺省 ``time.time()``，测试靠它固定
       ``snapshot`` / ``date`` / 耗时。
     """
-    server = http.server.ThreadingHTTPServer((bind, port), BoardRequestHandler)
+    server = BoardHTTPServer((bind, port), BoardRequestHandler)
     server.daemon_threads = True
-    server.board_db_path = str(db_path)  # type: ignore[attr-defined]
-    server.board_clock = clock or (lambda: int(time.time()))  # type: ignore[attr-defined]
+    server.board_db_path = str(db_path)
+    server.board_clock = clock or (lambda: int(time.time()))
     return server

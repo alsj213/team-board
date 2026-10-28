@@ -23,7 +23,7 @@ import pytest
 
 from team_board import commands, db, fmt, web
 from team_board.model import TITLE_MAX, Task
-from tests.fixtures.make_board import FIXTURE_NOW, LONG_TITLE, build_board
+from tests.fixtures.make_board import FIXTURE_NOW, build_board
 
 DAY = datetime.date(2026, 10, 28)
 SNAPSHOT = "2026-10-28 12:00"

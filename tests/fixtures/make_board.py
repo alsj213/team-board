@@ -21,7 +21,7 @@ if __package__ in (None, ""):
     if _SRC.is_dir() and str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
 
-from team_board.model import DEFAULT_DB  # noqa: E402
+from team_board.model import DEFAULT_DB
 
 # 2026-10-28 12:00:00 CST；测试统一用它，避开跨午夜的坑
 FIXTURE_NOW = 1793160000

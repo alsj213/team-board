@@ -1,0 +1,71 @@
+$ python -m ruff check no_such_path
+E902 No such file or directory (os error 2)
+--> no_such_path:1:1
+
+Found 1 error.
+rc=1
+
+$ python -m bandit -r no_such_dir
+[main]	INFO	profile include tests: None
+[main]	INFO	profile exclude tests: None
+[main]	INFO	cli include tests: None
+[main]	INFO	cli exclude tests: None
+[main]	INFO	running on Python 3.14.7
+Run started:2026-10-28 14:16:30.945083+00:00
+
+Test results:
+	No issues identified.
+
+Code scanned:
+	Total lines of code: 0
+	Total lines skipped (#nosec): 0
+	Total potential issues skipped due to specifically being disabled (e.g., #nosec BXXX): 0
+
+Run metrics:
+	Total issues (by severity):
+		Undefined: 0
+		Low: 0
+		Medium: 0
+		High: 0
+	Total issues (by confidence):
+		Undefined: 0
+		Low: 0
+		Medium: 0
+		High: 0
+Files skipped (1):
+	./no_such_dir (No such file or directory)
+rc=0
+
+$ python -m ruff check /home/liu/.hermes/profiles/engineer/cache/scratch/bad_ruff_probe.py   # 故意坏文件 → 必须 rc=1，F401
+F401 [*] `os` imported but unused
+ --> /home/liu/.hermes/profiles/engineer/cache/scratch/bad_ruff_probe.py:3:8
+  |
+1 | """边界自检用的临时文件（不在仓库内）：故意留一个未使用导入，让 ruff 报 F401。"""
+2 |
+3 | import os
+  |        ^^
+help: Remove unused import: `os`
+  |
+2 |
+  - import os
+  |
+
+Found 1 error.
+[*] 1 fixable with `--fix`.
+rc=1
+
+$ python -m mypy no_such_dir
+no_such_dir: error: Cannot read file: No such file or directory
+Found 1 error in 1 file (errors prevented further checking)
+rc=2
+
+$ python -m bandit -r /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py   # 故意 B602 → 必须 rc=1
+>> Issue: [B404:blacklist] Consider possible security implications associated with the subprocess module.
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:3:0
+>> Issue: [B607:start_process_with_partial_path] Starting a process with a partial executable path
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:5:0
+>> Issue: [B602:subprocess_popen_with_shell_equals_true] subprocess call with shell=True seems safe, but may be changed in the future, consider rewriting without shell
+   Location: /home/liu/.hermes/profiles/engineer/cache/scratch/bad_bandit_probe.py:5:0
+	Total issues (by severity):
+	Total issues (by confidence):
+rc=1
