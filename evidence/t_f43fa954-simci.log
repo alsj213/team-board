@@ -1,0 +1,25 @@
+$ git clone -q --branch wt/t_f43fa954 https://github.com/alsj213/team-board.git /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo
+rc=0
+$ git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+rc=0
+$ mkdir -p /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src && git archive HEAD src | tar -x -C /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src
+rc=0
+$ git checkout -B main origin/main
+Switched to a new branch 'main'
+Branch 'main' set up to track remote branch 'main' from 'origin'.
+rc=0
+$ git worktree list
+/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo  de2a7d4 [main]
+$ PYTHONPATH=/home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/pr-src/src python -m team_board.cli branch-audit --branch wt/t_f43fa954
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /home/liu/.hermes/profiles/engineer/cache/scratch/tmp.XYG9ZuqTaS/repo
+主分支: main
+检查的卡分支: t_f43fa954
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+rc=0
