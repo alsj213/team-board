@@ -1,0 +1,4 @@
+$ curl -s -w '\nhttp=%{http_code}\n' http://127.0.0.1:18788/api/summary  # 真实库
+{"snapshot": "2026-10-28 21:25", "date": "2026-10-28", "completed": 40, "running": 1, "blocked": 0, "anomaly": 0, "anomalies": []}
+http=200
+rc=0

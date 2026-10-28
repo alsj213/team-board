@@ -1,0 +1,14 @@
+# 服务端请求日志见 evidence/t_406be0e8-serve.log（服务进程 stderr）
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18787/  # index
+index=200 rc=0
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18787/nope  # missing
+missing=404 rc=0
+$ curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18787/api/board  # 405 expected
+post=405 rc=0
+$ team-board serve --db /tmp/w3/board.db --port 18787  # 端口占用
+rc=1
+stderr=错误: 无法监听 127.0.0.1:18787: [Errno 98] Address already in use
+
+serve_rc=0  # SIGINT 收尾，期望 0
+# 真实库 serve 就绪于第 2 次探测；返回体见 t_406be0e8-curl-real-summary.txt
+real_serve_rc=0  # SIGINT 收尾，期望 0

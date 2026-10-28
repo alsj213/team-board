@@ -1,0 +1,32 @@
+$ team-board serve --port 0   # 端口 0
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --port: 端口超出 1-65535: '0'
+
+$ team-board serve --port -1   # 端口负数
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --port: 端口超出 1-65535: '-1'
+
+$ team-board serve --port 65536   # 端口越上界
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --port: 端口超出 1-65535: '65536'
+
+$ team-board serve --port abc   # 端口非整数
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --port: 端口应为 1-65535 的整数: 'abc'
+
+$ team-board serve --bind 0.0.0.0   # 对外暴露
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --bind: 只允许本机地址 127.0.0.1 / localhost / ::1: '0.0.0.0'
+
+$ team-board serve --bind    # 空 bind
+rc=2 (expect 2)
+stderr=team-board serve: error: argument --bind: 只允许本机地址 127.0.0.1 / localhost / ::1: ''
+
+$ team-board serve --db /tmp/definitely-missing-t_406be0e8.db   # 库不存在
+rc=1 (expect 1)
+stderr=错误: 数据源不存在: /tmp/definitely-missing-t_406be0e8.db
+
+$ team-board serve --port 1   # 特权端口（非 root 不可绑）
+rc=1 (expect 1)
+stderr=错误: 无法监听 127.0.0.1:1: [Errno 13] Permission denied
+

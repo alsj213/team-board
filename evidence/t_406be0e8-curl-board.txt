@@ -1,0 +1,4 @@
+$ curl -s -w '\nhttp=%{http_code}\n' http://127.0.0.1:18787/api/board   # board
+{"columns": {"running": [{"id": "t_running_stale", "assignee": "engineer", "status": "running", "duration_minutes": 640, "title": "running_stale"}, {"id": "t_running_fresh", "assignee": "pm", "status": "running", "duration_minutes": 575, "title": "running_fresh"}], "queued": [{"id": "t_null_start", "assignee": "pm", "status": "ready", "duration_minutes": 655, "title": "null_start"}], "blocked": [{"id": "t_blocked_one", "assignee": "pm", "status": "blocked", "duration_minutes": 685, "title": "blocked_one"}], "done": [{"id": "t_done_yesterday", "assignee": "pm", "status": "done", "duration_minutes": 60, "title": "done_yesterday"}, {"id": "t_done_today", "assignee": "engineer", "status": "done", "duration_minutes": 25, "title": "done_today"}]}}
+http=200
+rc=0
