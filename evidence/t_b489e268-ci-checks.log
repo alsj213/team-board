@@ -1,9 +1,32 @@
+================================================================
+2026-10-29 新一轮（rebase 到 main=1212183 之后）
+记录时 head = bc113425373626dfd7715bcee1240996ae06f750
+================================================================
+
 $ gh pr checks 11 -R alsj213/team-board
+bandit (3.12)	pass	15s	https://github.com/alsj213/team-board/actions/runs/40722543850/job/122937020749	
+mypy (3.12)	pass	18s	https://github.com/alsj213/team-board/actions/runs/40722543850/job/122937021538	
+pytest (3.12)	pass	26s	https://github.com/alsj213/team-board/actions/runs/40722543850/job/122937021297	
+ruff (3.12)	pass	17s	https://github.com/alsj213/team-board/actions/runs/40722543850/job/122937021334	
+rc=0
+
+$ gh pr view 11 -R alsj213/team-board --json headRefOid,headRefName,baseRefName,mergeable,mergeStateStatus,state
+{"baseRefName":"main","headRefName":"wt/t_b489e268","headRefOid":"bc113425373626dfd7715bcee1240996ae06f750","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}
+rc=0
+
+说明：上面这轮 CI 跑在 bc11342（= main 1212183 + rebase 后的 4 个提交）。
+本日志随下一次提交更新，届时 head 只多「本日志刷新」本身，代码树不变。
+
+================================================================
+历史（已过期，仅留作对照）：rebase 前那轮
+================================================================
+
+$ gh run view 40704454511 -R alsj213/team-board --json headSha,headBranch,conclusion
+{"conclusion":"success","headBranch":"wt/t_b489e268","headSha":"1705f7d1f2475aefe9dce08b7787645083e8e868"}
+
+$ gh pr checks 11 -R alsj213/team-board        # 对应上面这轮（head=1705f7d）
 bandit (3.12)	pass	15s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872681517	
 mypy (3.12)	pass	15s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682299	
 pytest (3.12)	pass	19s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682445	
 ruff (3.12)	pass	16s	https://github.com/alsj213/team-board/actions/runs/40704454511/job/122872682056	
 rc=0
-
-$ gh pr view 11 --json state,headRefName,baseRefName,mergeable
-{"baseRefName":"main","headRefName":"wt/t_b489e268","mergeable":"MERGEABLE","state":"OPEN"}
