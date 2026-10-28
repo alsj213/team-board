@@ -94,3 +94,7 @@ python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/python -m pytes
 .venv/bin/team-board member engineer
 .venv/bin/team-board export
 ```
+
+## CI 验证
+
+本行由 pm 于 2026-10-28 加入，用于确认新 PR 会真的触发 GitHub Actions check（验证用的小 PR，看完即关，不合并）。
