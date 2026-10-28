@@ -5,13 +5,25 @@
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-REAL_REPO=/home/liu/project/team-board
+# 真仓库路径：默认是宿主上的主 checkout；本机没有那个 checkout 时（例如 docker
+# 沙箱、CI runner）用 TB_REAL_REPO 指到任意 checkout 来做同一套「未被污染」断言，
+# 没有可指的对象就**明确 skip 并打提示**，绝不假装断言通过。
+REAL_REPO=${TB_REAL_REPO:-/home/liu/project/team-board}
 TMP=$(mktemp -d)
 FAILS=0
 RC=0
 
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
+
+if [ -d "$REAL_REPO/.git" ] || git -C "$REAL_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  REAL_REPO_OK=1
+  echo "真仓库快照对象: $REAL_REPO"
+else
+  REAL_REPO_OK=0
+  echo "⚠ 跳过真仓库污染断言：$REAL_REPO 不是可读的 git checkout"
+  echo "  （宿主上跑会断言真 checkout；本机可用 TB_REAL_REPO=<其它 checkout> 指定对象）"
+fi
 
 if [ -n "${PYTHON:-}" ]; then
   PY=$PYTHON
@@ -74,9 +86,13 @@ check() {  # check <场景名> <期望rc> <实际rc> <输出文件> <必须包�
   fi
 }
 
-echo "== 真仓库快照（开始） =="
-snapshot >"$TMP/before.txt"
-cat "$TMP/before.txt"
+if [ "$REAL_REPO_OK" = 1 ]; then
+  echo "== 真仓库快照（开始） =="
+  snapshot >"$TMP/before.txt"
+  cat "$TMP/before.txt"
+else
+  echo "== 真仓库快照（开始）：已跳过 =="
+fi
 
 # ------------------------------------------------ 场景 A：跨卡提交
 echo
@@ -136,15 +152,19 @@ check "绿色基线" 0 "$RC" "$TMP/g.out" "结论：无偏差" "t_aaaaaaaa"
 
 # ------------------------------------------------ 真仓库未被污染
 echo
-echo "== 真仓库快照（结束） =="
-snapshot >"$TMP/after.txt"
-cat "$TMP/after.txt"
-if diff -q "$TMP/before.txt" "$TMP/after.txt" >/dev/null; then
-  echo "  ✓ 真仓库状态与演示前完全一致（未被污染）"
+if [ "$REAL_REPO_OK" = 1 ]; then
+  echo "== 真仓库快照（结束） =="
+  snapshot >"$TMP/after.txt"
+  cat "$TMP/after.txt"
+  if diff -q "$TMP/before.txt" "$TMP/after.txt" >/dev/null; then
+    echo "  ✓ 真仓库状态与演示前完全一致（未被污染）"
+  else
+    echo "  ✗ 真仓库状态发生变化："
+    diff -u "$TMP/before.txt" "$TMP/after.txt" || true
+    FAILS=$((FAILS + 1))
+  fi
 else
-  echo "  ✗ 真仓库状态发生变化："
-  diff -u "$TMP/before.txt" "$TMP/after.txt" || true
-  FAILS=$((FAILS + 1))
+  echo "  ⚠ 真仓库污染断言已跳过（没有可读的 checkout，见开头提示）"
 fi
 
 echo

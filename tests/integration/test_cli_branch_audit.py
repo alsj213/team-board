@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -318,6 +319,92 @@ def test_unknown_flag_exits_two(capsys: pytest.CaptureFixture[str]) -> None:
     assert "bogus" in captured.err
 
 
+# --------------------------------------- 环境/参数级错误一律 rc2（必修 1）
+# 判据来自卡面：AuditError 语义 → rc2、stderr `错误: `、stdout 空、无 Traceback。
+# rc1 是「发现偏差」的专用码，崩溃绝不能和真偏差同码（CI 分不出红的原因）。
+
+
+def test_allow_file_not_utf8_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """豁免表指到二进制文件（非 UTF-8）→ rc2，不许 UnicodeDecodeError 冒出来。"""
+
+    binary = tmp_path / "binary-allow.bin"
+    binary.write_bytes(b"\xa0\xa1\xff\xfe not utf-8 \x80")
+
+    rc, out, err = run(["--repo", str(repo), "--allow-file", str(binary)], capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "UTF-8" in err
+    assert "Traceback" not in err
+
+
+def test_allow_file_is_directory_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    directory = tmp_path / "allow-dir"
+    directory.mkdir()
+
+    rc, out, err = run(["--repo", str(repo), "--allow-file", str(directory)], capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "Traceback" not in err
+
+
+def test_missing_git_executable_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``PATH`` 里没有 git → rc2，不许 FileNotFoundError 冒出来。"""
+
+    monkeypatch.setenv("PATH", "/nonexistent-bin-dir")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "git" in err
+    assert "Traceback" not in err
+
+
+def test_ascii_stdout_returns_two(
+    repo: Path, tmp_path: Path
+) -> None:
+    """stdout 编码表示不了中文 → rc2（真子进程跑，环境变量才有意义）。
+
+    ``LC_ALL=C`` + ``PYTHONIOENCODING=ascii`` 同时把 stdout/stderr 设成 ASCII：
+    报告里的中文写不出去。这是环境级错误，不是「发现偏差」，必须 rc2、
+    stdout 一个字节都不许落、stderr 里要有 ``错误: ``（UTF-8 字节直写）。
+    """
+
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "w2.txt", "feat: t_bbbbbbbb 的活跑到 A 分支")
+    git(repo, "checkout", "-q", "main")
+    src = Path(__file__).resolve().parents[2] / "src"
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(src),
+        "PYTHONIOENCODING": "ascii",
+        "LC_ALL": "C",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "team_board.cli", "branch-audit",
+         "--repo", str(repo)],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == b""
+    assert proc.stderr.startswith("错误: ".encode("utf-8"))
+    assert b"Traceback" not in proc.stderr
+
+
 # ------------------------------------------------- --branch 只看一条分支
 
 
@@ -353,3 +440,66 @@ def test_branch_only_checks_the_requested_card_branch(
         assert rc == 0, out
         assert "t_eeeeeeee" not in out
         assert "检查的卡分支: t_aaaaaaaa" in out
+
+
+# -------------------------- 必修 2：裸卡号指向「漏 wt/ 前缀」的分支不许假绿
+
+
+def test_bare_card_branch_without_wt_prefix_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """只有裸分支 ``refs/heads/t_aaaaaaaa``（漏 wt/ 前缀）时 ``--branch t_aaaaaaaa`` 必须 rc2。
+
+    修前这里 rc0 + 「检查的卡分支: （无）」+「结论：无偏差」—— 零条 ref 静默空跑。
+    CI 传的是 ``$HEAD_REF``，于是「PR 头分支漏写 wt/」这个最该抓的偏差形态会被
+    门禁直接放行。卡面只许诺两种写法都指向**卡分支**，没许诺指向不存在的卡分支判绿。
+    """
+
+    git(repo, "checkout", "-q", "-b", "t_aaaaaaaa")
+    commit_file(repo, "n.txt", "chore: 顺手改点东西（没写卡号）")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(
+        ["--repo", str(repo), "--branch", "t_aaaaaaaa"], capsys
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "wt/t_aaaaaaaa" in err
+    assert "Traceback" not in err
+
+
+def test_bare_card_branch_without_wt_prefix_rc2_even_with_wt_spelling(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """同理：显式写 ``--branch wt/t_aaaaaaaa`` 但该分支不存在时也不许静默空跑。"""
+
+    git(repo, "checkout", "-q", "-b", "t_aaaaaaaa")
+    commit_file(repo, "n.txt", "chore: 没写卡号")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(
+        ["--repo", str(repo), "--branch", "wt/t_aaaaaaaa"], capsys
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "wt/t_aaaaaaaa" in err
+    assert "Traceback" not in err
+
+
+def test_branch_card_id_resolves_wt_branch_when_it_exists(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """裸卡号在 ``wt/t_xxx`` 存在时正常解析（修完别把正常路径也判死）。"""
+
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo), "--branch", "t_aaaaaaaa"], capsys)
+
+    assert rc == 0
+    assert err == ""
+    assert "检查的卡分支: t_aaaaaaaa" in out

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,6 @@ from team_board.branches import (
     load_allowlist,
     render_report,
 )
-
 
 # ---------------------------------------------------------------- 卡号正则
 
@@ -108,6 +108,16 @@ def test_load_allowlist_illegal_raises(tmp_path: Path, line: str) -> None:
         load_allowlist(path)
 
 
+def test_load_allowlist_non_utf8_raises_audit_error(tmp_path: Path) -> None:
+    """非 UTF-8 文本（如误指到二进制文件）→ AuditError，不是 UnicodeDecodeError。"""
+
+    path = tmp_path / "allow.bin"
+    path.write_bytes(b"\xa0\xff\xfe\x80")
+    with pytest.raises(branches.AuditError) as excinfo:
+        load_allowlist(path)
+    assert "UTF-8" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------- 规则 A 判定
 
 
@@ -163,7 +173,7 @@ def test_finding_is_immutable() -> None:
         commit=commit,
         evidence="提交标题",
     )
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         finding.kind = "别的"  # type: ignore[misc]
 
 

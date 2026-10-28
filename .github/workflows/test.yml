@@ -49,10 +49,15 @@ jobs:
       # 一切换，工作区里就是 main 的代码，`python -m team_board.cli` 会退化成
       # 老版本（实测报 `invalid choice: 'branch-audit'`）。所以先把 PR 自己的
       # 代码归档到 RUNNER_TEMP，切回 main 后再用这份 src 跑稽核。
-      - name: Stage the PR's own source (audit must run this build, not main)
+      #
+      # 为什么连 .team-board 一起归档：豁免表默认路径是 <被稽核仓库>/.team-board/
+      # branch-audit-allow.txt，而切回 main 后被稽核仓库就是 main 的检出 —— 不带上
+      # PR 自己的那份，PR 里新加的豁免永远读不到（豁免这个出口就等于不存在）。
+      # 本次 PR 自身一条豁免都没有，带上的只是注释头；但这是正确性，不是内容。
+      - name: Stage the PR's own source and allowlist (audit must run this build)
         run: |
           mkdir -p "$RUNNER_TEMP/pr-src"
-          git archive HEAD src | tar -x -C "$RUNNER_TEMP/pr-src"
+          git archive HEAD src .team-board | tar -x -C "$RUNNER_TEMP/pr-src"
       - name: Put the runner checkout back on main
         run: git checkout -B main origin/main
       - name: Run branch audit
@@ -60,10 +65,12 @@ jobs:
           PYTHONPATH: ${{ runner.temp }}/pr-src/src
           HEAD_REF: ${{ github.head_ref }}
         run: |
+          ALLOW_FILE="$RUNNER_TEMP/pr-src/.team-board/branch-audit-allow.txt"
           if [ -n "$HEAD_REF" ]; then
-            python -m team_board.cli branch-audit --branch "$HEAD_REF"
+            python -m team_board.cli branch-audit --branch "$HEAD_REF" \
+              --allow-file "$ALLOW_FILE"
           else
-            python -m team_board.cli branch-audit
+            python -m team_board.cli branch-audit --allow-file "$ALLOW_FILE"
           fi
 
   ruff:

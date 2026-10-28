@@ -9,7 +9,9 @@
 - 0：无偏差
 - 1：发现偏差（提交归属 / checkout 偏移）
 - 2：参数或环境错误（``branches.AuditError`` → stderr ``错误: …``、stdout 空、
-  不冒 traceback；argparse 级坏参数照旧 rc2）
+  不冒 traceback；argparse 级坏参数照旧 rc2）。环境错误包含：``PATH`` 里没有
+  ``git``、豁免表不是 UTF-8 文本、stdout/stderr 编码表示不了中文
+  （``PYTHONIOENCODING=ascii``）
 """
 
 from __future__ import annotations
@@ -192,6 +194,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_stderr_error(message: str) -> None:
+    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。
+
+    用户可能跑在 ``LC_ALL=C PYTHONIOENCODING=ascii`` 下：这条消息里有中文，
+    直接 ``print(..., file=sys.stderr)`` 会 ``UnicodeEncodeError``（于是 rc1 +
+    traceback，跟「发现偏差」同码），或者被 Python 默认的 ``backslashreplace``
+    转成 ``\\u9519\\u8bef: …``（那就不是 ``错误: `` 了）。所以先问 stderr 的编码
+    能不能表示整行，能就正常写；不能就按 UTF-8 字节直写 ``stderr.buffer``。
+    """
+
+    line = f"错误: {message}\n"
+    encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
+    try:
+        line.encode(encoding)
+    except UnicodeEncodeError:
+        data = line.encode("utf-8")
+        buffer = getattr(sys.stderr, "buffer", None)
+        if buffer is not None:
+            buffer.write(data)
+            buffer.flush()
+        else:  # pragma: no cover - 没有 buffer 的替身对象（极少见）
+            sys.stderr.write(data.decode("utf-8", "backslashreplace"))
+        return
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     """``serve`` 子命令：先验库可读 → 起服务 → 阻塞到 Ctrl-C。
 
@@ -230,7 +259,12 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 
 def _run_branch_audit(args: argparse.Namespace) -> int:
-    """``branch-audit`` 子命令：AuditError → stderr ``错误: …`` + rc2，不冒 traceback。"""
+    """``branch-audit`` 子命令：AuditError → stderr ``错误: …`` + rc2，不冒 traceback。
+
+    报告整块生成后再一次性写出：stdout 编码表示不了中文（如
+    ``PYTHONIOENCODING=ascii``）属于环境级错误 → rc2、stdout 空、stderr
+    ``错误: …``，不许退化成 rc1 + traceback（rc1 是「发现偏差」的专用码）。
+    """
 
     try:
         report = branches.audit(
@@ -240,10 +274,21 @@ def _run_branch_audit(args: argparse.Namespace) -> int:
             allow_file=args.allow_file,
         )
     except branches.AuditError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        _write_stderr_error(str(exc))
         return 2
 
-    print(branches.render_report(report))
+    text = branches.render_report(report)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # TextIOWrapper 先整体编码再写出：编码失败时 stdout 里一个字节都没落
+        _write_stderr_error(
+            "当前 stdout 编码 "
+            f"{getattr(sys.stdout, 'encoding', None)!r} 无法表示稽核报告里的中文，"
+            "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
+        )
+        return 2
     return 0 if report.ok else 1
 
 

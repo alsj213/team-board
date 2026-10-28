@@ -119,14 +119,26 @@ class Report:
 
 
 def _git(repo: str | Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """在 ``repo`` 里跑 git，不抛 CalledProcessError，交给调用方判 rc。"""
+    """在 ``repo`` 里跑 git，不抛 CalledProcessError，交给调用方判 rc。
 
-    return subprocess.run(
-        ["git", "-C", os.fspath(repo), *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    ``PATH`` 里没有 ``git``（``FileNotFoundError``）或其它 ``OSError``
+    （权限、进程数上限等）都是环境级错误 → ``AuditError``（CLI 转 rc2），
+    不许冒 ``FileNotFoundError`` 给用户。
+    """
+
+    try:
+        return subprocess.run(
+            ["git", "-C", os.fspath(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AuditError(
+            "找不到 git 可执行文件（PATH 里没有 git），无法稽核"
+        ) from exc
+    except OSError as exc:
+        raise AuditError(f"无法执行 git: {exc}") from exc
 
 
 def _must_git(repo: str | Path, *args: str, what: str) -> str:
@@ -167,7 +179,13 @@ def load_allowlist(path: str | Path | None) -> tuple[AllowEntry, ...]:
     entries: list[AllowEntry] = []
     try:
         text = file_path.read_text(encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - 权限等罕见环境问题
+    except UnicodeDecodeError as exc:
+        # 不是 UTF-8 文本（比如误指到二进制文件）：参数级错误 → rc2
+        raise AuditError(
+            f"豁免表 {file_path} 不是 UTF-8 文本，无法解析"
+            f"（第 {exc.start} 字节起解码失败）"
+        ) from exc
+    except OSError as exc:  # 权限、路径是目录等
         raise AuditError(f"无法读取豁免表 {file_path}: {exc}") from exc
 
     for lineno, raw in enumerate(text.splitlines(), start=1):
@@ -472,9 +490,19 @@ def audit(
         if card is None:
             notes.append(f"{requested} 不是卡分支，跳过提交归属检查")
         else:
-            refs.extend(
-                (card, ref) for ref in existing if "/wt/" in ref
-            )
+            card_refs = [ref for ref in existing if "/wt/" in ref]
+            if not card_refs:
+                # 裸卡号只解析到「不带 wt/ 前缀」的同名分支：它根本不是卡分支，
+                # 若就这样放过去，`--branch t_x` 会稽核零条 ref 并报「无偏差」，
+                # 把「PR 头分支漏写 wt/」这种最该抓的偏差放行成假绿。
+                # 卡面只许诺两种写法都指向卡分支，没许诺指向不存在的卡分支时判绿。
+                raise AuditError(
+                    f"分支不存在（本地与 origin 都没有）: wt/{card}"
+                    f"（{requested} 只匹配到 "
+                    f"{'、'.join(ref.removeprefix('refs/') for ref in existing)}，"
+                    f"卡分支必须是 wt/{card}）"
+                )
+            refs.extend((card, ref) for ref in card_refs)
     else:
         listing = _must_git(
             top,
