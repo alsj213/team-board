@@ -1,12 +1,12 @@
-"""三个子命令的渲染层：只把 Task 列表变成字符串，不 print、不读写文件。
+"""子命令的渲染层：只把 Task 列表变成字符串，不 print、不读写文件。
 
-所有函数一律返回不带尾随换行的 str。
-``render_list`` 本轮实现；``render_summary`` / ``render_member`` 是占位，由 E4/E5 填。
+所有函数一律返回不带尾随换行的 str；``render_export`` 返回单行 JSON 文本。
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 
 from . import db, fmt
 from .model import (
@@ -31,6 +31,22 @@ def _assignee_text(task: Task) -> str:
     return task.assignee if task.assignee else EMPTY_ASSIGNEE
 
 
+def _visible_sorted(tasks: list[Task], now: int) -> list[Task]:
+    """未归档卡，按 list 的口径排序。
+
+    排序：状态按 STATUS_ORDER 下标升序 → 同状态内耗时降序 → id 升序。
+    """
+    visible = [task for task in tasks if task.status != ARCHIVED]
+    return sorted(
+        visible,
+        key=lambda task: (
+            _STATUS_RANK.get(task.status, len(STATUS_ORDER)),
+            -task.duration_minutes(now),
+            task.id,
+        ),
+    )
+
+
 def render_list(tasks: list[Task], now: int) -> str:
     """看板总览表：卡号 / 负责人 / 状态 / 耗时(分) / 标题。
 
@@ -39,18 +55,9 @@ def render_list(tasks: list[Task], now: int) -> str:
     - 耗时列右对齐；标题按 TITLE_MAX 截断；
     - 一张可显示的卡都没有时返回单行 EMPTY_BOARD（不带表头）。
     """
-    visible = [task for task in tasks if task.status != ARCHIVED]
-    if not visible:
+    order = _visible_sorted(tasks, now)
+    if not order:
         return EMPTY_BOARD
-
-    order = sorted(
-        visible,
-        key=lambda task: (
-            _STATUS_RANK.get(task.status, len(STATUS_ORDER)),
-            -task.duration_minutes(now),
-            task.id,
-        ),
-    )
 
     headers = ["卡号", "负责人", "状态", "耗时(分)", "标题"]
     rows = [
@@ -64,6 +71,32 @@ def render_list(tasks: list[Task], now: int) -> str:
         for task in order
     ]
     return fmt.format_table(headers, rows, right_align=(3,))
+
+
+def render_export(tasks: list[Task], now: int) -> str:
+    """未归档卡的 JSON 快照（机器读，单行）。
+
+    - 只含 ``status != archived`` 的卡，排序与 ``render_list`` 完全一致；
+    - 返回 ``json.dumps(payload, ensure_ascii=False)`` 的单行文本：无 indent、
+      无 sort_keys，不带尾随换行；
+    - 每个对象的键顺序固定 ``id, assignee, status, duration_minutes, title``，
+      类型恒为 ``str, str, str, int, str``；``assignee`` / ``status`` / ``title``
+      为 None 时输出空串（不套列表用的「—」）；
+    - ``title`` 不截断（不用 TITLE_MAX）；
+    - ``duration_minutes`` 一律来自 ``Task.duration_minutes(now)``，不另写算法；
+    - 一张可显示的卡都没有（全 archived 或 tasks 为空）时返回 ``[]``。
+    """
+    payload = [
+        {
+            "id": task.id,
+            "assignee": task.assignee or "",
+            "status": task.status or "",
+            "duration_minutes": task.duration_minutes(now),
+            "title": task.title or "",
+        }
+        for task in _visible_sorted(tasks, now)
+    ]
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def render_summary(

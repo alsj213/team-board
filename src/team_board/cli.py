@@ -45,7 +45,7 @@ def _parse_now(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，三个子命令共享 --db / --now。"""
+    """建 CLI 前端：prog=team-board，四个子命令共享 --db / --now。"""
     parser = argparse.ArgumentParser(
         prog="team-board",
         description="团队看板的只读命令行查看器",
@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("list", "列出未归档卡（按状态与耗时排序）"),
         ("summary", "当日汇总"),
         ("member", "单个成员的卡"),
+        ("export", "导出未归档卡的 JSON 快照"),
     ):
         sub = subparsers.add_parser(name, help=help_text)
         sub.add_argument(
@@ -108,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "member":
             rework = db.load_rework_counts(conn)
             text = commands.render_member(args.name, tasks, rework, now)
+        elif args.command == "export":
+            text = commands.render_export(tasks, now)
         else:  # pragma: no cover - argparse 已拦截未知子命令
             parser.error(f"未知子命令: {args.command}")
     except db.BoardError as exc:
