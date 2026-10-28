@@ -124,3 +124,57 @@ def test_load_rework_counts_ignores_other_kinds(tmp_path: Path) -> None:
     finally:
         ro.close()
     assert counts == {"t_done_today": 2}
+
+
+def _make_tasks_db(path: Path, rows: list[tuple[object, ...]]) -> Path:
+    """建只含 tasks 表的最小库，按给定行灌数（created_at/started_at 可为 NULL）。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT,"
+            " status TEXT, created_at INTEGER, started_at INTEGER, completed_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, title, assignee, status, created_at,"
+            " started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_load_tasks_double_null_timestamps_raises_board_error(tmp_path: Path) -> None:
+    """created_at / started_at 双 NULL 是脏数据：读取层喊错，不让耗时口径炸 TypeError。"""
+    db = _make_tasks_db(
+        tmp_path / "null_ts.db",
+        [("t_null_ts", "NULL 时间戳卡", "pm", "running", None, None, None)],
+    )
+    conn = connect(db)
+    try:
+        with pytest.raises(BoardError) as excinfo:
+            load_tasks(conn)
+    finally:
+        conn.close()
+    assert str(excinfo.value) == "任务 t_null_ts 缺少 created_at/started_at，无法计算耗时"
+
+
+def test_load_tasks_allows_started_at_null_when_created_at_present(
+    tmp_path: Path,
+) -> None:
+    """只缺 started_at 不算脏数据：仍回退到 created_at 正常算耗时。"""
+    now = 1_793_160_000
+    db = _make_tasks_db(
+        tmp_path / "null_start.db",
+        [("t_null_start", "只缺 started_at", "pm", "ready", now - 90 * 60, None, None)],
+    )
+    conn = connect(db)
+    try:
+        tasks = load_tasks(conn)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 1
+    assert tasks[0].started_at is None
+    assert tasks[0].duration_minutes(now) == 90
