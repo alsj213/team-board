@@ -1,18 +1,26 @@
-### 第 1 次 CI（run 40704131071）：branch-audit fail —— 原因：切回 main 后工作区是 main 的代码
-$ gh run view 40704131071 -R alsj213/team-board --log-failed | grep -F 'invalid choice'
-branch-audit (卡分支/checkout)	UNKNOWN STEP	2026-10-28T14:15:33.8534629Z team-board: error: argument command: invalid choice: 'branch-audit' (choose from list, summary, member, export, serve)
-rc=0
+# 验收 8：PR #9 的 CI（两个独立 check）
+# head 006b6b4 = 本轮 3 项必修的代码提交（证据提交之后还会再跑一次，卡面里报最终 run）
 
-### 修好后（见 PR 说明）：gh pr checks 9 -R alsj213/team-board
 $ gh pr checks 9 -R alsj213/team-board
-branch-audit (卡分支/checkout)	pass	6s	https://github.com/alsj213/team-board/actions/runs/40704364913/job/122872358556	
-pytest (3.12)	pass	20s	https://github.com/alsj213/team-board/actions/runs/40704364913/job/122872358698	
-rc=0
+branch-audit (卡分支/checkout)	pass	6s	https://github.com/alsj213/team-board/actions/runs/40709624258/job/122891030838	
+pytest (3.12)	pass	21s	https://github.com/alsj213/team-board/actions/runs/40709624258/job/122891029905	
+exit 0
 
-$ git -C /home/liu/project/tb-wt/t_f43fa954 branch --show-current
-wt/t_f43fa954
-rc=0
+$ gh pr view 9 -R alsj213/team-board --json number,state,headRefName,headRefOid,mergeable,files --jq ...
+{"head":"wt/t_f43fa954","mergeable":"MERGEABLE","n":9,"nfiles":18,"sha":"006b6b4d882fefb5b6d56500ad8cacdf907059ca","state":"OPEN"}
+exit 0
 
-$ gh pr view 9 -R alsj213/team-board --json headRefName,state,files -q '.headRefName + " " + .state + " files=" + ((.files|length)|tostring)'
-wt/t_f43fa954 OPEN files=13
-rc=0
+## 本地按 workflow 步骤复现（fresh clone → fetch → archive src+.team-board → 切回 main → 跑稽核）
+$ cd /workspace/cisim && PYTHONPATH=$RUNNER_TEMP/pr-src/src python3 -m team_board.cli branch-audit --branch wt/t_f43fa954 --allow-file $RUNNER_TEMP/pr-src/.team-board/branch-audit-allow.txt
+分支稽核（卡分支提交归属 + checkout 偏移）
+仓库: /workspace/cisim
+主分支: main
+检查的卡分支: t_f43fa954
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+exit 0
