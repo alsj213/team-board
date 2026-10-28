@@ -1,0 +1,5 @@
+$ .venv/bin/team-board serve --bind localhost --port 18789 --db /home/liu/.hermes/profiles/engineer/cache/scratch/t_1b200562/board.db
+banner=服务已启动: http://localhost:18789/ （数据库 /home/liu/.hermes/profiles/engineer/cache/scratch/t_1b200562/board.db，只读；Ctrl-C 退出）
+serve_rc=0  # SIGINT 收尾，期望 0
+stderr=<empty>
+probe rc=0

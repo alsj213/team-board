@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import sqlite3
 import threading
 import urllib.error
 import urllib.request
@@ -24,6 +25,10 @@ from tests.fixtures.make_board import FIXTURE_NOW, build_board
 #: 每次响应都必须带上的头
 CACHE_CONTROL = "no-store"
 
+#: 13 位毫秒（2026-10-28 前后某个时刻的毫秒值）—— ``datetime.fromtimestamp``
+#: 会抛 ``ValueError: year ... is out of range``，不是 ``db.BoardError``
+THIRTEEN_DIGIT_MS = 1793160000000
+
 
 @pytest.fixture()
 def board(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -33,9 +38,13 @@ def board(tmp_path: Path) -> tuple[Path, dict[str, str]]:
 
 
 @contextlib.contextmanager
-def _running_server(db_path: str | Path) -> Iterator[str]:
-    """起一个临时端口的 server，退出 with 时 shutdown + server_close + join。"""
-    server = web.make_server(db_path, port=0, clock=lambda: FIXTURE_NOW)
+def _running_server(db_path: str | Path, *, clock: int = FIXTURE_NOW) -> Iterator[str]:
+    """起一个临时端口的 server，退出 with 时 shutdown + server_close + join。
+
+    ``clock`` 就是 ``web.make_server`` 的时钟注入点，用来把 13 位毫秒这种
+    payload 层脏值塞进服务进程。
+    """
+    server = web.make_server(db_path, port=0, clock=lambda: clock)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -302,14 +311,61 @@ def test_serve_invalid_args_exit_two(
     assert "Traceback" not in captured.err
 
 
+def test_serve_bind_ipv6_exit_two_with_clear_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """IPv6 回环地址是假选项：rc2 + 一句说得清的错误（不是启动后 gaierror）。
+
+    白名单背后的 ``ThreadingHTTPServer`` 恒为 ``AF_INET``，所以 IPv6 字面量必须
+    在解析层就被拒，而不是放行后 100% 起不来。
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["serve", "--bind", "::1"])
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert captured.out == ""
+    assert "只允许本机地址" in captured.err
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.parametrize("port", ["1", "8787", "65535"])
 def test_parse_port_accepts_edges(port: str) -> None:
     assert cli._parse_port(port) == int(port)
 
 
-@pytest.mark.parametrize("bind", ["127.0.0.1", "localhost", "::1"])
+@pytest.mark.parametrize("bind", ["127.0.0.1", "localhost"])
 def test_parse_bind_accepts_local_addresses(bind: str) -> None:
     assert cli._parse_bind(bind) == bind
+
+
+@pytest.mark.parametrize("bind", ["127.0.0.1", "localhost"])
+def test_make_server_really_binds_whitelisted_address(
+    board: tuple[Path, dict[str, str]], bind: str
+) -> None:
+    """白名单里的每个值都**真 bind 一次**并接受一次 GET。
+
+    只断言 ``_parse_bind`` 的返回值等于入参是解析层自证，证明不了能起服务
+    （IPv6 那个假选项就是这么漏出去的）；这里必须让内核真的 bind + 真的应答。
+    """
+    path, _ = board
+    server = web.make_server(path, bind=bind, port=0, clock=lambda: FIXTURE_NOW)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        status, _, body = _http(f"http://{host}:{port}", "/api/board")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status == 200
+    assert list(json.loads(body.decode("utf-8"))["columns"]) == [
+        "running",
+        "queued",
+        "blocked",
+        "done",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -344,3 +400,79 @@ def test_web_make_server_accepts_port_zero(
         assert server.daemon_threads is True
     finally:
         server.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# 10) payload 层非 BoardError 异常 → 500 + JSON、无 traceback、不崩线程
+# --------------------------------------------------------------------------- #
+
+
+def _dirty_completed_at(path: Path, value: int) -> None:
+    """把 done_today 的 completed_at 改成脏值（模拟 CLI 也能写出的 13 位毫秒）。"""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (value, "t_done_today"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_summary_clock_13_digit_ms_500_json_server_survives(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """注入 13 位毫秒 clock：/api/summary → 500 + JSON（不是断连），/api/board 仍 200。
+
+    这条走的是 ``datetime.fromtimestamp(now)``（web.py 里 ``.date()`` 那一步），
+    抛的是 ``ValueError``，``isinstance(BoardError)`` 为 False —— 正是兜底层
+    要接住的那类。
+    """
+    path, _ = board
+    with _running_server(path, clock=THIRTEEN_DIGIT_MS) as base:
+        capsys.readouterr()  # 丢掉启动阶段噪声，只看请求期间
+        status, headers, body = _http(base, "/api/summary")
+        board_status, _, board_body = _http(base, "/api/board")
+        captured = capsys.readouterr()
+
+    assert status == 500
+    assert headers["Content-Type"].startswith("application/json")
+    assert headers["Content-Type"].endswith("charset=utf-8")
+    assert headers["Cache-Control"] == CACHE_CONTROL
+    assert int(headers["Content-Length"]) == len(body)
+    error = json.loads(body.decode("utf-8"))
+    assert set(error) == {"error"}
+    assert error["error"]  # 空串不行：空则回 type(exc).__name__
+
+    # 同一进程的 /api/board 不受影响（线程没崩、连接没坏）
+    assert board_status == 200
+    columns = json.loads(board_body.decode("utf-8"))["columns"]
+    assert "t_running_stale" in [card["id"] for card in columns["running"]]
+
+    assert "Traceback (most recent call last)" not in captured.err
+
+
+def test_summary_dirty_completed_at_500_json(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """库里 done 卡的 ``completed_at`` 是 13 位毫秒 → /api/summary 500 + JSON。
+
+    这条走的是 ``commands.summary_stats`` 里对 ``task.completed_at`` 的
+    ``fromtimestamp``，与上面那条（``now`` 越界）不是同一个调用点，两条合起来
+    才算「兜底范围覆盖整段 payload 构建」。
+    """
+    path, _ = board
+    _dirty_completed_at(path, THIRTEEN_DIGIT_MS)
+
+    with _running_server(path) as base:
+        capsys.readouterr()
+        status, headers, body = _http(base, "/api/summary")
+        captured = capsys.readouterr()
+
+    assert status == 500
+    assert headers["Content-Type"].startswith("application/json")
+    error = json.loads(body.decode("utf-8"))
+    assert set(error) == {"error"}
+    assert error["error"]
+    assert "Traceback (most recent call last)" not in captured.err

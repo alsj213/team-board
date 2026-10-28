@@ -1,0 +1,34 @@
+===============================================================
+# 1) 全量 pytest（期望 rc=0，条数 >176）
+$ .venv/bin/python -m pytest -q
+........................................................................ [ 40%]
+........................................................................ [ 80%]
+....................................                                     [100%]
+180 passed in 15.13s
+rc=0
+===============================================================
+# 2) serve --bind ::1（期望 rc=2 + 「只允许本机地址」）
+$ .venv/bin/team-board serve --bind ::1 --port 18787
+usage: team-board serve [-h] [--db PATH] [--port PORT] [--bind ADDR]
+team-board serve: error: argument --bind: 只允许本机地址 127.0.0.1 / localhost: '::1'
+rc=2
+===============================================================
+# 3) grep -rn "::1" -- README.md src tests（期望零命中 → rc=1）
+$ grep -rn "::1" -- README.md src tests
+grep: tests/integration/__pycache__/test_web_server.cpython-314-pytest-9.1.1.pyc: binary file matches
+tests/integration/test_web_server.py:323:        cli.main(["serve", "--bind", "::1"])
+rc=0
+--- 去掉构建缓存（__pycache__ 在 .gitignore 里）再看一次 ---
+$ grep -rn "::1" --exclude-dir=__pycache__ -- README.md src tests
+tests/integration/test_web_server.py:323:        cli.main(["serve", "--bind", "::1"])
+rc=0
+===============================================================
+# 4) grep -rn "except Exception" src/team_board/web.py（期望命中兜底层）
+$ grep -rn "except Exception" src/team_board/web.py
+272:      遇到 NULL id 的 ``TypeError`` 等）由 ``except Exception`` 同样收口成
+326:        except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
+rc=0
+===============================================================
+# 5) pgrep -af '[t]eam-board serve'（期望 rc=1，无残留）
+$ pgrep -af '[t]eam-board serve'
+rc=1

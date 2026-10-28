@@ -17,7 +17,13 @@ from . import commands, db, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
-_LOCAL_BINDS = frozenset({"127.0.0.1", "localhost", "::1"})
+#:
+#: IPv6 回环字面量不在表里：``web.make_server`` 用的 ``ThreadingHTTPServer``
+#: 的 ``address_family`` 恒为 ``AF_INET``，拿 IPv6 字面量去 bind 必然
+#: ``gaierror``（实测 ``[Errno -9] Address family for hostname not supported``）。
+#: IPv6 支持属于另一件事，不做「文档说行、真跑起不来」的假选项 ——
+#: 拒绝行为有集成测试锁住。
+_LOCAL_BINDS = frozenset({"127.0.0.1", "localhost"})
 
 
 def _parse_date(value: str) -> date:
@@ -62,10 +68,10 @@ def _parse_port(value: str) -> int:
 
 
 def _parse_bind(value: str) -> str:
-    """``serve --bind``：只接受本机地址，其它（含 ``0.0.0.0``、空串）rc2。"""
+    """``serve --bind``：只接受本机地址，其它（含 ``0.0.0.0``、空串、IPv6 字面量）rc2。"""
     if value not in _LOCAL_BINDS:
         raise argparse.ArgumentTypeError(
-            f"只允许本机地址 127.0.0.1 / localhost / ::1: {value!r}"
+            f"只允许本机地址 127.0.0.1 / localhost: {value!r}"
         )
     return value
 
@@ -130,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_bind,
         default="127.0.0.1",
         metavar="ADDR",
-        help="监听地址（只允许 127.0.0.1 / localhost / ::1）",
+        help="监听地址（只允许 127.0.0.1 / localhost）",
     )
 
     return parser

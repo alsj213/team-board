@@ -268,6 +268,9 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
       server 上长期复用；
     - 数据库不可用（``db.BoardError``）→ 500 + ``{"error": ...}``，不打
       traceback、不崩线程；
+    - payload 构建期的其它异常（13 位毫秒时间戳的 ``ValueError``、``sorted``
+      遇到 NULL id 的 ``TypeError`` 等）由 ``except Exception`` 同样收口成
+      500 + ``{"error": ...}``：``str(exc)`` 为空时回 ``type(exc).__name__``；
     - 非 GET → 405 + ``{"error": "method not allowed"}``，没有任何写接口。
     """
 
@@ -319,6 +322,13 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
                 )
         except db.BoardError as exc:
             self._send_json(500, {"error": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001 - 兜底，见下方 docstring
+            # payload 层任何非 BoardError 异常（如 completed_at 是 13 位毫秒时
+            # datetime.fromtimestamp 抛 ValueError、id 为 NULL 时 sorted 抛
+            # TypeError）都在这里收口：回 500 + JSON、不把 traceback 交给
+            # socketserver、不让异常穿出线程。
+            self._send_json(500, {"error": str(exc) or type(exc).__name__})
             return
         finally:
             if conn is not None:
