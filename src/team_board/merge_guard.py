@@ -37,6 +37,39 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
 --match-head-commit`` → rc2、stderr 一行、stdout 空，**不许**静默降级成「不带 sha
 合并」（那等于把 check-then-act 的洞重新打开）。
 
+合并前必须已 rebase（base 必须是 head 的祖先）
+--------------------------------------------
+「分支落后 main 也照样合」是另一个 check-then-act 洞：只钉 head sha 不保证合进去的树
+包含 main 尖端。所以预检之后、``gh pr merge`` 之前还有一道 rebase 闸门，判据是三条命令
+（顺序固定；拒绝时 stdout 0 字节、一个 ``gh`` 写操作都不发）：
+
+```
+# ① 取远端真身：一次 fetch 两个 refspec（base 用预检读到的 baseRefName，不是写死的 main）
+git -C <repo> fetch --no-tags --no-recurse-submodules --quiet <remote> \
+    '+refs/heads/<base>:refs/merge-guard/<pr>/base' \
+    '+refs/heads/<branch>:refs/merge-guard/<pr>/head'
+# ② 交叉核对：远端 head 必须逐字等于预检读到的 headRefOid
+git -C <repo> rev-parse refs/merge-guard/<pr>/head
+# ③ 判定：base 是不是 head 的祖先
+git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-guard/<pr>/head
+```
+
+- `<base>` 取 ``gh pr view`` 的 ``baseRefName``；形态非法（空串 / 含空白字符 / 带
+  ``refs/`` 前缀）→ rc2，且**一个 git 调用都不发**（fetch 之前就拦）。
+- ② 是必需的：预检到合并之间分支被推送时，判的必须是预检看到的那条 sha —— 与
+  ``--match-head-commit`` 同一个理由。
+- ③ ``rc=0`` = 已 rebase → ``rebase | PASS``；``rc=1`` = 落后或分叉 → **拒绝**；其它 rc
+  （``128`` 对象缺失 / 通信错误…）= 判不了 → **同样拒绝**（不知道不等于通过）。
+- **不用** ``--depth`` 浅抓：浅历史下 ``merge-base --is-ancestor`` 会假红
+  （:mod:`team_board.branches` 已记同一个坑）。
+- 私有 ref ``refs/merge-guard/<pr>/{base,head}`` 每次 ``+`` 覆盖，**不做清理**（刻意
+  决定）：清理要多跑 ``git update-ref -d``，多出两条失败路径，而「清理失败不许翻状态」
+  最容易出 P1。它不在 ``refs/heads`` / ``refs/remotes`` 下，稽核看不见、``git push``
+  也不带出去，代价只是 pin 住两个提交对象。
+- **没有跳过开关**：没有 ``--allow-stale`` / ``--skip-rebase-check`` / ``--force`` /
+  ``--no-verify``。``--verify-only`` 路径也不加这一步（它一次 gh 都不调，不宣称合并前
+  状态）。
+
 合并方式只认一种
 ----------------
 ``--method`` 只接受 ``merge``（默认值就是 ``merge``，可省略）。``squash`` / ``rebase``
@@ -103,6 +136,9 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 形态非法（空串 / 含空白字符 /
   带 ``refs/`` 前缀）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
+  **合并前 rebase 闸门拒绝**（``gh pr view`` 的 ``baseRefName`` 形态非法；``git fetch``
+  取远端提交失败；远端 head 与预检的 ``headRefOid`` 不一致；``base`` 不是 ``head`` 的
+  祖先；祖先关系判不了）、
   ``headRefOid`` 缺失或不是 40/64 位十六进制、gh 不支持 ``--match-head-commit``、
   源分支在远端**不存在**、PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、
   gh/git 输出不是 UTF-8、stdout 编码表示不了中文、子命令超时、合并后通信持续失败
@@ -185,6 +221,19 @@ STEP_MERGE = "合并"
 STEP_DELETE = "分支删除"
 #: ``--verify-only`` 的步骤标签：只回答「远端有没有这个 ref」，不宣称删除
 STEP_REMOTE_REF = "远端 ref"
+#: 合并前 rebase 闸门的步骤标签（判据 = ``git merge-base --is-ancestor``）
+STEP_REBASE = "rebase"
+
+#: 私有 ref 命名空间前缀：本工具把远端 base / head 抓到这里再判祖先关系。
+#: 它**不在** ``refs/heads`` / ``refs/remotes`` 下 —— :mod:`team_board.branches`
+#: 的稽核只枚举这两类，``git push`` 也不会把它带出去（见 :func:`rebase_fetch_argv`）。
+MERGE_GUARD_REF_PREFIX = "refs/merge-guard"
+
+#: :func:`classify_merge_base_rc` 的三档：祖先 / 不是祖先 / 判不了
+ANCESTOR_YES = "yes"
+ANCESTOR_NO = "no"
+ANCESTOR_ERROR = "error"
+
 
 OUT_DELETED = "deleted"
 OUT_PRESENT = "present"
@@ -564,6 +613,83 @@ def ls_remote_argv(repo: str, remote: str, branch: str) -> tuple[str, ...]:
     )
 
 
+def rebase_base_ref(pr: int) -> str:
+    """本工具抓远端 base 提交的私有 ref：``refs/merge-guard/<pr>/base``。"""
+
+    return f"{MERGE_GUARD_REF_PREFIX}/{pr}/base"
+
+
+def rebase_head_ref(pr: int) -> str:
+    """本工具抓远端 head 提交的私有 ref：``refs/merge-guard/<pr>/head``。"""
+
+    return f"{MERGE_GUARD_REF_PREFIX}/{pr}/head"
+
+
+def rebase_fetch_argv(
+    repo: str, remote: str, pr: int, base: str, branch: str
+) -> tuple[str, ...]:
+    """判定「base 是不是 head 的祖先」的**第一条**命令：一次 fetch 抓两个 ref。
+
+    为什么整条判定要落到私有 ref 上（不直接 ``git fetch`` 到 ``refs/remotes/<remote>/*``）：
+    判定对象必须是**远端此刻**的提交，而不是本地某次 fetch 留下的旧对象。抓完之后
+    ``rev-parse`` / ``merge-base`` 全部在这两个 ref 上做，判的就是「这一轮看到的远端」。
+
+    ``--force`` 用 ``+`` 写在 refspec 里（``+refs/heads/<x>:refs/merge-guard/...``）：
+    上一轮留下的 ref 可能与这一轮不同，不加 ``+`` 会非快进失败。
+
+    **不清理**这两个 ref（刻意决定，理由见 :func:`rebase_gate` 的 docstring）。
+    """
+
+    return (
+        "git",
+        "-C",
+        repo,
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--quiet",
+        remote,
+        f"+refs/heads/{base}:{rebase_base_ref(pr)}",
+        f"+refs/heads/{branch}:{rebase_head_ref(pr)}",
+    )
+
+
+def rebase_rev_parse_argv(repo: str, ref: str) -> tuple[str, ...]:
+    """``git rev-parse <ref>``：读远端抓下来的提交 SHA（交叉核对用）。"""
+
+    return ("git", "-C", repo, "rev-parse", ref)
+
+
+def rebase_merge_base_argv(repo: str, pr: int) -> tuple[str, ...]:
+    """判定命令：``base`` 是不是 ``head`` 的祖先（rc0 是、rc1 不是、其它判不了）。"""
+
+    return (
+        "git",
+        "-C",
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        rebase_base_ref(pr),
+        rebase_head_ref(pr),
+    )
+
+
+def classify_merge_base_rc(rc: int) -> str:
+    """``merge-base --is-ancestor`` 的退出码分类：``0`` / ``1`` / 其它。
+
+    ``0`` → :data:`ANCESTOR_YES`（base 是 head 的祖先 = 已 rebase，放行）；
+    ``1`` → :data:`ANCESTOR_NO`（不是祖先 = 落后或分叉，拒绝）；
+    其它（``128`` 对象缺失 / 通信错误 …）→ :data:`ANCESTOR_ERROR`，**同样拒绝**：
+    判不了就不许合并，不许把「不知道」当成「通过」。
+    """
+
+    if rc == 0:
+        return ANCESTOR_YES
+    if rc == 1:
+        return ANCESTOR_NO
+    return ANCESTOR_ERROR
+
+
 def merge_argv(
     pr: int,
     method: str,
@@ -836,6 +962,42 @@ def check_branch_shape(branch: str) -> None:
             f"--branch {branch!r} {BRANCH_RULE_REFS_PREFIX}：要的是裸分支名"
             "（例 wt/t_1234abcd），本工具自己拼 refs/heads/；"
             "重复前缀会查成 refs/heads/refs/… 而永远不存在"
+        )
+
+
+def check_base_ref_shape(base: str) -> None:
+    """``gh pr view`` 读到的 ``baseRefName`` 必须是**裸分支名**。
+
+    与 :func:`check_branch_shape` 同一条规矩、同三条判据（空串 / 含空白字符 / 带
+    ``refs/`` 前缀），但文案**必须点名 ``baseRefName``**：这个值来自 gh 的预检输出，
+    不是调用方给的 ``--branch``，复述 ``--branch`` 那套文案只会让人去改一个没问题的参数。
+
+    为什么也要在 ``fetch`` 之前拦：``base`` 会被拼成 refspec 的源侧
+    （``+refs/heads/<base>:…``），畸形值要么 fetch 直接失败（rc2 但报错指向 git），
+    要么更糟 —— 拼出一个本地存在、远端却不存在的 ref。位置在 :func:`rebase_gate`
+    第一步，畸形 ``baseRefName`` 一个 git 调用都不发。
+    """
+
+    if not base:
+        raise MergeGuardError(
+            f"gh pr view 的 baseRefName {BRANCH_RULE_EMPTY}："
+            "要的是裸分支名（例 main）；空串会拼成 refs/heads/ 这个不存在的 ref，"
+            "无法判定 head 是否已 rebase 到 base，拒绝合并"
+        )
+    for index, char in enumerate(base):
+        if char.isspace():
+            raise MergeGuardError(
+                f"gh pr view 的 baseRefName {base!r} {BRANCH_RULE_WHITESPACE}"
+                f"（第 {index + 1} 个字符是 {char!r}）：要的是裸分支名，"
+                "空白不会被 Git 规范化掉，refs/heads/<含空白> 在远端永远查不到，"
+                "无法判定 head 是否已 rebase 到 base，拒绝合并"
+            )
+    if base.startswith("refs/"):
+        raise MergeGuardError(
+            f"gh pr view 的 baseRefName {base!r} {BRANCH_RULE_REFS_PREFIX}："
+            "要的是裸分支名（例 main），本工具自己拼 refs/heads/；"
+            "重复前缀会抓成 refs/heads/refs/… 而永远不存在，"
+            "无法判定 head 是否已 rebase 到 base，拒绝合并"
         )
 
 
@@ -1316,6 +1478,112 @@ def _keep_evidence(lines: list[str]) -> Iterator[None]:
         ) from exc
 
 
+def rebase_gate(opts: Options, info: Preflight) -> str:
+    """**合并前 rebase 闸门**：``origin/main`` 不是 head 的祖先就 rc2 拦下。
+
+    判据是三条命令，顺序固定（全部在 ``gh pr merge`` 之前跑，拒绝时一个 ``gh`` 写操作
+    都不发、stdout 保持 0 字节）：
+
+    1. :func:`rebase_fetch_argv` —— 一次 ``git fetch`` 把远端 ``base`` 与 ``branch``
+       抓进私有 ref ``refs/merge-guard/<pr>/{base,head}``；base 取 ``gh pr view`` 读到
+       的 ``baseRefName``（不写死 ``main``），``+`` 强制覆盖上一轮的 ref；
+    2. :func:`rebase_rev_parse_argv` —— 读 ``refs/merge-guard/<pr>/head``，必须**逐字
+       等于**预检读到的 ``headRefOid``（预检到合并之间分支被推送时，判的就该是预检看到
+       的那条 sha，与 ``--match-head-commit`` 同一个理由）；
+    3. :func:`rebase_merge_base_argv` —— ``git merge-base --is-ancestor base head``：
+       ``rc=0`` = 已 rebase（PASS）、``rc=1`` = 落后或分叉（拒绝）、其它 = 判不了（拒绝）。
+
+    为什么**不清理** ``refs/merge-guard/<pr>/{base,head}``（刻意决定，不是漏了）：
+    清理要多跑一条 ``git update-ref -d``，于是多出两条失败路径（``update-ref`` 失败、
+    清理与下一次 fetch 之间被别的进程插队），而「清理失败不许翻状态」正是最容易出 P1
+    的地方 —— 合并已经成功却因为清理报错被读成未完成。留下的代价仅是两个提交对象被
+    pin 住：这两个 ref 不在 ``refs/heads`` / ``refs/remotes`` 下，:mod:`team_board.branches`
+    的稽核（只枚举这两类）看不见、``git push`` 也不会把它们带出去。
+
+    不做 ``--depth`` 浅抓（``branches.py`` 已记同一个坑）：浅历史下
+    ``merge-base --is-ancestor`` 会假红。
+
+    通过时返回要打到 stdout 的 ``rebase | PASS | …`` 证据行（由 :func:`_run_merge`
+    插在 ``head sha`` 之后）；拒绝时抛 :class:`MergeGuardError`（rc2、stdout 空、
+    stderr 恰一行）。
+    """
+
+    base = info.base_ref
+    # 畸形 baseRefName 在 fetch 之前拦：一个 git 调用都不发
+    check_base_ref_shape(base)
+    base_text = base if opts.remote == "origin" else f"{opts.remote}/{base}"
+
+    fetch = _run(
+        rebase_fetch_argv(opts.repo, opts.remote, opts.pr, base, opts.branch),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    if fetch.returncode != 0:
+        raise MergeGuardError(
+            f"取远端提交失败（git fetch rc={fetch.returncode}）：{key_line(fetch)}；"
+            f"无法判定 head 是否已 rebase 到 {base_text}，拒绝合并"
+        )
+
+    head_ref = rebase_head_ref(opts.pr)
+    rev = _run(
+        rebase_rev_parse_argv(opts.repo, head_ref),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    # rev-parse 失败时拿不到 sha：把它的关键输出填进「远端 head 提交」这一格，
+    # 于是仍然落同一条「不一致」文案（比编一个新退出码路径好判）
+    remote_head = rev.stdout.strip() if rev.returncode == 0 else key_line(rev)
+    if remote_head != info.head_oid:
+        raise MergeGuardError(
+            f"远端 head 提交 {remote_head} 与 gh pr view 的 headRefOid "
+            f"{info.head_oid} 不一致：预检之后分支被推送，拒绝合并"
+        )
+
+    ancestor = _run(
+        rebase_merge_base_argv(opts.repo, opts.pr),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    kind = classify_merge_base_rc(ancestor.returncode)
+    if kind == ANCESTOR_NO:
+        raise MergeGuardError(
+            f"分支 {opts.branch} 落后 {base_text}（{base_text} 不是 head 的祖先，"
+            f"git merge-base --is-ancestor rc=1）：合并前必须先 rebase 到 {base_text}，"
+            "拒绝合并"
+        )
+    if kind == ANCESTOR_ERROR:
+        raise MergeGuardError(
+            f"无法判定 {base_text} 是否为 head 的祖先"
+            f"（git merge-base rc={ancestor.returncode}）：{key_line(ancestor)}；拒绝合并"
+        )
+
+    return format_step(
+        STEP_REBASE,
+        ok=True,
+        command=ancestor.command,
+        rc=ancestor.returncode,
+        # merge-base --is-ancestor 成功时没有输出，所以 key 由本工具合成
+        key=(
+            f"{_short_ref(opts, rebase_base_ref(opts.pr), fallback=base_text)} "
+            f"是 head {info.head_oid[:7]} 的祖先（已 rebase 到 {base_text}）"
+        ),
+    )
+
+
+def _short_ref(opts: Options, ref: str, *, fallback: str) -> str:
+    """读 ``ref`` 的提交 sha 前 7 位（仅用于证据行；读不到就退回 ``fallback``）。"""
+
+    proc = _run(
+        rebase_rev_parse_argv(opts.repo, ref),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    sha = proc.stdout.strip()
+    if proc.returncode != 0 or not _HEAD_OID.fullmatch(sha):
+        return fallback
+    return sha[:7]
+
+
 def ensure_branch_present(opts: Options) -> CommandResult:
     """**合并前**确认源分支在远端存在（rc=0 才算存在）；否则 ``MergeGuardError`` → rc2。
 
@@ -1465,6 +1733,10 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
             f"--branch {opts.branch} 等于 PR {opts.pr} 的 baseRefName，"
             "拒绝合并（合并后删除会毁掉主分支）"
         )
+    # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。
+    # 排在这里（而不是 lines 攒完之后）是刻意的：拒绝时 stdout 必须 0 字节，
+    # 否则下游会把半截证据行读成「已经走到合并了」。PASS 行插在 head sha 之后。
+    rebase_line = rebase_gate(opts, info)
 
     lines = [
         format_step(
@@ -1486,6 +1758,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         ),
         # 预检钉到**提交**：这条 sha 就是合并时交给 --match-head-commit 的那个值。
         f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
+        rebase_line,
     ]
 
     merge_argv_value = merge_argv(

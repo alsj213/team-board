@@ -36,6 +36,9 @@ BODY_TEXT = (
 
 #: 假 gh 的 ``pr view`` 报出来的 head 提交（40 位十六进制）：合并 argv 必须带它
 HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
+#: 假 git 在 ``refs/merge-guard/<pr>/base`` 上读到的 base 提交（rebase PASS 行的 key 用它前 7 位）
+BASE_OID = "b3c1d2e4f5a6978899aabbccddeeff0011223344"
+
 #: ``gh pr view`` 要的字段（``headRefOid`` 是「预检钉到提交」的凭据）
 VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
 VIEW_CALL = f"gh pr view 9 --json {VIEW_FIELDS}"
@@ -54,6 +57,25 @@ def merge_call(
         f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
         f"--subject {subject} --body-file {path}"
     )
+
+
+def rebase_call(stub: Stub) -> str:
+    """rebase 闸门的判定命令原文（私有 ref 命名空间 ``refs/merge-guard/<pr>/*``）。"""
+
+    return (
+        f"git -C {stub.repo} merge-base --is-ancestor "
+        "refs/merge-guard/9/base refs/merge-guard/9/head"
+    )
+
+
+def rebase_line(stub: Stub) -> str:
+    """rebase 闸门通过时的那一行证据（``merge-base`` 成功没有输出，key 由工具合成）。"""
+
+    return (
+        f"rebase | PASS | {rebase_call(stub)} | rc=0 | "
+        f"{BASE_OID[:7]} 是 head {HEAD_OID[:7]} 的祖先（已 rebase 到 main）"
+    )
+
 
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
@@ -80,16 +102,51 @@ exit 9
 
 GIT_STUB = """#!/bin/sh
 printf 'git %s\\n' "$*" >> "$FAKE_LOG"
-n=0
-if [ -n "$FAKE_GIT_COUNT" ] && [ -f "$FAKE_GIT_COUNT" ]; then n=$(cat "$FAKE_GIT_COUNT"); fi
-n=$((n + 1))
-if [ -n "$FAKE_GIT_COUNT" ]; then printf '%s' "$n" > "$FAKE_GIT_COUNT"; fi
-# 第一次 ls-remote 可以是「合并前源分支存在」闸门，用独立的退出码
-if [ "$n" = "1" ] && [ -n "$FAKE_LS_REMOTE_FIRST_RC" ]; then
-  exit "$FAKE_LS_REMOTE_FIRST_RC"
-fi
-if [ -n "$FAKE_GIT_SLEEP" ]; then sleep "$FAKE_GIT_SLEEP"; fi
-exit "${FAKE_LS_REMOTE_RC:-2}"
+for arg in "$@"; do
+  case "$arg" in
+    ls-remote|fetch|rev-parse|merge-base) sub="$arg"; break ;;
+  esac
+done
+case "$sub" in
+  ls-remote)
+    # 只有 ls-remote 计次：第 1 次 = 合并前的「源分支存在」闸门，其余 = 合并后的删除探针
+    n=0
+    if [ -n "$FAKE_GIT_COUNT" ] && [ -f "$FAKE_GIT_COUNT" ]; then n=$(cat "$FAKE_GIT_COUNT"); fi
+    n=$((n + 1))
+    if [ -n "$FAKE_GIT_COUNT" ]; then printf '%s' "$n" > "$FAKE_GIT_COUNT"; fi
+    if [ "$n" = "1" ] && [ -n "$FAKE_LS_REMOTE_FIRST_RC" ]; then
+      exit "$FAKE_LS_REMOTE_FIRST_RC"
+    fi
+    if [ -n "$FAKE_GIT_SLEEP" ]; then sleep "$FAKE_GIT_SLEEP"; fi
+    exit "${FAKE_LS_REMOTE_RC:-2}"
+    ;;
+  fetch)
+    if [ -n "$FAKE_FETCH_ERR" ]; then printf '%s\\n' "$FAKE_FETCH_ERR" >&2; fi
+    exit "${FAKE_FETCH_RC:-0}"
+    ;;
+  rev-parse)
+    ref=""
+    for arg in "$@"; do
+      case "$arg" in refs/*) ref="$arg" ;; esac
+    done
+    case "$ref" in
+      */base) out="$FAKE_REV_PARSE_BASE_OUT" ;;
+      *) out="$FAKE_REV_PARSE_OUT" ;;
+    esac
+    rc="${FAKE_REV_PARSE_RC:-0}"
+    if [ -n "$FAKE_REV_PARSE_ERR" ]; then printf '%s\\n' "$FAKE_REV_PARSE_ERR" >&2; fi
+    if [ "$rc" = "0" ] && [ -n "$out" ]; then printf '%s\\n' "$out"; fi
+    exit "$rc"
+    ;;
+  merge-base)
+    if [ -n "$FAKE_MERGE_BASE_ERR" ]; then printf '%s\\n' "$FAKE_MERGE_BASE_ERR" >&2; fi
+    exit "${FAKE_MERGE_BASE_RC:-0}"
+    ;;
+  *)
+    printf 'fake git: unexpected args: %s\\n' "$*" >&2
+    exit 9
+    ;;
+esac
 """
 
 
@@ -170,6 +227,12 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     # 默认：合并前的「源分支存在」闸门通过（分支在），合并后的探针报「没有这个 ref」
     monkeypatch.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")
     monkeypatch.setenv("FAKE_LS_REMOTE_RC", "2")
+    # 默认：rebase 闸门的三个子命令都成功 —— fetch 成功、远端 head 就是预检的 headRefOid、
+    # base 是 head 的祖先（已 rebase）。各用例按需覆盖成红样。
+    monkeypatch.setenv("FAKE_FETCH_RC", "0")
+    monkeypatch.setenv("FAKE_REV_PARSE_OUT", HEAD_OID)
+    monkeypatch.setenv("FAKE_REV_PARSE_BASE_OUT", BASE_OID)
+    monkeypatch.setenv("FAKE_MERGE_BASE_RC", "0")
     out = Stub(bindir=bindir, log=log, repo=repo, body_file=body_file, setenv=monkeypatch.setenv)
     out.view()
     return out
@@ -396,8 +459,10 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[1].startswith(f"预检 | PASS | {VIEW_CALL} | rc=0 | ")
     # 预检钉到提交：新增一行 head sha 证据（值是假 gh 报的 headRefOid）
     assert lines[2] == f"head sha | PASS | {HEAD_OID}"
-    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
-    assert lines[4].startswith(
+    # 预检之后、合并之前：rebase 闸门（base 必须是 head 的祖先）
+    assert lines[3] == rebase_line(stub)
+    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
+    assert lines[5].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
     )
@@ -490,7 +555,9 @@ def test_old_gh_unknown_match_head_commit_rc2_no_downgrade(
     assert "不提供不带 head sha 的合并路径" in err
     merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
     assert merge_calls == [merge_call(stub)]  # 没有「不带 sha 再试一次」
-    assert len(stub.git_calls()) == 1  # 只有合并前那次存在性探针，没有删除验证
+    # 只有合并前那次存在性探针，没有删除验证（rebase 闸门的 fetch / rev-parse /
+    # merge-base 是另外三条子命令，按子命令分派计数，不混进 ls-remote 的次数里）
+    assert len([call for call in stub.git_calls() if " ls-remote " in call]) == 1
 
 
 # ------------------- 1d. --timeout 是总预算（P2-1）：单次卡住也不许击穿它
@@ -636,8 +703,9 @@ def test_merge_failure_rc1_and_no_verification(
     rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 1
-    # 只有合并前那一次「源分支存在」探针，合并后一次删除验证都没跑
-    assert len(stub.git_calls()) == 1
+    # 只有合并前那一次「源分支存在」探针，合并后一次删除验证都没跑（rebase 闸门的
+    # fetch / rev-parse / merge-base 另算：这里是按 ls-remote 次数判「没做删除验证」）
+    assert len([call for call in stub.git_calls() if " ls-remote " in call]) == 1
     assert stub.git_calls()[0].startswith("git -C ")
     assert merge_call(stub) in stub.gh_calls()
     assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
@@ -1080,7 +1148,8 @@ def test_git_vanishes_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
@@ -1101,7 +1170,8 @@ def test_merge_ok_but_undetermined_rc2(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)}")
+    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)}")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -1276,7 +1346,8 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
@@ -1664,8 +1735,9 @@ def test_signal_after_merge_keeps_evidence_rc2(
         args_for(stub, "--timeout", "30", "--interval", "1"), cwd=stub.repo
     )
     try:
-        # git 第 2 次调用 = 合并后的轮询探针已启动 → 「合并 | PASS」那行已经攒好
-        _wait_until(lambda: len(stub.git_calls()) >= 2)
+        # ls-remote 第 2 次 = 合并后的轮询探针已启动 → 「合并 | PASS」那行已经攒好
+        # （不能按 git 总调用次数判：rebase 闸门的 fetch / rev-parse / merge-base 也在里头）
+        _wait_until(lambda: len([c for c in stub.git_calls() if " ls-remote " in c]) >= 2)
         proc.send_signal(signum)
         out, err = proc.communicate(timeout=60)
     finally:
@@ -2102,3 +2174,156 @@ def test_merge_guard_commit_passes_merge_audit_require(
     assert audit.returncode == 0, audit.stdout + audit.stderr
     assert f"by={MERGE_BY}" in audit.stdout
     assert "结论：无问题" in audit.stdout
+
+
+# ------------------------------- 16. 合并前 rebase 闸门：红样（base 不是 head 的祖先）
+#
+# 修之前：分支落后 main 也照样合 —— 只钉 head sha 不保证合进去的树包含 main 尖端。
+# 现在预检之后、`gh pr merge` 之前判 `merge-base --is-ancestor base head`，不是祖先
+# 就 rc2：stdout 0 字节（证据行还没开始攒）、stderr 恰一行、零 `gh pr merge`。
+
+def test_rebase_gate_rejects_stale_branch_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stub.setenv("FAKE_MERGE_BASE_RC", "1")  # base 不是 head 的祖先（落后 / 分叉）
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2  # 与「源分支不存在」「PR 不是 OPEN」同档：合并不可能发生
+    assert out == ""  # 一个字的证据都不该有
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert f"分支 {CARD_BRANCH} 落后 main" in err
+    assert "git merge-base --is-ancestor rc=1" in err
+    assert "合并前必须先 rebase 到 main" in err
+    # gh 只调过那一次预检：一个 `gh pr merge` 都没发
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not any(call.startswith("gh pr merge") for call in stub.gh_calls())
+
+
+def test_rebase_gate_fetch_failure_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``git fetch`` 抓不到远端提交 → rc2；后面两条命令一条都不跑。"""
+
+    stub.setenv("FAKE_FETCH_RC", "128")
+    stub.setenv("FAKE_FETCH_ERR", "fatal: could not read from remote repository")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "取远端提交失败（git fetch rc=128）" in err
+    assert "could not read from remote repository" in err
+    assert "无法判定 head 是否已 rebase 到 main" in err
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not [c for c in stub.git_calls() if " rev-parse " in c or " merge-base " in c]
+
+
+def test_rebase_gate_head_pushed_after_preflight_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """预检到合并之间分支被推送（远端 head ≠ headRefOid）→ rc2，判的就是预检那条 sha。"""
+
+    stub.setenv("FAKE_REV_PARSE_OUT", "0055aa66bb77cc88dd99ee00112233445566778899")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "0055aa66bb77cc88dd99ee00112233445566778899" in err
+    assert f"headRefOid {HEAD_OID}" in err
+    assert "预检之后分支被推送" in err
+    # 判了「不一致」就不许再往下判祖先关系
+    assert not [c for c in stub.git_calls() if " merge-base " in c]
+    assert stub.gh_calls() == [VIEW_CALL]
+
+
+def test_rebase_gate_undetermined_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``merge-base`` 退出码不是 0/1（128 = 对象缺失 / 通信错误）→ 判不了，同样拒绝。"""
+
+    stub.setenv("FAKE_MERGE_BASE_RC", "128")
+    stub.setenv("FAKE_MERGE_BASE_ERR", "fatal: bad object refs/merge-guard/9/base")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "无法判定 main 是否为 head 的祖先（git merge-base rc=128）" in err
+    assert "bad object refs/merge-guard/9/base" in err
+    assert stub.gh_calls() == [VIEW_CALL]
+
+
+@pytest.mark.parametrize(
+    ("base", "hint"),
+    [
+        ("", "不能是空串"),
+        ("ma in", "不能含空白字符"),
+        ("refs/heads/main", "不能带 refs/ 前缀"),
+    ],
+    ids=["empty", "whitespace", "refs-prefix"],
+)
+def test_rebase_gate_rejects_malformed_base_ref_name(
+    stub: Stub, capsys: pytest.CaptureFixture[str], base: str, hint: str
+) -> None:
+    """``gh pr view`` 报出畸形 ``baseRefName`` → rc2、零 git 调用（fetch 之前就拦）。"""
+
+    stub.view(base=base)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "baseRefName" in err  # 文案必须点名 baseRefName，不是 --branch
+    assert hint in err
+    assert "--branch" not in err
+    # 闸门一个 git 调用都不发：只有合并前那次存在性探针（它在 gh 预检之前）
+    assert not [
+        c
+        for c in stub.git_calls()
+        if " fetch " in c or " rev-parse " in c or " merge-base " in c
+    ]
+    assert len([c for c in stub.git_calls() if " ls-remote " in c]) == 1
+    assert stub.gh_calls() == [VIEW_CALL]
+
+
+def test_rebase_gate_git_subcommand_order_passing(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """通过路径的 git 子命令顺序必须是：存在性探针 → fetch → rev-parse → merge-base →
+    rev-parse(base，只用于证据行) → 删除探针。
+    """
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, _err = run(args_for(stub), capsys)
+
+    assert rc == 0
+    subs = [call.split()[3] for call in stub.git_calls()]
+    assert subs[:5] == ["ls-remote", "fetch", "rev-parse", "merge-base", "rev-parse"]
+    assert set(subs[5:]) == {"ls-remote"}  # 后面全是删除探针
+    assert rebase_line(stub) in out.splitlines()
+
+
+def test_verify_only_never_emits_rebase_step(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--verify-only`` 一次 gh 都不调、也不宣称合并前状态：不许出现 ``rebase |``。"""
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # verify-only 没有「合并前存在」闸门
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for_verify(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert "rebase |" not in out
+    assert "head sha |" not in out
+    assert stub.gh_calls() == []
+    assert not [c for c in stub.git_calls() if " fetch " in c or " merge-base " in c]
+
