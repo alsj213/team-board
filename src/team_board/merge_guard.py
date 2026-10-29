@@ -78,6 +78,28 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
   ``--no-verify``。``--verify-only`` 路径也不加这一步（它一次 gh 都不调，不宣称合并前
   状态）。
 
+合并前先过两道证据闸门（R17⑤ / R18④）
+--------------------------------------
+rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdout 0 字节、**一个 gh 写操作
+都不发**）：
+
+1. **认领唯一性**（R17⑤）：读看板库（``--db``，只读 ``mode=ro``）的未结卡，判「恰好一张
+   卡在正文顶格写了 ``PR-CLAIM: #<pr>``」且**这张卡的卡号逐字等于 ``--card``**。判定
+   逻辑全在 :func:`team_board.prclaim.audit` 与 ``Report.sole_claim_id``，本模块不复制
+   正则、不另写一份 —— 与 ``team-board pr-claim-audit`` 共用同一份实现。三种拒绝文案
+   一眼可分：``无未结卡认领该 PR`` / ``重复认领`` / ``认领卡 ≠ --card``。这一步一次 gh
+   都不调（只读本地库）。
+2. **双问绑定 head sha**（R18④）：用 ``--pr`` 与预检读到的 ``headRefOid`` 调
+   :func:`team_board.reviewhead.fetch_bodies` / ``analyze``，要求该 sha 上 ``defect`` +
+   ``regression`` 各 ≥1 条结构化标记（``REVIEW-HEAD`` / ``REVIEW-KIND``）。只发两条
+   ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，``--paginate``），
+   取数失败 / 证据不齐一律 rc2。三种拒绝文案：``双问缺证``（一条标记都没有） /
+   ``双问陈旧``（有标记但都不是当前 head，即 head 变了没重跑双问） / ``双问缺类``
+   （当前 head 上缺某一类）。
+
+两道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-review-head``），也都不在
+``--verify-only`` 路径上跑（那条路径不合并，不该要求认领与双问）。
+
 合并方式只认一种
 ----------------
 ``--method`` 只接受 ``merge``（默认值就是 ``merge``，可省略）。``squash`` / ``rebase``
@@ -144,6 +166,9 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 形态非法（空串 / 含空白字符 /
   带 ``refs/`` 前缀）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
+  **合并前认领闸门拒绝**（读不到看板库 / PR 无未结卡认领 / 重复认领 / 认领卡 ≠
+  ``--card``）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
+  双问缺类）、
   **合并前 rebase 闸门拒绝**（``gh pr view`` 的 ``baseRefName`` 形态非法；``git fetch``
   取远端提交失败；远端 head 与预检的 ``headRefOid`` 不一致；``base`` 不是 ``head`` 的
   祖先；祖先关系判不了）、
@@ -190,7 +215,9 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+from team_board import db, prclaim, reviewhead
 from team_board.merges import MERGE_BY_RE, MERGE_CARD_RE, check_message
+from team_board.model import DEFAULT_DB
 
 #: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
 METHODS: tuple[str, ...] = ("merge",)
@@ -231,6 +258,10 @@ STEP_DELETE = "分支删除"
 STEP_REMOTE_REF = "远端 ref"
 #: 合并前 rebase 闸门的步骤标签（判据 = ``git merge-base --is-ancestor``）
 STEP_REBASE = "rebase"
+#: 合并前「认领唯一性」闸门的步骤标签（R17⑤；判据 = ``prclaim.audit``）
+STEP_CLAIM = "认领唯一性"
+#: 合并前「双问绑定 head sha」闸门的步骤标签（R18④；判据 = ``reviewhead.analyze``）
+STEP_REVIEW_HEAD = "双问绑定"
 
 #: 私有 ref 命名空间前缀：本工具把远端 base / head 抓到这里再判祖先关系。
 #: 它**不在** ``refs/heads`` / ``refs/remotes`` 下 —— :mod:`team_board.branches`
@@ -1198,6 +1229,136 @@ def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
     )
 
 
+# ---------------------------------------------------- 合并前的两道证据闸门
+
+def _claim_row_ids(rows: tuple[prclaim.ClaimRow, ...]) -> str:
+    """认领卡的卡号清单（拒绝文案里用；0 张时是 ``(无)``）。"""
+
+    return ",".join(row.id for row in rows) if rows else "(无)"
+
+
+def claim_gate(opts: Options, info: Preflight) -> str:
+    """**合并前认领唯一性闸门**（R17⑤）：``PR-CLAIM`` 唯一且就是 ``--card``，否则 rc2。
+
+    判据直接调 :func:`team_board.prclaim.audit`（``pr-claim-audit`` 子命令的同一份实现，
+    禁止第二份判定逻辑）与 ``Report.sole_claim_id``（恰好一张才给卡号，0 张或 ≥2 张给
+    ``None``）—— 本模块**不**从渲染文本里抠卡号。
+
+    三种拒绝文案一眼可分（都是一行 ``错误: …``、stdout 0 字节）：
+
+    - 0 张认领 → ``无未结卡认领该 PR``；
+    - ≥2 张认领 → ``重复认领``（附卡号清单）；
+    - 恰好一张但不是 ``--card`` → ``认领卡 ≠ --card``。
+
+    这一步一次 gh 都不调（只读看板库，``mode=ro``）。库不可用同样是 rc2 且要在拒绝前
+    就把原因说清 —— 「读不到库」不许被读成「没有卡认领」。
+    """
+
+    accounting = opts.accounting
+    if accounting is None:  # pragma: no cover - validate 已拦住（合并模式必填）
+        raise MergeGuardError("合并模式缺少认账参数（内部错误）")
+    card = accounting.card
+    source = f"看板库 {opts.db_path}（未结卡，mode=ro）"
+    try:
+        conn = db.connect(opts.db_path)
+    except (db.BoardError, OSError) as exc:
+        raise MergeGuardError(
+            f"读看板库失败，无法判定 PR #{opts.pr} 的认领唯一性：{exc}；拒绝合并"
+        ) from exc
+    try:
+        rows = db.iter_claim_rows(conn)
+    except (db.BoardError, OSError) as exc:
+        raise MergeGuardError(
+            f"读未结卡正文失败，无法判定 PR #{opts.pr} 的认领唯一性：{exc}；拒绝合并"
+        ) from exc
+    finally:
+        conn.close()
+
+    report = prclaim.audit(rows, opts.pr)
+    if not report.ok:
+        if not report.claims:
+            raise MergeGuardError(
+                f"认领闸门拦下 PR #{opts.pr}：{prclaim.VERDICT_NONE}；"
+                "拒绝合并（R17：一次只许一张卡对同一 PR 发 gh 写操作）"
+            )
+        raise MergeGuardError(
+            f"认领闸门拦下 PR #{opts.pr}：{prclaim.VERDICT_DUPE}"
+            f"（认领卡 {_claim_row_ids(report.claims)}）；拒绝合并"
+        )
+    sole = report.sole_claim_id
+    if sole != card:
+        raise MergeGuardError(
+            f"认领闸门拦下 PR #{opts.pr}：认领卡 {sole} ≠ --card {card}"
+            "（认领卡号必须与 --card 逐字一致，R17）；拒绝合并"
+        )
+    return format_step(
+        STEP_CLAIM,
+        ok=True,
+        # 这一步没有外部命令：判据是本地只读库 + 纯函数，命令格写明数据来源
+        command=f"prclaim.audit({source}, pr=#{opts.pr})",
+        rc=0,
+        key=f"认领唯一 → {sole}（与 --card 逐字一致）",
+    )
+
+
+def review_head_gate(opts: Options, info: Preflight) -> str:
+    """**合并前双问绑定闸门**（R18④）：该 head sha 上 defect + regression 各 ≥1 条。
+
+    取数与判定全调 :mod:`team_board.reviewhead`（``pr-review-head-audit`` 子命令的同一份
+    实现）：``fetch_bodies(pr)`` 只发两条 ``gh api GET``（``--paginate``，只看 body），
+    ``analyze(head_oid, bodies)`` 是纯函数。取数失败（gh 不在 PATH / 非 0 / 超时 / 输出
+    不是 JSON）一律 rc2 —— 「读不到评审」不许被读成「双问没做」（那是 rc1 语义，本工具
+    只有 rc2 这一档拒绝）。
+
+    三种拒绝文案一眼可分：
+
+    - 一条结构化标记都没有 → ``双问缺证``；
+    - 有标记但都不在当前 head 上 → ``双问陈旧``（head 变了没重跑双问）；
+    - 当前 head 上缺某一类 → ``双问缺类``（附缺的类）。
+    """
+
+    head = info.head_oid
+    short = head[:12]
+    try:
+        bodies = reviewhead.fetch_bodies(opts.pr)
+    except reviewhead.ReviewHeadError as exc:
+        raise MergeGuardError(
+            f"取 PR #{opts.pr} 的评审正文失败，无法判定双问是否绑定 head {short}："
+            f"{exc}；拒绝合并"
+        ) from exc
+    report = reviewhead.analyze(head, bodies)
+    if not report.ok:
+        if not report.marks:
+            raise MergeGuardError(
+                f"双问缺证：PR #{opts.pr} 的评审正文（{report.bodies_scanned} 条）里"
+                "没有任何 REVIEW-HEAD / REVIEW-KIND 标记"
+                f"（{reviewhead.CONCLUSION_NO_MARK}）；拒绝合并"
+            )
+        if not report.kinds_on_head:
+            raise MergeGuardError(
+                f"双问陈旧：PR #{opts.pr} 有 {len(report.marks)} 条结构化标记，"
+                f"但都不是当前 head {short}（head 变了要重跑双问）；拒绝合并"
+            )
+        raise MergeGuardError(
+            "双问缺类："
+            f"{reviewhead.CONCLUSION_MISSING.format(short=short, missing=','.join(report.missing))}"
+            "；拒绝合并"
+        )
+    return format_step(
+        STEP_REVIEW_HEAD,
+        ok=True,
+        command=(
+            f"gh api repos/{reviewhead.REPO}/pulls/{opts.pr}/reviews --paginate"
+            f" + gh api repos/{reviewhead.REPO}/issues/{opts.pr}/comments --paginate"
+        ),
+        rc=0,
+        key=(
+            f"head {short} 上 defect + regression 各 >=1 条"
+            f"（扫描正文 {report.bodies_scanned} 条、带标记 {len(report.marks)} 条）"
+        ),
+    )
+
+
 # ------------------------------------------------------------------ 命令行
 
 class _Parser(argparse.ArgumentParser):
@@ -1242,6 +1403,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", default=".", metavar="PATH", help="仓库路径（默认 .）")
     parser.add_argument("--remote", default="origin", metavar="NAME", help="远端名（默认 origin）")
+    parser.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=(
+            "看板 SQLite 路径，只读（认领唯一性闸门用；"
+            f"默认 {DEFAULT_DB}）"
+        ),
+    )
     parser.add_argument(
         "--timeout",
         default="60",
@@ -1321,6 +1491,8 @@ class Options:
     method: str
     repo: str
     remote: str
+    #: 看板 SQLite 路径（认领唯一性闸门的数据源，只读打开）
+    db_path: str
     timeout: int
     interval: int
     command_timeout: int
@@ -1372,6 +1544,7 @@ def validate(args: argparse.Namespace) -> Options:
         method=method,
         repo=repo,
         remote=args.remote,
+        db_path=args.db,
         timeout=timeout,
         interval=interval,
         command_timeout=command_timeout,
@@ -1745,6 +1918,12 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
             f"--branch {opts.branch} 等于 PR {opts.pr} 的 baseRefName，"
             "拒绝合并（合并后删除会毁掉主分支）"
         )
+    # 合并**前**的两道证据闸门（顺序固定，见模块 docstring）：
+    #   ① 认领唯一性（R17⑤）——只读看板库，一次 gh 都不调；
+    #   ② 双问绑定 head sha（R18④）——只发两条 gh api GET。
+    # 两者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
+    claim_line = claim_gate(opts, info)
+    review_line = review_head_gate(opts, info)
     # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。
     # 排在这里（而不是 lines 攒完之后）是刻意的：拒绝时 stdout 必须 0 字节，
     # 否则下游会把半截证据行读成「已经走到合并了」。PASS 行插在 head sha 之后。
@@ -1770,6 +1949,8 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         ),
         # 预检钉到**提交**：这条 sha 就是合并时交给 --match-head-commit 的那个值。
         f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
+        claim_line,
+        review_line,
         rebase_line,
     ]
 

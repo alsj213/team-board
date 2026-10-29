@@ -454,7 +454,8 @@ python3 -m team_board.merge_guard \
   [--method {merge}=merge] --delete-branch \
   --card <t_ 加 8 位小写十六进制> --by <profile>/run<NNN> \
   --subject <合并提交标题> --body-file <认账 body 文件> \
-  [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] \
+  [--repo PATH=. ] [--remote NAME=origin] [--db PATH=<默认看板库>] \
+  [--timeout SEC=60] [--interval SEC=2] \
   [--command-timeout SEC=60] [--verify-only]
 ```
 
@@ -500,6 +501,22 @@ python3 -m team_board.merge_guard \
   `headRefName` 必须与 `--branch` **逐字相等**，`headRefOid` 必须是 40 位（SHA-1）或
   64 位（SHA-256）十六进制提交 SHA —— 缺字段或格式不对一律 rc2，说清实际值。预检通过
   后把提交钉进证据：`head sha | PASS | <sha>`。
+- **合并前的两道证据闸门（预检之后、rebase 之前，顺序固定）**，两道都**只读**、拒绝时
+  stdout 0 字节、**一个 gh 写操作都不发**，也都**没有跳过开关**（没有 `--skip-claim` /
+  `--skip-review-head`），且都不在 `--verify-only` 路径上跑：
+  1. **认领唯一性（R17⑤）**：读 `--db` 指向的看板库（只读 `mode=ro`）的未结卡，判「恰好
+     一张卡在正文顶格写了 `PR-CLAIM: #<pr>`」且这张卡的卡号**逐字等于 `--card`**。判定
+     逻辑与 `team-board pr-claim-audit` 同源（`prclaim.audit` / `Report.sole_claim_id`），
+     本工具不复制正则。三种拒绝文案一眼可分：`无未结卡认领该 PR` / `重复认领`（附卡号
+     清单） / `认领卡 <id> ≠ --card <card>`。这一步一次 gh 都不调。
+  2. **双问绑定 head sha（R18④）**：用 `--pr` 与预检读到的 `headRefOid` 调
+     `reviewhead.fetch_bodies` / `analyze`（与 `team-board pr-review-head-audit` 同源），
+     要求该 sha 上 `defect` + `regression` 各 ≥1 条 `REVIEW-HEAD` / `REVIEW-KIND` 标记。
+     只发两条 `gh api GET`（`pulls/<n>/reviews` + `issues/<n>/comments`，`--paginate`）。
+     三种拒绝文案：`双问缺证`（一条标记都没有） / `双问陈旧`（有标记但都不是当前 head，
+     head 变了没重跑双问） / `双问缺类`（当前 head 上缺某一类，附缺的类）。
+- `--db` 默认取看板库路径（认领闸门的数据源，只读打开）；库打不开 / 不是合法 SQLite /
+  读 `tasks` 失败一律 rc2 且说清原因 —— **不许**读成「没有卡认领」。
 - 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>
   --subject <subject> --body-file <path>`
   （`<sha>` = 预检读到的 `headRefOid`；后两个参数来自 `--subject` / `--body-file`，顺序固定）。
