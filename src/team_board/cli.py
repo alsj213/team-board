@@ -35,6 +35,13 @@
   ``--rev`` 解析不成提交、找不到主分支、``PATH`` 里没有 ``git``、git 输出不是
   UTF-8、stdout 编码表示不了中文）
 
+``body-audit`` 子命令（只读，看每张卡 ``tasks.body`` 的字节分布）：
+- 0：没有超限卡
+- 1：有超限卡（``body`` 的 UTF-8 字节数 > ``bodylimit.BODY_LIMIT_BYTES``）
+- 2：参数或环境错误（``db.BoardError`` / ``OSError`` / ``sqlite3.Error`` →
+  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--db`` 不存在、
+  不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
+
 ``merge-record`` 子命令（合并**前**那一半）：
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
 - 1：``--check-file`` 预检发现认账问题（每处一行 ``问题: <kind>：<detail>``）
@@ -48,12 +55,13 @@ from __future__ import annotations
 
 import argparse
 import re
+import sqlite3
 import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
 
-from . import branches, commands, commits, db, merges, web
+from . import bodylimit, branches, commands, commits, db, merges, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -139,7 +147,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**八个**子命令。
+    """建 CLI 前端：prog=team-board，共**十个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -156,6 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
       ``--check-file`` 预检（0 成功/通过 / 1 预检有问题 / 2 参数或环境错误），吃
       ``--card`` / ``--by`` / ``--pr`` / ``--subject`` / ``--body-out`` /
       ``--check-file``；**只打印** ``gh pr merge`` 模板，不执行任何 git/gh 命令；
+    - ``body-audit``：稽核全板 ``tasks.body`` 的 UTF-8 字节分布与超限清单（0 无超限 /
+      1 有超限 / 2 参数或环境错误），只吃 ``--db`` / ``--all``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -351,6 +361,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="预检模式：校验该文件的认账三字段（不能与 --body-out 同给）",
+    )
+
+    body_cmd = subparsers.add_parser(
+        "body-audit",
+        help="稽核卡正文 body 的字节分布与超限清单（0 无超限 / 1 有超限 / 2 参数或环境错误）",
+    )
+    body_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    body_cmd.add_argument(
+        "--all",
+        action="store_true",
+        help="连 done 卡一起算（默认只算未结卡：status ∉ {done, archived}）",
     )
 
     serve = subparsers.add_parser(
@@ -747,6 +773,32 @@ def _run_merge_record(args: argparse.Namespace) -> int:
         return 2
 
 
+def _run_body_audit(args: argparse.Namespace) -> int:
+    """``body-audit`` 子命令：读失败一律 stderr 一行 ``错误: …`` + rc2。
+
+    三个码的分工：0 无超限 / 1 有超限 / 2 参数或环境错误。库不可用时 stdout
+    **一个字节都不写**（报告整块在库读成功之后才拼），所以 rc2 与 rc1 不会混。
+    """
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        rows = db.iter_body_rows(conn, include_done=args.all)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    summary = bodylimit.summarize(rows)
+    scope = bodylimit.SCOPE_ALL if args.all else bodylimit.SCOPE_PENDING
+    text = bodylimit.render(summary, db_path=args.db, scope=scope)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 1 if summary.counts["over"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -761,6 +813,9 @@ def main(argv: list[str] | None = None) -> int:
         return _run_commit_audit(args)
     if args.command == "merge-record":
         return _run_merge_record(args)
+
+    if args.command == "body-audit":
+        return _run_body_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)

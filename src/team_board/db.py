@@ -9,6 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from . import bodylimit
 from .model import DEFAULT_DB, Task
 
 
@@ -71,6 +72,44 @@ def load_tasks(conn: sqlite3.Connection) -> list[Task]:
             )
         )
     return tasks
+
+
+_BODY_COLUMNS = "id, status, assignee, body"
+
+#: ``iter_body_rows`` 的两种口径（``include_done`` 决定用哪一条）
+_BODY_SCOPE_PENDING = "status NOT IN ('done', 'archived')"
+_BODY_SCOPE_ALL = "status != 'archived'"
+
+
+def iter_body_rows(
+    conn: sqlite3.Connection, *, include_done: bool
+) -> list[tuple[str, str, str, int | None]]:
+    """``(id, status, assignee, body 的 UTF-8 字节数|None)``，按 id 升序。
+
+    - ``include_done=False``：只要未结卡（``status NOT IN ('done','archived')``）；
+    - ``include_done=True``：未归档卡全要（``status != 'archived'``）；
+    - body 为 NULL 的行第 4 列是 ``None``（不是 0）：NULL 与「空 body」要分得开；
+    - 字节数在 Python 侧用 :func:`bodylimit.body_bytes` 算，SQL 里不做长度运算
+      （SQLite 的 ``length()`` 数的是字符，不是 UTF-8 字节）；
+    - ``assignee`` / ``status`` 的 NULL 归成空串，渲染层不必再判空。
+    """
+    where = _BODY_SCOPE_ALL if include_done else _BODY_SCOPE_PENDING
+    # where 来自模块常量（无外部输入，不是注入面）→ bandit B608 假阳性
+    sql = f"SELECT {_BODY_COLUMNS} FROM tasks WHERE {where} ORDER BY id"  # nosec B608
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.body 失败: {exc}") from exc
+
+    return [
+        (
+            str(row[0]),
+            "" if row[1] is None else str(row[1]),
+            "" if row[2] is None else str(row[2]),
+            None if row[3] is None else bodylimit.body_bytes(str(row[3])),
+        )
+        for row in rows
+    ]
 
 
 def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
