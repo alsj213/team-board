@@ -50,10 +50,18 @@
   带 ``refs/`` 前缀，校验复用 :func:`team_board.merge_guard.check_branch_shape`，不复制
   正则）、生成模式缺必需参数（``--card`` / ``--by`` / ``--pr`` / ``--branch`` /
   ``--body-out`` 缺任一项）、``--subject`` 空 / 纯空白 / 含换行（校验复用
-  :func:`team_board.merge_guard.check_subject`，不复制判据）、``--check-file`` 与
+  :func:`team_board.merge_guard.check_subject`，不复制判据）、``--body-out`` /
+  ``--repo`` 含换行（打印行会被截成两行，照抄即半条命令）、``--repo`` 含 ``:``
+  （``PYTHONPATH=…`` 是冒号分隔的，单条路径里的冒号拆不开 → 照抄即
+  ``No module named team_board``）、``--check-file`` 与
   ``--body-out`` 同给、``--body-out``
   父目录不存在、body 文件不存在 / 是目录 / 无权限 / 非 UTF-8 / 空、stdout 编码表示
   不了中文）
+
+``--subject`` 以 ``-`` 开头时（``-h`` / ``--fix …``），打印行改用
+``--subject=<值>`` 形式：``shlex.quote('-h')`` 原样返回，``--subject -h`` 会被
+argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=value`` 形式的
+值不参与选项解析。其余取值仍打 ``--subject <值>``（改动只落在这一行，不换命令形态）。
 """
 
 from __future__ import annotations
@@ -367,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "把认账 body 原样写入该文件（末尾恰好一个换行）；父目录不存在 → rc2。"
+            "把认账 body 原样写入该文件（末尾恰好一个换行）；父目录不存在 / 含换行 → rc2。"
             "生成模式必给（命令里的 --body-file 必须指向真实文件）"
         ),
     )
@@ -377,7 +385,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "仓库路径（默认 .）：只用来拼打印命令里的 cd / PYTHONPATH / --repo 三处，"
-            "不校验它是不是 git 仓库（那是 merge_guard 的事）"
+            "不校验它是不是 git 仓库（那是 merge_guard 的事）；含换行或冒号 → rc2"
+            "（冒号会把 PYTHONPATH 拆成两条路径）"
         ),
     )
     record_cmd.add_argument(
@@ -735,6 +744,11 @@ def _record_generate(
     （``/mnt/c/Users/…`` 一类）会让 ``cd`` 报「too many arguments」。``--body-file``
     恒打印**绝对路径**：merge_guard 的 ``read_body_file`` 拒相对路径（进程 cwd 与
     ``--repo`` 两套 cwd 会解析成两个不同文件）。
+
+    quote 之外还有三条「一行 / 一个 token」的约束（见 :func:`_subject_argument`、
+    :func:`_check_single_line_for_command`、:func:`_check_repo_for_command`）：
+    标题以 ``-`` 开头改打 ``--subject=<值>``，``--repo`` / ``--body-out`` 含换行与
+    ``--repo`` 含冒号在 ``_run_merge_record`` 就拒（rc2），走到这里时都已是可打印值。
     """
 
     body = merges.build_message(card=card, by=by, pr=pr, subject=subject)
@@ -747,7 +761,7 @@ def _record_generate(
         f"cd {repo_q} && PYTHONPATH={shlex.quote(repo_path + '/src')}"
         " python3 -m team_board.merge_guard"
         f" --pr {pr} --branch {shlex.quote(branch)} --method merge --delete-branch"
-        f" --card {card} --by {by} --subject {shlex.quote(title)}"
+        f" --card {card} --by {by} {_subject_argument(title)}"
         f" --body-file {shlex.quote(body_path)} --repo {repo_q}"
     )
     lines = [
@@ -795,6 +809,69 @@ def _check_subject_for_command(subject: str) -> None:
         merge_guard.check_subject(subject)
     except merge_guard.MergeGuardError as exc:
         raise merges.MergeAuditError(str(exc)) from exc
+
+
+#: 打印行里「一行」这条硬约束的字符集：与 ``merge_guard.check_subject`` 拒的是同一组
+#: （``\\n`` / ``\\r``）。这里不 import 它来判 ``--repo`` / ``--body-out``：那个函数还
+#: 顺带拒空串与纯空白，而这两处「空值」各有自己的文案（``--body-out`` 的路径为空 /
+#: ``--repo`` 的路径为空），套上去会把参数名说错。判据本身由
+#: ``tests/integration/test_cli_merge_record.py`` 的对照用例锁住（同一批取值两边必须
+#: 同判），改一边不改另一边会红。
+_NEWLINE_CHARS = ("\n", "\r")
+
+
+def _check_single_line_for_command(value: str, flag: str) -> None:
+    """``--repo`` / ``--body-out`` 的值必须**单行**：含 ``\\n`` / ``\\r`` → rc2。
+
+    这一行的末尾是 ``--repo …``，值里带换行时打印出来的命令被截成两行：前半行引号
+    未闭合（``shlex.split`` 直接 ``No closing quotation``）、后半行是裸露的路径碎片。
+    照抄前半行 = 半条命令；照抄整段 = shell 当两条命令，退出码被后一条覆盖。
+    ``shlex.quote`` 保得住参数字面，保不住「一行」—— 与 ``--subject`` 的换行是同一类。
+    """
+
+    for index, char in enumerate(value):
+        if char in _NEWLINE_CHARS:
+            raise merges.MergeAuditError(
+                f"{flag} {value!r} 不能含换行字符（第 {index + 1} 个字符是 {char!r}）："
+                "打印出来的合并命令会被截成两行，照抄即半条命令（引号未闭合）"
+            )
+
+
+def _check_repo_for_command(repo: str) -> None:
+    """``--repo`` 不能含 ``:``：``PYTHONPATH=…`` 是冒号分隔的，单条路径里的冒号拆不开。
+
+    打印行的前半段是 ``cd <repo> && PYTHONPATH=<repo>/src python3 -m …``。
+    ``PYTHONPATH`` 用冒号分隔多条路径，且**没有**转义机制 —— ``/tmp/a:b`` 会被 Python
+    拆成 ``/tmp/a`` 与 ``b/src`` 两条，首条里没有 ``team_board``，照抄即 ``rc=1``
+    「No module named team_board」。rc1 是「认账未达成」专用码，会被读成合并失败，
+    所以宁可生成阶段拒（rc2，参数错误），不打印一条注定跑不通的命令。
+    判据是打印形态决定的，与路径本身合不合法无关：``merge_guard --repo`` 自己吃 ``:``
+    没问题，坏的是这一行里的 ``PYTHONPATH=``。调用方传进来的是 ``os.path.realpath``
+    之后的值（打印行里写的就是它），所以「cwd 自带冒号、``--repo .``」这条路也拦得住。
+    """
+
+    if ":" in repo:
+        raise merges.MergeAuditError(
+            f"--repo {repo!r} 不能含冒号：打印行里的 PYTHONPATH=<repo>/src 是冒号分隔的，"
+            "含冒号会被拆成两条路径 → 照抄即 rc1「No module named team_board」"
+            "（rc1 会被读成合并失败）。请换一个不含冒号的仓库路径"
+        )
+
+
+def _subject_argument(subject: str) -> str:
+    """把标题拼成打印行里的一个参数：以 ``-`` 开头时用 ``--subject=<quoted>`` 形式。
+
+    ``shlex.quote('-h')`` 原样返回 ``-h``，于是 ``--subject -h`` 里的 ``-h`` 会被
+    argparse 当成选项 → 照抄即 ``错误: argument --subject: expected one argument``（rc2）。
+    argparse 认 ``--opt=value`` 形式，且 ``=`` 右边的值**不参与选项解析**，换行不受影响
+    （换行已在 :func:`_check_subject_for_command` 拒掉）。其余取值保持
+    ``--subject <quoted>``：现有断言与文档样例都是这个形态，不为一个边缘取值换形态。
+    """
+
+    quoted = shlex.quote(subject)
+    if subject.startswith("-"):
+        return f"--subject={quoted}"
+    return f"--subject {quoted}"
 
 
 def _run_merge_record(args: argparse.Namespace) -> int:
@@ -848,6 +925,12 @@ def _run_merge_record(args: argparse.Namespace) -> int:
                 "生成合并命令必须给 --body-out（命令里的 --body-file 必须指向一个"
                 "真实存在的文件，否则照抄即 rc2「--body-file 文件不存在」）"
             )
+        _check_single_line_for_command(os.path.realpath(args.body_out), "--body-out")
+        # 打印行里出现的是 realpath 结果（不是用户原样给的相对路径），所以判据也落在
+        # 解析后的值上：cwd 本身带冒号 / 换行时，`--repo .` 拼出来的 PYTHONPATH 一样会坏。
+        repo_abs = os.path.realpath(args.repo)
+        _check_single_line_for_command(repo_abs, "--repo")
+        _check_repo_for_command(repo_abs)
         return _record_generate(
             card=card,
             by=by,

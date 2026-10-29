@@ -7,9 +7,12 @@
 内容与 stdout 的 body 段逐字节一致（末尾恰好一个换行）、``--subject`` 覆盖标题且经
 ``shlex.quote`` 后能逐字还原、``--body-out`` 相对路径打印成绝对路径、``--branch`` /
 ``--body-out`` 缺任一项 rc2、``--branch`` 形态非法（空串 / 含空白 / ``refs/`` 前缀）
-rc2、``--subject`` 含换行 rc2、打印行的 **shell 安全性**（``--branch`` 含 ``;`` / ``$``
-时经 ``bash -c`` 仍恰好一条命令；``--repo`` 含空格时 ``cd`` / ``PYTHONPATH`` / ``--repo``
-三处都加引号）、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 / 字段与参数不一致 rc1、rc2 一组
+rc2、``--subject`` 含换行 rc2、``--body-out`` / ``--repo`` 含换行 rc2、``--repo`` 含
+冒号 rc2（``PYTHONPATH`` 被拆条）、``--subject`` 以 ``-`` 开头时打印行改用
+``--subject=<值>`` 且照抄不撞 argparse、打印行的 **shell 安全性**（``--branch`` 含
+``;`` / ``$`` 时经 ``bash -c`` 仍恰好一条命令；``--repo`` 含空格时 ``cd`` /
+``PYTHONPATH`` / ``--repo`` 三处都加引号）、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 /
+字段与参数不一致 rc1、rc2 一组
 （``--pr`` 取值域含 0 / 负 / 空串 / 13 位毫秒 / 天文数字 / 超上限 / ``+1`` / ``1_0``，
 ``--by`` 与 ``--card`` 形态，生成模式缺参数，``--check-file`` 不存在 / 是目录 /
 空文件 / 非 UTF-8 / 与 ``--body-out`` 同给，``--body-out`` 父目录不存在）、stdout
@@ -30,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from team_board import cli
+from team_board import cli, merges
 from team_board import merge_guard as mg
 
 CARD = "t_ad5e7ff6"
@@ -455,6 +458,183 @@ def test_rc2_subject_with_newline(
     assert "换行" in err or "不能为空" in err
     assert err.count("\n") == 1, repr(err)
     assert not target.exists()
+
+
+#: 以 ``-`` 开头的标题：``--subject -h`` 会被 argparse 当成 flag（单个短选项 / 带空格的
+#: 长选项 / 只有一个减号三种形态）
+DASH_SUBJECTS = ("-h", "--fix 版本", "-")
+
+
+@pytest.mark.parametrize("subject", DASH_SUBJECTS)
+def test_subject_starting_with_dash_prints_equals_form(
+    subject: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--subject`` 以 ``-`` 开头 → 打印行用 ``--subject=<值>``，照抄不撞 argparse。
+
+    修复前 ``shlex.quote('-h')`` 原样返回 ``-h``，打印行是 ``--subject -h``，argparse
+    把 ``-h`` 当 flag → ``错误: argument --subject: expected one argument``（rc2），
+    合并命令永远跑不起来。``--opt=value`` 的值不参与选项解析，所以换成 ``=`` 形式。
+    """
+
+    rc, out, err, body_path = generate(tmp_path, capsys, f"--subject={subject}")
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    line = printed_command(out)
+    assert f"--subject={shlex.quote(subject)}" in line, line
+    assert " --subject " not in line, line  # 不再出现「空格分隔」形态
+    assert body_path.read_text(encoding="utf-8").splitlines()[0] == subject
+
+    argv = printed_argv(out)
+    assert "--subject" not in argv, argv
+    assert f"--subject={subject}" in argv, argv
+    assert argv[argv.index("--body-file") + 1] == os.path.realpath(str(body_path))
+    assert argv[argv.index("--repo") + 1] == os.path.realpath(str(tmp_path))
+
+    # 真交给 bash：`--subject=-h` 必须是**一个** token（等于号把值与选项钉在一起）
+    rc_bash, got, stdout, stderr = run_line_in_bash(line, shim_python3(tmp_path))
+    assert rc_bash == 0, (stdout, stderr)
+    assert got == ["-m", "team_board.merge_guard", *argv], (stdout, stderr)
+
+    # 再喂 merge_guard 自己的 argparse：走到「源分支不在远端」闸门，而不是参数错误
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv_: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        calls.append(argv_)
+        return mg.CommandResult(argv=argv_, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(mg, "_run", fake_run)
+    rc_mg = mg.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc_mg == 2, (captured.out, captured.err)
+    assert "expected one argument" not in captured.err
+    assert "不在 origin 远端" in captured.err
+    assert len(calls) == 1 and calls[0][0] == "git", calls
+
+
+#: ``PYTHONPATH`` 是冒号分隔的（没有任何转义机制）：单条路径里的冒号一定会被拆开
+COLON_REPO = "/tmp/t880-a:b"
+
+
+def test_rc2_body_out_with_newline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--body-out`` 含换行 → rc2、stdout 0 字节、stderr 恰一行，且不写 body 文件。
+
+    修复前只 quote 不拒：打印行从 10 行变 12 行，``--body-file '…/a`` 这一行引号未闭合，
+    ``shlex.split`` 直接 ``No closing quotation``，照抄即半条命令。
+    """
+
+    target = tmp_path / "a\nb.txt"
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", str(tmp_path),
+            "--body-out", str(target),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "--body-out" in err
+    assert "换行" in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
+
+
+def test_rc2_repo_with_newline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--repo`` 含换行 → rc2（修复前 stdout 从 10 行变 13 行，命令被截断）。"""
+
+    repo = tmp_path / "r\nx"
+    repo.mkdir()
+    target = tmp_path / "body.txt"
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", str(repo),
+            "--body-out", str(target),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "--repo" in err
+    assert "换行" in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
+
+
+def test_rc2_repo_with_colon(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--repo`` 含冒号 → rc2（修复前打印 ``PYTHONPATH=/tmp/a:b/src``，照抄即 rc1）。"""
+
+    target = tmp_path / "body.txt"
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", COLON_REPO,
+            "--body-out", str(target),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "--repo" in err
+    assert "冒号" in err
+    assert "PYTHONPATH" in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "value", ["plain", "a b", "-h", "a\nb", "a\rb", "a\r\nb", "wt/t_x;echo$IFS"]
+)
+def test_single_line_rule_matches_merge_guard_subject_rule(value: str) -> None:
+    """``_check_single_line_for_command`` 与 ``merge_guard.check_subject`` 在换行上同判。
+
+    两处判据刻意不互相 import（``check_subject`` 还顺带拒空串 / 纯空白，套到 ``--repo``
+    上会把参数名说错），所以用这条对照用例把「同一批取值两边同判」钉住：改一边不改
+    另一边，这里就红。
+    """
+
+    line_ok = True
+    try:
+        cli._check_single_line_for_command(value, "--repo")
+    except merges.MergeAuditError:
+        line_ok = False
+
+    subject_ok = True
+    try:
+        mg.check_subject(value)
+    except mg.MergeGuardError:
+        subject_ok = False
+
+    assert line_ok == subject_ok, (value, line_ok, subject_ok)
 
 
 def test_without_body_out_is_rc2(capsys: pytest.CaptureFixture[str]) -> None:
