@@ -242,6 +242,81 @@ bash scripts/demo-branch-audit.sh
 本机没有这个 checkout（容器 / CI）时用 `TB_REAL_REPO=<别的 checkout>` 指定断言对象，
 都没有就**明确打 skip 提示**而不是假装断言通过。
 
+## 独立 worktree 与 push 前的拦截（push-guard）
+
+卡分支**一律在独立 worktree 里开**，主 checkout 只停 `main`：
+
+```
+git -C /home/liu/project/team-board worktree add /home/liu/tb-wt/<卡号> -b wt/<卡号> origin/main
+```
+
+这是规则 B（checkout 偏移）的**事前**版本：规则 B 由 `branch-audit` 事后稽核
+（CI job `branch-audit (卡分支/checkout)`），`git push` 之前的拦截由
+`.githooks/pre-push` 调 `team-board push-guard` 完成 —— **一个事前拦、一个事后
+稽核，口径同一份**（判定表与文案模板见 `docs/push-guard.md`）。
+
+四条判定（顺序固定 P-1 → P-2 → P-3 → P-4，不短路，全命中全报）：
+
+- **P-1** 主 checkout 必须停在 `main`（停在任何别的分支、或 detached，都拦）；
+- **P-2** 主 checkout 不许推送卡分支 `wt/t_xxxxxxxx`（要推就先 `worktree add`）；
+- **P-3** 非主 checkout 侧一致性：HEAD 是卡分支而目录名 ≠ 卡号 / HEAD detached /
+  推了别的卡分支 —— 三条都拦；
+- **P-4** 原有 `main` / `master` 保护不丢（含「删远端分支」那种全零 sha）。
+
+放行时 stdout 恰一行 `push-guard: 放行 N 条 ref（checkout=…，HEAD=…）`；拦下时
+stdout 空、stderr 每处一行以 `拒绝：` 开头、`git push` rc=1。退出码：push-guard
+本体 `0` 放行 / `1` 拦下 / `2` 参数或环境错误；钩子层 `1` 覆盖三种情况（判红、
+push-guard 环境错误、以及 fail-closed），**环境错误与 fail-closed 都不静默放行**。
+
+唯一的「rc2 但放行」是**空 stdin**：`git push` 在「已是最新」时仍会调钩子但一行
+ref 都不喂（push-guard 判 rc2 `没有收到任何要推送的 ref`）—— 没有 ref 要传就没有
+可拦的东西，钩子按这条固定文案放行且不打印（用例 h 钉住）。
+
+装一次（`core.hooksPath` 不进版本库；worktree 共享同一份 `.git/config`）：
+
+```
+git config core.hooksPath .githooks
+team-board push-guard --repo . --check-install     # rc0 = 指对了 + 文件在 + 可执行
+grep -q 'team_board.cli push-guard' .githooks/pre-push   # 内容断言：确实在调判定本体
+```
+
+`--check-install` 的 rc0 **只看配置与文件存在性，不看钩子内容**（旧钩子还在纯
+shell 拦 main/master 时它也 rc0，是已知假绿）—— 所以「P-1…P-4 真生效」要另配上面
+那条 `grep` 断言，或直接跑一次真 push 红样例。
+
+**剩余风险（5 条）**：
+
+1. `git push --no-verify` 绕过所有客户端钩子 → 本钩子不保证 100% 拦截；权威判定
+   仍是 CI job `branch-audit (卡分支/checkout)`。
+2. 新 clone / 容器里没配 `core.hooksPath` → 钩子根本不跑（`--check-install` 查得出，
+   但不强制生效）。
+3. 不经本机 `git` 的推送（GitHub 网页编辑、别台机器、`gh api` 手搓提交、Git Data
+   API）→ 覆盖不到。
+4. 直推 `main` 没有平台级强制点（`gh api repos/alsj213/team-board/branches/main/protection`
+   → 403）→ 仍靠钩子 + CI 事后稽核。
+5. 本卡不动 `.github/`（避免升 R7 C 档）→ **不新增 CI job**，CI 侧口径只有现成的
+   `branch-audit`。
+
+实测（2026-10-30，远端一律用 `mktemp` 下的一次性裸仓，**不碰 origin**）：
+
+```
+# 红：主 checkout 停在非 main 分支 + 推现存卡分支
+$ git -C /home/liu/project/team-board -c core.hooksPath=<本卡 worktree>/.githooks push <裸仓> wt/t_06c7b458
+拒绝：主 checkout /home/liu/project/team-board 停在 tmp/pg-red，必须停 main
+拒绝：主 checkout 不许推送卡分支 wt/t_06c7b458；做法：git -C /home/liu/project/team-board worktree add /home/liu/tb-wt/t_06c7b458 -b wt/t_06c7b458 origin/main
+rc=1     # 裸仓 for-each-ref 为空：拦在传输之前
+
+# 绿：独立 worktree（目录名 = 卡号、HEAD = 卡分支）推同一分支
+$ git push <裸仓> wt/t_27bc948e
+push-guard: 放行 1 条 ref（checkout=/home/liu/tb-wt/t_27bc948e，HEAD=wt/t_27bc948e）
+rc=0     # 裸仓出现 refs/heads/wt/t_27bc948e
+
+# 回归：规则 B 的事后稽核没被改坏（同一时刻新旧代码跑真仓）
+$ PYTHONPATH=<origin/main 的 src> python -m team_board.cli branch-audit --repo /home/liu/project/team-board   → rc=1
+$ PYTHONPATH=<本卡 src>            python -m team_board.cli branch-audit --repo /home/liu/project/team-board   → rc=1
+$ diff <(旧) <(新)     # stdout / stderr 均无差异
+```
+
 ## 合并认账稽核（merge-audit）
 
 事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`merged-by`）+

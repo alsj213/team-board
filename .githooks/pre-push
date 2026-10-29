@@ -1,29 +1,57 @@
 #!/bin/sh
-# pre-push：禁止直接 push 到 main / master，其余分支放行。
-# 起因：私有仓免费计划下无法开分支保护（API 403），护栏只能放在客户端。
-# 绕过方式：git push --no-verify（应仅限紧急回滚，且事后补 PR）。
+# pre-push：唯一判定源 = src/team_board/pushguard.py（`team-board push-guard`）。
+#
+# 本文件只是**薄壳**：拿工作树根 → 把 git 喂进来的 ref 行原样透传给 push-guard →
+# 照它的退出码放行 / 拦截。**不在 shell 里重写判定**：主分支保护（P-4）、主 checkout
+# 必须停 main（P-1）、主 checkout 不许推卡分支（P-2）、worktree 与卡分支一致（P-3）
+# 四条全在 pushguard.py 里，改规则只改那一个文件。
+#
+# 起因：私有仓免费计划下开不了分支保护（`gh api repos/<owner>/<repo>/branches/main/protection`
+# → 403 Upgrade to GitHub Pro），护栏只能放在客户端。判定权仍在 CI 的
+# `branch-audit（卡分支/checkout）`：本钩子只是把同一口径提前到「推之前当场拦住」。
+# 本钩子与传输通道无关：https 与 ssh 走的是同一个 pre-push。
+# 绕过方式：`git push --no-verify`（已知剩余风险，见 .githooks/README.md 与 docs/push-guard.md）。
+set -u
 
-blocked=0
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
+if [ -z "$root" ]; then
+    printf '[pre-push] 拒绝：拿不到工作树根（fail-closed）\n' >&2
+    exit 1
+fi
 
-while read -r local_ref local_sha remote_ref remote_sha; do
-    case "$remote_ref" in
-        refs/heads/main | refs/heads/master)
-            blocked=1
-            printf '\n[pre-push] 拒绝：不允许直接 push 到 %s\n' "${remote_ref#refs/heads/}" >&2
-            if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
-                printf '[pre-push] 这是删除远端分支的操作，同样禁止。\n\n' >&2
-            else
-                printf '[pre-push] 正确做法：走分支 + PR\n' >&2
-                printf '  git switch -c wt/<主题>\n' >&2
-                printf '  git push -u origin wt/<主题>\n' >&2
-                printf '  gh pr create --base main --head wt/<主题>\n\n' >&2
-            fi
-            ;;
-    esac
-done
+# stderr 先落临时文件：只需在「push-guard 自己跑不起来」时改写成一句人话，
+# 其它情形原样回放（stdout 不接管，判定由 push-guard 自己写）。
+errfile="${TMPDIR:-/tmp}/pre-push-$$.err"
+if ! : >"$errfile" 2>/dev/null; then
+    errfile=/dev/null
+fi
 
-if [ "$blocked" -ne 0 ]; then
-    printf '[pre-push] 本次 push 已中止（远端未被修改）。\n' >&2
+# stdin 原样透传：不 cat、不重定向、不 exec，push-guard 直接读 git 喂的那几行。
+PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m team_board.cli push-guard --repo "$root" 2>"$errfile"
+rc=$?
+
+if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ] || grep -q 'No module named' "$errfile" 2>/dev/null; then
+    [ "$errfile" = /dev/null ] || rm -f "$errfile"
+    printf '[pre-push] 拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）\n' >&2
+    exit 1
+fi
+
+# 空 stdin = 没有要更新的 ref（`git push` 在「已是最新」时仍会调用钩子，但一行都不喂）。
+# 此时没有任何 ref 会被传输，也就没有可拦的东西 —— 放行。判据用 push-guard 自己的
+# 那句固定文案（rc2 + `没有收到任何要推送的 ref`），不在 shell 里另算一遍「有没有 ref」；
+# 文案若被改，tests/integration/test_pre_push_hook.py 的用例 h 会当场红。
+if [ "$rc" -eq 2 ] && grep -q '没有收到任何要推送的 ref' "$errfile" 2>/dev/null; then
+    [ "$errfile" = /dev/null ] || rm -f "$errfile"
+    exit 0
+fi
+
+cat "$errfile" >&2
+[ "$errfile" = /dev/null ] || rm -f "$errfile"
+
+if [ "$rc" -ne 0 ]; then
+    printf '[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/tb-wt/<卡号> -b wt/<卡号> origin/main\n' >&2
+    printf '[pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红\n' >&2
     exit 1
 fi
 
