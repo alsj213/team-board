@@ -45,17 +45,23 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
    **只回显不判定** —— 历史提交无法回填 trailer，拿 trailer 路径去判它们会让
    整段假红。历史段里 ``legacy_record`` 认不出的（``Merge branch ...``）也保留，
    记成 ``card=None`` 的记录，不许静默丢条目。
-9. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
-   merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
-   小写十六进制 → ``MergeAuditError``（**不静默当成「没有基线」**）。
-10. **判据①**：``merged-by`` 的 profile 部分（``/`` 之前）必须**严格等于**该卡
-   ``tasks.assignee``。只在 ``audit(only_card=…)``（即 CLI 给了 ``--card``）时生效，
-   且只判 ``source="trailer"`` 的记录 —— 历史段（``source="legacy"``）没有
-   ``merged-by`` 值，照样只回显「by=无法判定」，不参与判据①。``assignee`` 由
-   :func:`card_assignee` 只读打开看板库取；库不存在 / 不是合法 SQLite / 没有
-   ``tasks`` 表 / 卡不存在 / 卡没有 assignee 一律 ``MergeAuditError``（rc2，
-   **不静默跳过判据**）。``merged-by`` 值本身缺失或格式非法时，``缺字段`` /
-   ``格式非法`` 已经报过，判据① 不再重复报第二条，输出行写「不适用」。
+9. **判定对象 = first-parent 链上的合并提交**（两段取数都带 ``--first-parent``）。
+   真正的认账事件只有一种：**把卡分支合进 main** 的那个合并提交 —— 它在 main 的
+   first-parent 链上。分支侧 ``git merge origin/main`` 产生的同步合并（把 main
+   并回卡分支）落在 second-parent 链上，它**既不合任何 PR，也本来就不该有**
+   ``merge-card`` / ``merge-pr``：**既不判、也不计入** records / problems / 历史段。
+   不加 ``--all-merges`` 之类的反向开关 —— 判定对象是口径，不是可选项。
+10. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
+    merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
+    小写十六进制 → ``MergeAuditError``（**不静默当成「没有基线」**）。
+11. **判据①**：``merged-by`` 的 profile 部分（``/`` 之前）必须**严格等于**该卡
+    ``tasks.assignee``。只在 ``audit(only_card=…)``（即 CLI 给了 ``--card``）时生效，
+    且只判 ``source="trailer"`` 的记录 —— 历史段（``source="legacy"``）没有
+    ``merged-by`` 值，照样只回显「by=无法判定」，不参与判据①。``assignee`` 由
+    :func:`card_assignee` 只读打开看板库取；库不存在 / 不是合法 SQLite / 没有
+    ``tasks`` 表 / 卡不存在 / 卡没有 assignee 一律 ``MergeAuditError``（rc2，
+    **不静默跳过判据**）。``merged-by`` 值本身缺失或格式非法时，``缺字段`` /
+    ``格式非法`` 已经报过，判据① 不再重复报第二条，输出行写「不适用」。
 """
 
 from __future__ import annotations
@@ -688,8 +694,10 @@ def audit(
 ) -> MergeReport:
     """稽核 ``<baseline>..<rev>`` 区间内合并提交的认账三字段。
 
-    判定段（区间内）走 :func:`record_from_commit`，逐条出 ``Problem``；
-    历史段（``<baseline>`` 及更早）只走 :func:`legacy_record` 回显，**不判定**。
+    判定段（区间内、**first-parent 链上**）走 :func:`record_from_commit`，逐条出 ``Problem``；
+    历史段（``<baseline>`` 及更早，同样只取 first-parent 链）只走
+    :func:`legacy_record` 回显，**不判定**。second-parent 侧的同步合并（把 main
+    并回卡分支）两段都不进。
 
     参数/环境级错误一律抛 :class:`MergeAuditError`（CLI 转 rc2），检查顺序：
     仓库 → ``baseline``/``baseline_file`` 互斥 → ``only_card`` 形态 →
@@ -737,10 +745,15 @@ def audit(
 
     judged: list[MergeRecord] = []
     problems: list[Problem] = []
+    # --first-parent：只判「把分支合进 main」的合并提交。分支侧 ``git merge
+    # origin/main`` 产生的同步合并落在 second-parent 链上，它没有合任何 PR、
+    # 本来就不该有 merge-card/merge-pr，判它必假红（t_d22c6399）。同一条参数
+    # 也用在下面的历史段，否则历史段仍在数同步合并。
     judged_text = _git_ok(
         root,
         "log",
         "--merges",
+        "--first-parent",
         f"--format={_JUDGE_FORMAT}",
         f"{baseline_sha}..{rev_sha}",
         what="无法读取区间内的合并提交",
@@ -759,6 +772,7 @@ def audit(
         root,
         "log",
         "--merges",
+        "--first-parent",
         f"--format={_HISTORY_FORMAT}",
         baseline_sha,
         what="无法读取基线之前的合并提交",
