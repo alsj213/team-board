@@ -52,6 +52,13 @@
   表示不了中文 → stderr 一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--repo``
   不存在或不是工作树、``--main-branch`` 为空或该分支不存在、stdin 每行字段数 ≠ 4、
   stdin 为空）
+``pr-review-head-audit`` 子命令（只读，判「双问结论是否绑定某条 head sha」）：
+- 0：该 head 上 ``defect`` 与 ``regression`` 各 ≥1 条标记载荷
+- 1：缺一类 / 两类都缺 / 只有别的 sha 的标记（head 变了没重跑双问）
+- 2：参数或环境错误（``reviewhead.ReviewHeadError`` → stderr 恰一行 ``错误: …``、
+  stdout 空、不冒 traceback；含 ``--head`` 不是 40/64 位小写十六进制、``--pr`` 不是
+  1-``MAX_MERGE_PR`` 的 ASCII 十进制正整数、``gh api`` 非 0 / 超时 / PATH 里没有
+  ``gh`` / 输出不是 UTF-8 或不是对象数组）
 
 ``pr-claim-audit`` 子命令（只读，看「PR 认领唯一性」，R17 的机器闸门）：
 - 0：未结卡里**恰好一张**卡在正文顶格写了 ``PR-CLAIM: #<该 PR>``
@@ -105,6 +112,7 @@ from . import (
     merges,
     prclaim,
     pushguard,
+    reviewhead,
     web,
 )
 from .model import DEFAULT_DB
@@ -184,7 +192,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十二个**子命令。
+    """建 CLI 前端：prog=team-board，共**十三个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -209,6 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
       ``--check-install`` 时从 stdin 读 pre-push 的 ref 行；
     - ``pr-claim-audit``：稽核 PR 认领唯一性（0 恰好一张卡认领 / 1 无人认领或重复
       认领 / 2 参数或环境错误），吃 ``--pr``（必填）/ ``--db``；
+    - ``pr-review-head-audit``：判双问结论是否绑定该 head sha（0 绑定成立 / 1 缺证据 /
+      2 参数或环境错误），只吃 ``--pr`` / ``--head``，**只读**（只发 ``gh api``）；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -490,6 +500,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB,
         metavar="PATH",
         help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+
+    head_cmd = subparsers.add_parser(
+        "pr-review-head-audit",
+        help=(
+            "判定双问结论是否绑定该 head sha（0 绑定成立 / 1 缺证据或 head 变过 / "
+            "2 参数或环境错误）"
+        ),
+    )
+    head_cmd.add_argument(
+        "--pr",
+        required=True,
+        default=None,
+        metavar="N",
+        help=f"PR 号（1-{MAX_MERGE_PR} 的 ASCII 十进制正整数）",
+    )
+    head_cmd.add_argument(
+        "--head",
+        required=True,
+        default=None,
+        metavar="SHA",
+        help="要绑定的 head sha（40 或 64 位小写十六进制；41-63 位一律 rc2）",
     )
 
     serve = subparsers.add_parser(
@@ -1190,6 +1222,27 @@ def _run_push_guard(args: argparse.Namespace) -> int:
     if not _write_stdout(verdicts[0].message + "\n"):
         return 2
     return 0
+def _run_pr_review_head_audit(args: argparse.Namespace) -> int:
+    """``pr-review-head-audit`` 子命令：``ReviewHeadError`` → stderr 一行 ``错误: …`` + rc2。
+
+    取数（两次 ``gh api --paginate``）与判定都在拼报告之前完成，所以 rc2 时 stdout
+    **一个字节都不写**（stderr 恰一行、不冒 traceback）；rc1 只在取数成功、证据不齐
+    时出现。本子命令**只读**：两条 ``gh api GET`` + 一次 ``--head``/``--pr`` 形态校验，
+    不发任何写请求。
+    """
+
+    try:
+        head = reviewhead.check_head(args.head)
+        pr = reviewhead.check_pr(args.pr)
+        bodies = reviewhead.fetch_bodies(pr)
+    except reviewhead.ReviewHeadError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    report = reviewhead.analyze(head, bodies)
+    if not _write_stdout(reviewhead.render(report) + "\n"):
+        return 2
+    return 0 if report.ok else 1
 
 
 def _run_pr_claim_audit(args: argparse.Namespace) -> int:
@@ -1238,6 +1291,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "push-guard":
         return _run_push_guard(args)
+    if args.command == "pr-review-head-audit":
+        return _run_pr_review_head_audit(args)
 
     if args.command == "pr-claim-audit":
         return _run_pr_claim_audit(args)
