@@ -270,15 +270,22 @@ trailer 区），任一条有问题即 rc1。
 python3 -m team_board.merge_guard \
   --pr <正整数> --branch <PR 的 head 分支名> \
   --method {merge,squash,rebase} --delete-branch \
-  [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] [--verify-only]
+  [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] \
+  [--command-timeout SEC=60] [--verify-only]
 ```
 
 - `--pr` / `--branch` / `--method` / `--delete-branch` 四项**必填**。`--method` 不给默认值
   （合并方式由合并卡决定）；`--delete-branch` 缺了就直接 rc2，且**一个 gh 写操作都不发**，
   stderr 固定一行
   `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
-- `--pr` 取值 1–999999999（13 位毫秒这种误用一律 rc2）；`--timeout` / `--interval`
-  必须是 ≥1 的 ASCII 十进制整数（`0`、负数、`1_000`、空串、空串之外的空白都 rc2）。
+- `--pr` 取值 1–999999999（13 位毫秒这种误用一律 rc2）；`--timeout` / `--interval` /
+  `--command-timeout` 必须是 ≥1 的 ASCII 十进制整数（`0`、负数、`1_000`、空串、空串之外的
+  空白都 rc2），且**各有 3600 秒的上界**（`MAX_TIMEOUT` / `MAX_INTERVAL` /
+  `MAX_COMMAND_TIMEOUT` 三个模块常量），另有硬约束 `--interval ≤ --timeout`。
+  上界不是装饰：没有它时 `clock() + timeout` 会裸抛
+  `OverflowError: int too large to convert to float`，而那时**合并已经发生了**。
+- `--command-timeout`（默认 60）是**单次子命令**的硬超时：预检的 `gh pr view` 超时 → rc2；
+  轮询里的 `git ls-remote` 超时 → 记一次通信错误继续轮询（绝不当成「分支还在」或「已删」）。
 - `--repo` 默认 `.`，gh 与 git 都以它为工作目录（gh 由 git remote 自己认仓库）；
   `--remote` 默认 `origin`。
 - `--branch` 等于该 PR 的 `baseRefName`，或等于 `main` / `master` → rc2（防删主分支）。
@@ -299,10 +306,16 @@ python3 -m team_board.merge_guard \
 - `0` —— 合并完成且已确认删除（`--verify-only` 时为「分支已删除」）。
 - `1` —— 未达成：合并失败、或合并成功但分支仍在、或无法判定。
 - `2` —— 参数或环境错误，含缺 `--delete-branch`。也包含：`--pr` / `--timeout` /
-  `--interval` 越界、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、PR 不是
-  `OPEN`、`PATH` 里没有 `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示不了中文，
-  以及**合并已发生但通信持续失败导致判不了**（这一种不算 1：判不了就是未通过，
-  rc2 一律 stderr 一行 `错误: …`、stdout 空、不冒 traceback）。
+  `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
+  `--branch` 是主分支或与 PR 的 `headRefName` 不一致、PR 不是 `OPEN`、`PATH` 里没有
+  `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示不了中文，以及**合并已发生但
+  通信持续失败导致判不了**（这一种不算 1：判不了就是未通过，`rc2` 一律 stderr 一行
+  `错误: …`、不冒 traceback，**退出码绝不为 1**）。
+
+stdout 只有一处例外：**合并已经发生之后**才出错时（合并后的探针超时、`git` 不可用、
+意外异常、判不了），stdout 仍打印已完成的「预检」「合并」两步 —— 后面的崩溃不许把
+「合并成功了」这条证据一起吞掉，否则下一轮会读成「没合并、可以重跑」。此时 stderr
+仍是一行 `错误: …`、退出码仍是 2。
 
 输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
 `预检` / `合并` / `分支删除`，末行固定 `结论：` 前缀。下面这段是假 gh / 假 git 跑出来的

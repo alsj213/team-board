@@ -23,12 +23,17 @@
 - ``1``：未达成 —— gh 合并失败 / 合并成功但源分支仍在远端 / ``--verify-only``
   时分支仍在远端或无法判定。
 - ``2``：参数或环境错误：缺 ``--delete-branch``、``--pr`` / ``--timeout`` /
-  ``--interval`` 不是 ≥1 的 ASCII 十进制整数（``--pr`` 上限 999999999）、
-  ``--branch`` 是 ``main`` / ``master`` 或等于该 PR 的 ``baseRefName``、
-  ``--branch`` 与 PR 的 ``headRefName`` 不一致、PR 不是 ``OPEN``、``PATH`` 里
-  没有 ``gh`` / ``git``、gh/git 输出不是 UTF-8、stdout 编码表示不了中文、
-  合并后通信持续失败导致无法判定。rc2 一律 stderr 一行 ``错误: …``、stdout 空、
-  不冒 traceback（崩溃绝不落到 rc1 —— rc1 是「未达成」专用码）。
+  ``--interval`` / ``--command-timeout`` 取值越界（``--pr`` 上限 ``MAX_PR``；
+  ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
+  ``--interval`` 不得大于 ``--timeout``）、``--branch`` 是 ``main`` / ``master``
+  或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
+  PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、gh/git 输出不是 UTF-8、
+  stdout 编码表示不了中文、子命令超时、合并后通信持续失败导致无法判定。
+
+rc2 一律 stderr 一行 ``错误: …``、不冒 traceback，且**退出码绝不为 1**（rc1 是
+「未达成」专用码：任何异常都不许落到它上面）。stdout 只有一种反例：**合并已经发生
+之后**才出错时，stdout 仍保留已完成的「预检」「合并」两步证据 —— 后面的崩溃不能把
+「合并成功了」这条证据一起丢掉，否则下一轮会把 rc2 读成「没合并、可以重跑」。
 """
 
 from __future__ import annotations
@@ -40,7 +45,8 @@ import re
 import subprocess  # nosec B404
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -52,6 +58,23 @@ MAIN_BRANCHES: frozenset[str] = frozenset({"main", "master"})
 
 #: ``--pr`` 的上限：PR 号是小正整数；13 位毫秒时间戳这类误用必须被拒
 MAX_PR = 999_999_999
+
+#: ``--timeout`` 的上限（秒）。没有上限时 ``clock() + timeout`` 会裸抛
+#: ``OverflowError: int too large to convert to float``（且发生在合并之后）
+MAX_TIMEOUT = 3600
+
+#: ``--interval`` 的上限（秒），同时受 ``--timeout`` 约束（``interval <= timeout``）
+MAX_INTERVAL = 3600
+
+#: ``--command-timeout`` 的上限（秒）：单次 gh / git 子命令的硬超时
+MAX_COMMAND_TIMEOUT = 3600
+
+#: ``--command-timeout`` 的默认值（秒）
+DEFAULT_COMMAND_TIMEOUT = 60
+
+#: 探针（``git ls-remote``）超时用的哨兵退出码：必须能被
+#: :func:`classify_probe_rc` 判成 :data:`PROBE_ERROR`（既不是 0 也不是 2）
+PROBE_TIMEOUT_RC = -1
 
 STEP_PREFLIGHT = "预检"
 STEP_MERGE = "合并"
@@ -78,6 +101,28 @@ _PR_VIEW_FIELDS = "number,state,headRefName,baseRefName"
 
 class MergeGuardError(Exception):
     """参数 / 环境级错误，CLI 转 rc2（stderr ``错误: …``，stdout 空）。"""
+
+
+class CommandTimeout(MergeGuardError):
+    """单次子命令在 ``--command-timeout`` 内没有返回。
+
+    预检里抛出 → rc2（合并还没发生，stdout 保持空）；轮询里被
+    :func:`make_probe` 吃掉并转成 :data:`PROBE_ERROR`（记一次通信错误继续轮询，
+    **不许**当成「分支还在」或「已删」）。
+    """
+
+
+class PartialFailure(MergeGuardError):
+    """合并已经发生之后才出错：必须把已完成的步骤证据一起带到 stdout（仍是 rc2）。
+
+    ``lines`` 是崩溃前已经攒下的输出行（至少含「预检 | PASS」「合并 | PASS」）；
+    ``main`` 先把它们写到 stdout，再把 ``错误: …`` 写到 stderr，退出码 2 ——
+    **绝不允许**落到 rc1，也不许只因后面的崩溃就让人读成「合并没发生、可以重跑」。
+    """
+
+    def __init__(self, message: str, lines: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.lines: list[str] = list(lines or [])
 
 
 @dataclass(frozen=True)
@@ -201,8 +246,13 @@ def format_step(step: str, *, ok: bool, command: str, rc: int, key: str) -> str:
 
 # --------------------------------------------------------------- 外部命令
 
-def _run(argv: tuple[str, ...], *, cwd: str) -> CommandResult:
+def _run(argv: tuple[str, ...], *, cwd: str, timeout: float) -> CommandResult:
     """跑外部命令，不抛 CalledProcessError，交给调用方判 rc。
+
+    ``timeout`` 是**单次子命令**的硬超时（``--command-timeout``）：一次卡住的
+    ``gh`` / ``git`` 不许把整个合并卡拖到 worker 超时。超时抛
+    :class:`CommandTimeout`（``MergeGuardError`` 子类，rc2）；轮询里的探针会把它
+    转成 :data:`PROBE_ERROR`，继续轮询。
 
     ``PATH`` 里没有可执行文件、输出不是 UTF-8、其它 ``OSError`` → ``MergeGuardError``
     （rc2），不许冒 traceback，也不许落到 rc1。
@@ -219,7 +269,12 @@ def _run(argv: tuple[str, ...], *, cwd: str) -> CommandResult:
             encoding="utf-8",
             errors="strict",
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise CommandTimeout(
+            f"{argv[0]} 命令超时：{timeout:g} 秒内没有返回（见 --command-timeout）"
+        ) from exc
     except FileNotFoundError as exc:
         raise MergeGuardError(
             f"找不到 {argv[0]} 可执行文件（PATH 里没有 {argv[0]}），无法合并/验证"
@@ -253,11 +308,28 @@ def ls_remote_argv(repo: str, remote: str, branch: str) -> tuple[str, ...]:
     )
 
 
-def make_probe(repo: str, remote: str, branch: str) -> Callable[[], CommandResult]:
-    """返回一个无参探针：每次调用跑一次 ``git ls-remote``。"""
+def make_probe(
+    repo: str, remote: str, branch: str, *, timeout: float
+) -> Callable[[], CommandResult]:
+    """返回一个无参探针：每次调用跑一次 ``git ls-remote``（``timeout`` 秒硬超时）。
+
+    探针超时**不等于**判定：转成退出码 :data:`PROBE_TIMEOUT_RC` 的
+    ``CommandResult``，由 :func:`classify_probe_rc` 判成 :data:`PROBE_ERROR`
+    —— 记一次通信错误继续轮询，绝不当成「分支还在」（rc0）或「已删」（rc2）。
+    其它环境错误（``git`` 不在 ``PATH``、输出不是 UTF-8）照旧 ``MergeGuardError``。
+    """
 
     def probe() -> CommandResult:
-        return _run(ls_remote_argv(repo, remote, branch), cwd=repo)
+        argv = ls_remote_argv(repo, remote, branch)
+        try:
+            return _run(argv, cwd=repo, timeout=timeout)
+        except CommandTimeout as exc:
+            return CommandResult(
+                argv=argv,
+                returncode=PROBE_TIMEOUT_RC,
+                stdout="",
+                stderr=f"{exc}\n",
+            )
 
     return probe
 
@@ -424,10 +496,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", default=".", metavar="PATH", help="仓库路径（默认 .）")
     parser.add_argument("--remote", default="origin", metavar="NAME", help="远端名（默认 origin）")
     parser.add_argument(
-        "--timeout", default="60", metavar="SEC", help="删除验证的最长等待秒数（默认 60）"
+        "--timeout",
+        default="60",
+        metavar="SEC",
+        help=f"删除验证的最长等待秒数（默认 60，1–{MAX_TIMEOUT}）",
     )
     parser.add_argument(
-        "--interval", default="2", metavar="SEC", help="删除验证的轮询间隔秒数（默认 2）"
+        "--interval",
+        default="2",
+        metavar="SEC",
+        help=(
+            f"删除验证的轮询间隔秒数（默认 2，1–{MAX_INTERVAL}，且不得大于 --timeout）"
+        ),
+    )
+    parser.add_argument(
+        "--command-timeout",
+        default=str(DEFAULT_COMMAND_TIMEOUT),
+        metavar="SEC",
+        help=(
+            "单次 gh / git 子命令的超时秒数"
+            f"（默认 {DEFAULT_COMMAND_TIMEOUT}，1–{MAX_COMMAND_TIMEOUT}）"
+        ),
     )
     parser.add_argument(
         "--verify-only",
@@ -448,6 +537,7 @@ class Options:
     remote: str
     timeout: int
     interval: int
+    command_timeout: int
     verify_only: bool
 
 
@@ -465,8 +555,15 @@ def validate(args: argparse.Namespace) -> Options:
     pr = parse_positive_int("--pr", args.pr, maximum=MAX_PR)
     branch = args.branch
     check_branch_is_not_main(branch)
-    timeout = parse_positive_int("--timeout", args.timeout)
-    interval = parse_positive_int("--interval", args.interval)
+    timeout = parse_positive_int("--timeout", args.timeout, maximum=MAX_TIMEOUT)
+    interval = parse_positive_int("--interval", args.interval, maximum=MAX_INTERVAL)
+    if interval > timeout:
+        raise MergeGuardError(
+            f"--interval 不能大于 --timeout（interval={interval}, timeout={timeout}）"
+        )
+    command_timeout = parse_positive_int(
+        "--command-timeout", args.command_timeout, maximum=MAX_COMMAND_TIMEOUT
+    )
     repo = args.repo
     if not os.path.isdir(repo):
         raise MergeGuardError(f"仓库路径不存在或不是目录: {repo}")
@@ -483,17 +580,51 @@ def validate(args: argparse.Namespace) -> Options:
         remote=args.remote,
         timeout=timeout,
         interval=interval,
+        command_timeout=command_timeout,
         verify_only=bool(args.verify_only),
     )
 
 
 # -------------------------------------------------------------------- 主流程
 
+@contextmanager
+def _keep_evidence(lines: list[str]) -> Iterator[None]:
+    """合并已经发生之后的兜底：任何异常都带上已完成的步骤证据走 rc2。
+
+    为什么必须有这一层：``poll_branch_deleted`` 是在 ``gh pr merge`` **之后**才跑的，
+    后面的崩溃（参数越界的 ``OverflowError``、探针环境故障、意外的 ``TypeError``…）
+    如果直接冒到解释器，退出码是 1，而且 ``main`` 里的 ``lines`` 一条都打不出来 ——
+    下一轮会把它读成「合并没发生、可以重跑」，再去合一次会撞 PR 已 MERGED。
+
+    所以这里把异常统一转成 :class:`PartialFailure`（携带 ``lines``），``main`` 先把
+    已完成的「预检」「合并」两步写到 stdout，再写 stderr 一行，退出码固定 2。
+    """
+
+    try:
+        yield
+    except PartialFailure:
+        raise
+    except CommandTimeout as exc:
+        raise PartialFailure(
+            f"{exc}；合并是否已发生无法确认，请人工核对 PR 状态，不要直接重跑合并",
+            lines,
+        ) from exc
+    except MergeGuardError as exc:
+        raise PartialFailure(str(exc), lines) from exc
+    except Exception as exc:  # 兜底：意外异常不许冒 traceback、不许落 rc1
+        detail = " ".join(str(exc).split())
+        raise PartialFailure(
+            f"合并后出现意外错误（{type(exc).__name__}: {detail}）；"
+            "合并是否已发生无法确认，请人工核对 PR 状态，不要直接重跑合并",
+            lines,
+        ) from exc
+
+
 def _run_verify_only(opts: Options) -> tuple[list[str], int]:
     """``--verify-only``：只验证「远端分支是否已删」，一次 gh 都不调。"""
 
     result = poll_branch_deleted(
-        make_probe(opts.repo, opts.remote, opts.branch),
+        make_probe(opts.repo, opts.remote, opts.branch, timeout=opts.command_timeout),
         timeout=opts.timeout,
         interval=opts.interval,
     )
@@ -527,7 +658,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         "--json",
         _PR_VIEW_FIELDS,
     )
-    view = _run(view_argv, cwd=opts.repo)
+    view = _run(view_argv, cwd=opts.repo, timeout=opts.command_timeout)
     if view.returncode != 0:
         raise MergeGuardError(
             f"gh pr view {opts.pr} 失败（rc={view.returncode}）: {key_line(view)}"
@@ -569,63 +700,69 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         f"--{opts.method}",
         "--delete-branch",
     )
-    merge = _run(merge_argv, cwd=opts.repo)
-    if merge.returncode != 0:
-        # gh 返回非 0：把 gh 的输出原文写出来，rc1，且不许再跑删除验证
-        _write_stderr_raw(merge.stdout)
-        _write_stderr_raw(merge.stderr)
+    # 从这一行起合并随时可能已经发生：任何异常都必须带着上面那条「预检 | PASS」
+    # （以及合并成功后的「合并 | PASS」）走 rc2，不许落 rc1、不许冒 traceback。
+    with _keep_evidence(lines):
+        merge = _run(merge_argv, cwd=opts.repo, timeout=opts.command_timeout)
+        if merge.returncode != 0:
+            # gh 返回非 0：把 gh 的输出原文写出来，rc1，且不许再跑删除验证
+            _write_stderr_raw(merge.stdout)
+            _write_stderr_raw(merge.stderr)
+            lines.append(
+                format_step(
+                    STEP_MERGE,
+                    ok=False,
+                    command=merge.command,
+                    rc=merge.returncode,
+                    key=key_line(merge),
+                )
+            )
+            lines.append(
+                f"结论：合并失败（gh pr merge 退出码 {merge.returncode}，"
+                "未做分支删除验证）"
+            )
+            return lines, 1
+
         lines.append(
             format_step(
                 STEP_MERGE,
-                ok=False,
+                ok=True,
                 command=merge.command,
                 rc=merge.returncode,
                 key=key_line(merge),
             )
         )
-        lines.append(
-            f"结论：合并失败（gh pr merge 退出码 {merge.returncode}，"
-            "未做分支删除验证）"
-        )
-        return lines, 1
 
-    lines.append(
-        format_step(
-            STEP_MERGE,
-            ok=True,
-            command=merge.command,
-            rc=merge.returncode,
-            key=key_line(merge),
+        result = poll_branch_deleted(
+            make_probe(
+                opts.repo, opts.remote, opts.branch, timeout=opts.command_timeout
+            ),
+            timeout=opts.timeout,
+            interval=opts.interval,
         )
-    )
-
-    result = poll_branch_deleted(
-        make_probe(opts.repo, opts.remote, opts.branch),
-        timeout=opts.timeout,
-        interval=opts.interval,
-    )
-    lines.append(
-        format_step(
-            STEP_DELETE,
-            ok=result.outcome == OUT_DELETED,
-            command=" ".join(ls_remote_argv(opts.repo, opts.remote, opts.branch)),
-            rc=result.returncode,
-            key=result.key,
-        )
-    )
-    if result.outcome == OUT_DELETED:
         lines.append(
-            f"结论：合并完成，源分支 {opts.branch} 已从 {opts.remote} 删除"
+            format_step(
+                STEP_DELETE,
+                ok=result.outcome == OUT_DELETED,
+                command=" ".join(ls_remote_argv(opts.repo, opts.remote, opts.branch)),
+                rc=result.returncode,
+                key=result.key,
+            )
         )
-        return lines, 0
-    if result.outcome == OUT_PRESENT:
-        lines.append("结论：合并成功但源分支仍在远端（合并不算完成）")
-        return lines, 1
-    # 合并已经发生，但「分支是否真的删了」判不了 —— 明确未通过，绝不当绿
-    raise MergeGuardError(
-        f"合并已完成，但无法判定远端分支 {opts.branch} 是否已删除"
-        f"（{result.reason}）；请人工核对"
-    )
+        if result.outcome == OUT_DELETED:
+            lines.append(
+                f"结论：合并完成，源分支 {opts.branch} 已从 {opts.remote} 删除"
+            )
+            return lines, 0
+        if result.outcome == OUT_PRESENT:
+            lines.append("结论：合并成功但源分支仍在远端（合并不算完成）")
+            return lines, 1
+        # 合并已经发生，但「分支是否真的删了」判不了 —— 明确未通过，绝不当绿。
+        # 走 PartialFailure：预检 / 合并两步证据留在 stdout，退出码 2（不是 1）。
+        raise MergeGuardError(
+            f"合并已完成，但无法判定远端分支 {opts.branch} 是否已删除"
+            f"（{result.reason}）；请人工核对"
+        )
 
 
 def run(args: argparse.Namespace) -> tuple[list[str], int]:
@@ -638,7 +775,12 @@ def run(args: argparse.Namespace) -> tuple[list[str], int]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m team_board.merge_guard`` 入口。"""
+    """``python -m team_board.merge_guard`` 入口。
+
+    退出码口径：**任何异常都不许落 rc1**（rc1 只表示「未达成」）。合并已发生之后的
+    失败走 :class:`PartialFailure`：先把已完成的步骤证据写到 stdout，再把
+    ``错误: …`` 写到 stderr，返回 2 —— 崩溃既不能丢证据，也不能被读成「可以重跑」。
+    """
 
     try:
         args = _parse(argv)
@@ -651,8 +793,22 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         lines, rc = run(args)
+    except PartialFailure as exc:
+        if exc.lines:
+            # stdout 编码表示不了中文时证据写不出，但仍然是 rc2（不许落 rc1）
+            with suppress(MergeGuardError):
+                _write_stdout(exc.lines)
+        _write_stderr_error(str(exc))
+        return 2
     except MergeGuardError as exc:
         _write_stderr_error(str(exc))
+        return 2
+    except Exception as exc:  # 兜底：意外异常不许冒 traceback、不许落 rc1
+        detail = " ".join(str(exc).split())
+        _write_stderr_error(
+            f"内部错误：{type(exc).__name__}: {detail}"
+            "（退出码不是 1；合并是否已发生请人工核对）"
+        )
         return 2
 
     try:

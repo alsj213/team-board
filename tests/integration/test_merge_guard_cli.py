@@ -21,6 +21,7 @@ CARD_BRANCH = "wt/t_bbeab29f"
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ -n "$FAKE_VIEW_SLEEP" ]; then sleep "$FAKE_VIEW_SLEEP"; fi
   printf '%s' "$FAKE_VIEW_JSON"
   exit "${FAKE_VIEW_RC:-0}"
 fi
@@ -35,6 +36,7 @@ exit 9
 
 GIT_STUB = """#!/bin/sh
 printf 'git %s\\n' "$*" >> "$FAKE_LOG"
+if [ -n "$FAKE_GIT_SLEEP" ]; then sleep "$FAKE_GIT_SLEEP"; fi
 exit "${FAKE_LS_REMOTE_RC:-2}"
 """
 
@@ -451,7 +453,11 @@ def test_missing_gh_rc2(
 def test_missing_git_after_merge_rc2(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """合并成功后 git 不可用 → 判不了，rc2（不许当绿，也不许当 rc1）。"""
+    """合并成功后 git 不可用 → 判不了，rc2（不许当绿，也不许当 rc1）。
+
+    合并已经发生，所以 stdout **必须仍保留**「预检 | PASS」「合并 | PASS」两步证据
+    （rc2 的常规口径是 stdout 空，这里是有意的唯一反例）。
+    """
 
     bindir = tmp_path / "gh-only-bin"
     bindir.mkdir()
@@ -472,9 +478,12 @@ def test_missing_git_after_merge_rc2(
 
     rc, out, err = run(args_for(Stub(bindir, log, repo, monkeypatch.setenv)), capsys)
 
-    assert rc == 2
-    assert out == ""
+    assert rc == 2  # 不是 1
+    assert out.splitlines()[0].startswith("预检 | PASS | ")
+    assert out.splitlines()[1].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    assert "Traceback" not in out + err
     assert err.startswith("错误: ")
+    assert err.count("\n") == 1  # stderr 只有一行
     assert "git" in err
     assert "gh pr merge 9 --merge --delete-branch" in log.read_text(encoding="utf-8")
 
@@ -488,9 +497,12 @@ def test_merge_ok_but_undetermined_rc2(
 
     rc, out, err = run(args_for(stub), capsys)
 
-    assert rc == 2
-    assert out == ""  # rc2 一律 stdout 空
+    assert rc == 2  # 不是 1：判不了就是未通过
+    assert out.startswith("预检 | PASS | ")  # 合并已发生 → 证据必须留下
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert "Traceback" not in out + err
     assert err.startswith("错误: ")
+    assert err.count("\n") == 1
     assert "无法判定" in err
 
 
@@ -503,4 +515,181 @@ def test_help_rc0(capsys: pytest.CaptureFixture[str]) -> None:
     assert rc == 0
     assert "--delete-branch" in captured.out
     assert "--verify-only" in captured.out
+    assert "--command-timeout" in captured.out
     assert captured.err == ""
+
+
+# --------------------- 11. 三个时长参数的取值域上界（max 3600，越界一律 rc2）
+
+BOUNDARY_VALUES = [
+    "0",
+    "-1",
+    "1793160000000",  # 13 位毫秒：修好之前它会让 poll 挂死（rc=124）
+    "9" * 400,  # 天文数字：修好之前它会在 clock() + timeout 上裸抛 OverflowError
+    "",
+]
+
+
+@pytest.mark.parametrize("flag", ["--timeout", "--interval", "--command-timeout"])
+@pytest.mark.parametrize("value", BOUNDARY_VALUES)
+def test_duration_flags_out_of_range_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str], flag: str, value: str
+) -> None:
+    rc, out, err = run(args_for(stub, flag, value), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1  # stderr 恰一行
+    assert "Traceback" not in err
+    assert stub.calls() == []  # 越界在调 gh / git 之前就被拒
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--timeout", "3601"),
+        ("--interval", "3601"),
+        ("--command-timeout", "3601"),
+    ],
+)
+def test_duration_upper_bound_exceeded_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str], flag: str, value: str
+) -> None:
+    rc, out, err = run(args_for(stub, flag, value), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "3600" in err  # 说清上界
+    assert stub.calls() == []
+
+
+def test_duration_upper_bound_itself_accepted(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """上界 3600 本身合法（不是越界）；假 git 第一次就说「已删」，不会真等。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(
+        args_for(
+            stub,
+            "--timeout",
+            "3600",
+            "--interval",
+            "3600",
+            "--command-timeout",
+            "3600",
+        ),
+        capsys,
+    )
+
+    assert rc == 0
+    assert err == ""
+    assert "结论：合并完成" in out
+
+
+def test_interval_greater_than_timeout_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``interval <= timeout`` 是硬约束：轮询间隔比总预算还长等于没预算。"""
+
+    rc, out, err = run(args_for(stub, "--timeout", "3", "--interval", "10"), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "--interval" in err
+    assert stub.calls() == []
+
+
+# ------------------- 12. 子命令超时（--command-timeout）：预检超时 → rc2
+
+def test_preflight_timeout_rc2_and_no_merge(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``gh pr view`` 卡住 → rc2，且**不许**再发合并命令。"""
+
+    stub.setenv("FAKE_VIEW_SLEEP", "5")
+
+    rc, out, err = run(args_for(stub, "--command-timeout", "1"), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "超时" in err
+    assert "Traceback" not in err
+    assert "gh pr merge" not in " ".join(stub.gh_calls())
+
+
+# ------------------- 13. 子命令超时：合并后的探针超时 → 不是 rc0
+
+def test_probe_timeout_after_merge_is_not_rc0(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ls-remote`` 卡住不许当成「分支还在」（rc1）或「已删」（rc0）。
+
+    超时按通信错误记一次、继续轮询，预算耗尽后判「无法判定」→ rc2（≠0，也≠1），
+    且因为合并已发生，stdout 必须保住「预检 | PASS」「合并 | PASS」。
+    """
+
+    stub.setenv("FAKE_GIT_SLEEP", "5")
+
+    rc, out, err = run(
+        args_for(stub, "--timeout", "1", "--interval", "1", "--command-timeout", "1"),
+        capsys,
+    )
+
+    assert rc != 0  # 绝不把超时读成「合并完成」
+    assert rc == 2
+    assert out.startswith("预检 | PASS | ")
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert "分支删除 | FAIL" in out  # 超时不算 PASS
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "无法判定" in err
+
+
+# ---------- 14. 非 MergeGuardError 异常：不许落 rc1、不许丢已完成步骤证据
+
+def test_unexpected_exception_after_merge_keeps_evidence(
+    stub: Stub, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> mg.PollResult:
+        raise ValueError("模拟意外崩溃")
+
+    monkeypatch.setattr(mg, "poll_branch_deleted", boom)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2  # 不是 1
+    assert out.splitlines()[0].startswith("预检 | PASS | ")
+    assert out.splitlines()[1].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    assert "Traceback" not in out + err
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1  # 一行，没有 traceback
+    assert "ValueError" in err
+    assert "人工核对" in err
+
+
+def test_unexpected_exception_before_merge_rc2_stdout_empty(
+    stub: Stub, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并之前的意外异常：rc2、stdout 空、stderr 一行（没有 traceback）。"""
+
+    def boom(*_args: object, **_kwargs: object) -> mg.CommandResult:
+        raise RuntimeError("模拟预检崩溃")
+
+    monkeypatch.setattr(mg, "_run", boom)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert "Traceback" not in err
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "RuntimeError" in err
