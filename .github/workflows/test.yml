@@ -142,3 +142,32 @@ jobs:
       # 只扫 src：pytest 断言的 B101 是噪声
       - name: Run bandit
         run: python -m bandit -r src -q --severity-level all --confidence-level all
+
+  commit-identity:
+    name: commit-identity (author 白名单 + committer 是本 bot)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch all branches
+        run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      # 判定逻辑全在 scripts/ci-commit-identity.sh，这里只做四件事：
+      # checkout / setup-python / fetch / 调脚本。脚本自己从 `git show origin/main:` 读镜像表
+      # （PR 分支里改 .team-board/cards.tsv 不参与判定），卡不在表里就回落到默认白名单
+      # {engineer, qa}，不再 fail closed 把别的卡的 PR 锁死。
+      # PR 的 checkout 是 detached HEAD → 分支名取 github.head_ref；push 到 main 时为空，退回
+      # `git branch --show-current`（= main，非卡分支 → 脚本 skip rc0）。
+      - name: Run commit identity audit
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
+        run: |
+          BRANCH="${HEAD_REF:-$(git branch --show-current)}"
+          bash scripts/ci-commit-identity.sh "$PWD" "$BRANCH" "$AUDIT_REV"
+

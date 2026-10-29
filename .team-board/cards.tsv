@@ -1,0 +1,9 @@
+# 卡 → 建卡时 assignee（CI 专用镜像，判据② 的数据源）
+# 本表只在 main 上维护（CI 用 git show origin/main: 读它）；PR 分支里改本表不生效；新卡由 ops 追加一行。
+# 用途：scripts/make-audit-board.py 用本表在 CI runner 上造临时看板库，传给
+#       python -m team_board.cli commit-audit --db；runner 上没有真看板库。
+# 取值口径：必须等于看板库 task_events 里该卡 kind='created' 事件的 payload.assignee
+#       （不是 tasks.assignee —— 那张卡被 request-review 改派过就变了）。
+# fail closed：CI 上判的卡不在本表里 → make-audit-board.py exit 2，不许跳过。
+# 格式：card<TAB>assignee；# 开头的注释行与空行忽略。
+t_51f5fad0	engineer

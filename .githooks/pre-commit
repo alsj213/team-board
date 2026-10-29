@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# pre-commit：提交者身份早警 —— 只做提醒，**不是防线**。
+#
+# 判定权在 `team-board commit-audit` + CI job `commit-identity`：
+#   钩子可以被 `--no-verify` 绕过、可以被 `git config core.hooksPath` 重装掉、
+#   提交消息里先写 `Co-authored-by` 也不影响 committer 字段 —— 三种失效场景都
+#   挡不住 `commit-audit`，所以真正的判定放在那边；这里只在本地提交时提醒一句，
+#   免得把假身份一路带到 PR。
+#
+# 校验两件事：
+#   1. `git config user.email` 的 localpart 必须登记在 <仓库根>/.team-board/bots.tsv；
+#   2. `git var GIT_COMMITTER_IDENT` 里的邮箱必须与它相同
+#      （`git -c user.email=…` 只改后者，两者不一致就是这么暴露的）。
+#
+# 修法：bash scripts/setup-bot-identity.sh <profile> <worktree>
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$root" ]; then
+    # 不在工作树里（裸仓 / 非仓库）：交给 git 自己报错，这里不掺和
+    exit 0
+fi
+
+bots_file="$root/.team-board/bots.tsv"
+
+alert() {
+    printf '[pre-commit] committer 不是本 bot：%s；先跑 bash scripts/setup-bot-identity.sh <profile> %s\n' \
+        "$1" "$root" >&2
+    printf '[pre-commit] （<profile> 换成 .team-board/bots.tsv 里你那一行的第 1 列；这是早警，判定权在 commit-audit + CI job commit-identity）\n' >&2
+    exit 1
+}
+
+if [ ! -f "$bots_file" ]; then
+    printf '[pre-commit] 身份表不存在：%s；先跑 bash scripts/setup-bot-identity.sh <profile> %s\n' \
+        "$bots_file" "$root" >&2
+    exit 1
+fi
+
+conf_email="$(git config --get user.email 2>/dev/null || true)"
+ident_email="$(git var GIT_COMMITTER_IDENT 2>/dev/null | sed -n 's/^.*<\([^>]*\)>.*$/\1/p')"
+
+if [ -z "$conf_email" ]; then
+    alert "user.email 未设置（git config --get user.email 为空）"
+fi
+if [ -z "$ident_email" ]; then
+    alert "git var GIT_COMMITTER_IDENT 里取不到邮箱（committer 身份未配置）"
+fi
+if [ "$ident_email" != "$conf_email" ]; then
+    alert "$ident_email（user.email 配的是 $conf_email，两者不一致）"
+fi
+
+conf_localpart="${conf_email%%@*}"
+registered="$(awk -F'\t' -v p="$conf_localpart" '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    NF != 3 { next }
+    $1 == p { print $1; exit }
+' "$bots_file")"
+
+if [ -z "$registered" ]; then
+    alert "$conf_email（profile=$conf_localpart 不在 bots.tsv 里）"
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+# bot 身份表：profile<TAB>name<TAB>email
+# 用途：commit-audit / commit-identity CI job / scripts/setup-bot-identity.sh 的唯一身份源。
+# 注意：GitHub 页面恒显示 alsj213，这张表只解决「提交元数据里能区分」，不解决页面显示。
+pm	pm	pm@team-board.local
+engineer	engineer	engineer@team-board.local
+qa	qa	qa@team-board.local
+ops	ops	ops@team-board.local
+hatch	hatch	hatch@team-board.local
+chief	chief	chief@team-board.local
