@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +16,26 @@ from team_board import merge_guard as mg
 
 #: 假 ``gh pr view`` 报出来的 head 提交（40 位十六进制）
 HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
+
+#: 认账四参数的默认取值（合并模式必填）
+MERGE_CARD = "t_bbeab29f"
+MERGE_BY = "pm/run200"
+MERGE_SUBJECT = "Merge PR #9（t_bbeab29f）"
+BODY_TEXT = f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #9\n"
+
+_BODY_PATH: str | None = None
+
+
+def body_file() -> str:
+    """造一份合法 body 文件并返回路径（模块级缓存：同一进程内只写一次）。"""
+
+    global _BODY_PATH
+    if _BODY_PATH is None:
+        handle, name = tempfile.mkstemp(prefix="mg-body-", suffix=".txt")
+        os.close(handle)
+        Path(name).write_text(BODY_TEXT, encoding="utf-8")
+        _BODY_PATH = name
+    return _BODY_PATH
 
 
 class FakeClock:
@@ -597,9 +620,25 @@ def test_duration_upper_bound_rejected(flag: str, raw: str, maximum: int) -> Non
     assert str(maximum) in str(excinfo.value)  # 说清上界
 
 
-def _validated_ns(**overrides: str) -> argparse.Namespace:
+def _validated_ns(**overrides: object) -> argparse.Namespace:
     ns = mg.build_parser().parse_args(
-        ["--pr", "9", "--branch", "wt/t_bbeab29f", "--method", "merge", "--delete-branch"]
+        [
+            "--pr",
+            "9",
+            "--branch",
+            "wt/t_bbeab29f",
+            "--method",
+            "merge",
+            "--delete-branch",
+            "--card",
+            MERGE_CARD,
+            "--by",
+            MERGE_BY,
+            "--subject",
+            MERGE_SUBJECT,
+            "--body-file",
+            body_file(),
+        ]
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -623,7 +662,21 @@ def test_method_default_is_merge_and_optional() -> None:
     """不传 ``--method`` 也能解析，取到的就是默认值 merge。"""
 
     ns = mg.build_parser().parse_args(
-        ["--pr", "9", "--branch", "wt/t_bbeab29f", "--delete-branch"]
+        [
+            "--pr",
+            "9",
+            "--branch",
+            "wt/t_bbeab29f",
+            "--delete-branch",
+            "--card",
+            MERGE_CARD,
+            "--by",
+            MERGE_BY,
+            "--subject",
+            MERGE_SUBJECT,
+            "--body-file",
+            body_file(),
+        ]
     )
 
     assert ns.method == mg.DEFAULT_METHOD == "merge"
@@ -1028,3 +1081,230 @@ def test_handle_signals_turns_signal_into_interrupted(
 
     assert excinfo.value.signame == signame
     assert "退出码不是 1" in str(excinfo.value)
+
+
+# ------------------------------------- 认账四参数（--card / --by / --subject / --body-file）
+#
+# 缺口（pm 实跑，卡 t_bb6600d8）：``gh pr merge`` 不带 ``--subject`` / ``--body-file`` 时
+# 用 gh 默认文案生成合并提交 message，**没有任何 trailer** —— 经 merge_guard 合出来的提交
+# 必然过不了 ``merge-audit --require``（缺 merged-by / merge-card / merge-pr）。所以合并模式
+# 多四个必填参数，全部原样转发；校验全部落在 ``validate``（即 ensure_branch_present 之前）。
+
+
+def test_merge_argv_verbatim_order() -> None:
+    """argv 逐字：三段语义（--merge/--delete-branch/--match-head-commit）原位，认账追加在后。"""
+
+    argv = mg.merge_argv(9, "merge", HEAD_OID, MERGE_SUBJECT, "/tmp/body.txt")
+
+    assert argv == (
+        "gh",
+        "pr",
+        "merge",
+        "9",
+        "--merge",
+        "--delete-branch",
+        "--match-head-commit",
+        HEAD_OID,
+        "--subject",
+        MERGE_SUBJECT,
+        "--body-file",
+        "/tmp/body.txt",
+    )
+    # 顺序也是契约：--subject / --body-file 必须在 --match-head-commit <sha> 之后
+    assert argv.index("--match-head-commit") < argv.index("--subject") < argv.index("--body-file")
+
+
+def test_validate_carries_accounting_into_options() -> None:
+    opts = mg.validate(_validated_ns())
+
+    assert opts.accounting is not None
+    assert opts.accounting.card == MERGE_CARD
+    assert opts.accounting.by == MERGE_BY
+    assert opts.accounting.subject == MERGE_SUBJECT
+    assert opts.accounting.body_file == body_file()
+
+
+@pytest.mark.parametrize("field", ["card", "by", "subject", "body_file"])
+def test_validate_rejects_missing_accounting_flag(field: str) -> None:
+    """合并模式缺任一项 → rc2 档（MergeGuardError），错误里点名缺的是哪个。"""
+
+    flag = "--" + field.replace("_", "-")
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(**{field: None}))
+
+    assert flag in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "bad_card",
+    ["", "t_", "t_deadbee", "t_deadbeef0", "T_DEADBEEF", "deadbeef", "t_DEADBEEF", "t_deadbeez"],
+)
+def test_validate_rejects_bad_card_shape(bad_card: str) -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(card=bad_card))
+    assert "--card" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "bad_by",
+    ["", "pm", "pm/run", "pm/run-1", "PM/run200", "pm/200", "pm/run200x", "pm/run 200"],
+)
+def test_validate_rejects_bad_by_shape(bad_by: str) -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(by=bad_by))
+    assert "--by" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("bad_subject", "hint"),
+    [
+        ("", "不能为空"),
+        ("   ", "为空"),
+        ("\t", "为空"),
+        ("a\nb", "换行"),
+        ("a\rb", "换行"),
+        ("Merge PR #9\n", "换行"),
+    ],
+)
+def test_validate_rejects_bad_subject(bad_subject: str, hint: str) -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(subject=bad_subject))
+    assert "--subject" in str(excinfo.value)
+    assert hint in str(excinfo.value)
+
+
+def test_validate_accepts_subject_with_surrounding_spaces() -> None:
+    """只拒「纯空白」与换行：首尾有空格但正文非空的标题照收（不静默 trim）。"""
+
+    opts = mg.validate(_validated_ns(subject="  Merge PR #9（t_bbeab29f）  "))
+
+    assert opts.accounting is not None
+    assert opts.accounting.subject == "  Merge PR #9（t_bbeab29f）  "
+
+
+def test_validate_rejects_empty_body_file_path() -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=""))
+
+    assert "--body-file" in str(excinfo.value)
+    assert "路径为空" in str(excinfo.value)
+
+
+def test_validate_rejects_missing_body_file(tmp_path: Path) -> None:
+    missing = tmp_path / "nope.txt"
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(missing)))
+
+    assert "不存在" in str(excinfo.value)
+
+
+def test_validate_rejects_body_file_directory(tmp_path: Path) -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(tmp_path)))
+
+    assert "不是普通文件" in str(excinfo.value)
+
+
+def test_validate_rejects_non_utf8_body_file(tmp_path: Path) -> None:
+    path = tmp_path / "gbk.txt"
+    path.write_bytes("Merge-Note: 合并\n".encode("gbk") + b"\xff\xfe\n")
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(path)))
+
+    assert "UTF-8" in str(excinfo.value)
+
+
+def test_validate_rejects_empty_body_file(tmp_path: Path) -> None:
+    path = tmp_path / "empty.txt"
+    path.write_text("", encoding="utf-8")
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(path)))
+
+    assert "空文件" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "kind"),
+    [
+        ("merged-by: pm/run200\nmerge-card: t_bbeab29f\n", "缺字段"),  # 少 merge-pr
+        (
+            "merged-by: pm/run200\nmerge-card: t_bbeab29f\nmerge-pr: #9\nmerge-pr: #9\n",
+            "重复字段",
+        ),
+        ("merged-by: PM/run200\nmerge-card: t_bbeab29f\nmerge-pr: #9\n", "格式非法"),
+    ],
+)
+def test_validate_rejects_bad_body_content(tmp_path: Path, body: str, kind: str) -> None:
+    """body 内容交给 ``merges.check_message`` 判（缺字段 / 重复 / 格式错）。"""
+
+    path = tmp_path / "body.txt"
+    path.write_text(body, encoding="utf-8")
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(path)))
+
+    assert kind in str(excinfo.value)
+
+
+def test_validate_rejects_body_card_mismatch(tmp_path: Path) -> None:
+    """``merge-card`` 与 ``--card`` 不一致：check_message 报「字段与参数不一致」。"""
+
+    path = tmp_path / "body.txt"
+    path.write_text(
+        "merged-by: pm/run200\nmerge-card: t_deadbeef\nmerge-pr: #9\n", encoding="utf-8"
+    )
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(path)))
+
+    assert "字段与参数不一致" in str(excinfo.value)
+
+
+def test_validate_rejects_body_pr_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "body.txt"
+    path.write_text(
+        "merged-by: pm/run200\nmerge-card: t_bbeab29f\nmerge-pr: #10\n", encoding="utf-8"
+    )
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file=str(path)))
+
+    assert "#10" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("card", MERGE_CARD), ("by", MERGE_BY), ("subject", MERGE_SUBJECT), ("body_file", "x.txt")],
+)
+def test_validate_verify_only_excludes_accounting(field: str, value: str) -> None:
+    """``--verify-only`` 与认账四参数互斥（verify-only 不合并，给了 body 说明调用方误判）。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(verify_only=True, **{field: value}))
+
+    assert "互斥" in str(excinfo.value)
+
+
+def test_validate_verify_only_alone_returns_no_accounting() -> None:
+    """单独 ``--verify-only`` 行为不变：Options.accounting 是 None，且不要求四个参数。"""
+
+    ns = mg.build_parser().parse_args(
+        [
+            "--pr",
+            "9",
+            "--branch",
+            "wt/t_bbeab29f",
+            "--delete-branch",
+            "--repo",
+            ".",
+            "--verify-only",
+        ]
+    )
+
+    opts = mg.validate(ns)
+
+    assert opts.verify_only is True
+    assert opts.accounting is None

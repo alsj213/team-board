@@ -44,6 +44,28 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
 依据是 R13（合并方式统一定一种 = create a merge commit，见 ``docs/merge-policy.md``）——
 本工具不再把「用哪种方式」交给调用方决定。
 
+认账三字段必须随合并命令一起走
+------------------------------
+``gh pr merge`` 不带 ``--subject`` / ``--body-file`` 时，合并提交 message 是 gh 自己的默认
+文案（``Merge pull request #20 from alsj213/wt/t_xxxx``），**没有任何 trailer** —— 经本工具
+合出来的提交必然过不了 ``merge-audit --require``（缺 ``merged-by`` / ``merge-card`` /
+``merge-pr`` 三条）。所以合并模式多四个**必填**参数，全部原样转发给 ``gh pr merge``：
+
+``gh pr merge <pr> --merge --delete-branch --match-head-commit <sha> --subject <subject>
+--body-file <path>``
+
+- ``--card`` 形如 ``t_[0-9a-f]{8}``、``--by`` 形如 ``<profile>/run<NNN>`` —— 用
+  :mod:`team_board.merges` 的 ``MERGE_CARD_RE`` / ``MERGE_BY_RE`` 校验，**不复制正则**；
+- ``--subject`` 单行非空白（含换行 → rc2）；
+- ``--body-file`` 必须存在、是普通文件、严格 UTF-8、非空，且内容经
+  ``merges.check_message(text, card=…, by=…, pr=…)`` 判过（缺字段 / 重复字段 / 格式非法 /
+  与参数不一致都算不合格）；
+- ``--verify-only`` 与这四个参数**互斥**（verify-only 不合并，给了 body 说明调用方误判）。
+
+四条校验全部在 :func:`validate` 里判完 —— 也就是 ``ensure_branch_present()`` 之前，
+零 ``gh`` 调用、零 ``git ls-remote``，任一不满足 → rc2、stdout 空、stderr 恰一行
+``错误: …``。**任何「body 不合规」都不许落到 rc1**：rc1 是「未达成」专用码。
+
 ``--branch`` 只收裸分支名
 ------------------------
 ``--branch`` 在 ``validate`` 里（一切 ``gh`` / ``git`` 调用**之前**）就过形态校验：空串、
@@ -71,7 +93,11 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
 - ``1``：未达成 —— gh 合并失败（且 PR 状态不是 ``MERGED``） / 合并成功但源分支仍在
   远端 / ``--verify-only`` 时分支仍在远端或无法判定。
 - ``2``：参数或环境错误：缺 ``--delete-branch``、``--method`` 不是 ``merge``（``squash``
-  / ``rebase`` 一律拒）、``--pr`` / ``--timeout`` /
+  / ``rebase`` 一律拒）、合并模式缺 ``--card`` / ``--by`` / ``--subject`` / ``--body-file``
+  任一项、``--card`` / ``--by`` 形态非法、``--subject`` 空 / 纯空白 / 含换行、``--body-file``
+  路径为空 / 文件不存在 / 不是普通文件 / 非严格 UTF-8 / 空文件、body 经
+  ``merges.check_message`` 判出问题（缺字段 / 重复 / 格式错 / 与参数不一致）、
+  ``--verify-only`` 与这四个认账参数同给、``--pr`` / ``--timeout`` /
   ``--interval`` / ``--command-timeout`` 取值越界（``--pr`` 上限 ``MAX_PR``；
   ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 形态非法（空串 / 含空白字符 /
@@ -111,6 +137,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess  # nosec B404
 import sys
 import time
@@ -118,6 +145,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
+
+from team_board.merges import MERGE_BY_RE, MERGE_CARD_RE, check_message
 
 #: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
 METHODS: tuple[str, ...] = ("merge",)
@@ -181,6 +210,9 @@ PROBE_ERROR = "error"
 MISSING_DELETE_BRANCH = (
     "合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）"
 )
+
+#: 合并模式下**必填**的四个认账参数（顺序即校验与报错顺序）
+ACCOUNTING_FLAGS: tuple[str, ...] = ("--card", "--by", "--subject", "--body-file")
 
 #: 只认 ASCII 十进制：``int()`` 认空白、正负号、下划线与非 ASCII 数字
 _DIGITS = re.compile(r"[0-9]+", re.ASCII)
@@ -274,6 +306,17 @@ class Preflight:
     base_ref: str
     #: 预检时源分支的 head 提交；合并命令要用它钉住「合的是哪一个提交」
     head_oid: str
+
+
+@dataclass(frozen=True)
+class Accounting:
+    """合并提交的认账三字段 + 标题（全部原样转发给 ``gh pr merge``）。"""
+
+    card: str
+    by: str
+    subject: str
+    #: 认账 body 文件路径（``gh pr merge --body-file`` 收到的是这个路径原文）
+    body_file: str
 
 
 @dataclass(frozen=True)
@@ -519,6 +562,42 @@ def ls_remote_argv(repo: str, remote: str, branch: str) -> tuple[str, ...]:
     )
 
 
+def merge_argv(
+    pr: int,
+    method: str,
+    head_oid: str,
+    subject: str,
+    body_file: str,
+) -> tuple[str, ...]:
+    """合并 argv（顺序固定，不许改）。
+
+    ``--merge`` / ``--delete-branch`` / ``--match-head-commit`` 三项语义一字不许动
+    （R13 / R12 / 预检钉提交），认账的 ``--subject`` 与 ``--body-file`` 只能**追加**在
+    ``--match-head-commit <sha>`` 之后：
+
+        gh pr merge <pr> --merge --delete-branch --match-head-commit <sha>
+            --subject <subject> --body-file <path>
+
+    不带这两个参数时 gh 用默认文案生成合并提交 message，**没有任何 trailer**，
+    经本工具合出来的提交必然过不了 ``merge-audit --require``（缺认账三字段）。
+    """
+
+    return (
+        "gh",
+        "pr",
+        "merge",
+        str(pr),
+        f"--{method}",
+        "--delete-branch",
+        "--match-head-commit",
+        head_oid,
+        "--subject",
+        subject,
+        "--body-file",
+        body_file,
+    )
+
+
 class Probe:
     """一次 ``git ls-remote`` 探针；每次调用只肯等「剩余总预算」。
 
@@ -758,6 +837,139 @@ def check_branch_shape(branch: str) -> None:
         )
 
 
+def check_subject(subject: str) -> str:
+    """``--subject`` 必须是**单行非空白**的合并提交标题。
+
+    三种非法形态各一行 ``错误: …``：空串、去掉首尾空白后为空、含换行（``\\n`` / ``\\r``）。
+    标题为空时 git 的 ``%s`` 会把第一行 trailer（``merged-by: …``）当提交标题，
+    认账块随之断掉；标题含换行时 gh 会把 ``--subject`` 当两行用，标题与正文边界不再确定。
+    """
+
+    if not subject:
+        raise MergeGuardError(
+            "--subject 不能为空：合并提交标题必填（空标题会让 git 把 merged-by 行当标题）"
+        )
+    for char in subject:
+        if char in ("\n", "\r"):
+            raise MergeGuardError(
+                f"--subject {subject!r} 不能含换行字符：--subject 只收单行标题，"
+                "正文（认账三字段）请放进 --body-file"
+            )
+    if not subject.strip():
+        raise MergeGuardError(
+            f"--subject {subject!r} 去掉首尾空白后为空：合并提交标题必填"
+        )
+    return subject
+
+
+def read_body_file(raw: str) -> str:
+    """读 ``--body-file`` 并校验：非空路径 / 存在 / 普通文件 / 严格 UTF-8 / 非空文件。
+
+    为什么逐条判、不用 ``Path.read_text()`` 一把梭：``read_text`` 对「不存在」「是目录」
+    「非 UTF-8」抛的是三种不同异常（``FileNotFoundError`` / ``IsADirectoryError`` /
+    ``UnicodeDecodeError``），漏一种就冒 traceback；裸冒 traceback 是 rc1，而 rc1 是
+    「未达成」专用码 —— 参数错的合并请求绝不许落到它上面。
+    """
+
+    if not raw:
+        raise MergeGuardError(
+            "--body-file 路径为空：要的是认账 body 文件（三行 trailer："
+            "merged-by / merge-card / merge-pr）"
+        )
+    try:
+        info = os.stat(raw)
+    except FileNotFoundError as exc:
+        raise MergeGuardError(f"--body-file 文件不存在: {raw}") from exc
+    except OSError as exc:
+        raise MergeGuardError(f"--body-file 无法读取 {raw}: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise MergeGuardError(
+            f"--body-file 不是普通文件: {raw}（要的是含认账三字段的文本文件）"
+        )
+    try:
+        with open(raw, "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        raise MergeGuardError(f"--body-file 无法读取 {raw}: {exc}") from exc
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MergeGuardError(
+            f"--body-file 不是严格 UTF-8 文本: {raw}（第 {exc.start} 字节起解码失败）"
+        ) from exc
+    if not text:
+        raise MergeGuardError(f"--body-file 是空文件: {raw}（认账 body 必须含三行 trailer）")
+    return text
+
+
+def validate_accounting(args: argparse.Namespace, pr: int) -> Accounting | None:
+    """校验认账四参数；``--verify-only`` 时返回 ``None``（且一个都不许给）。
+
+    全部在 :func:`validate` 里跑完 —— 即 ``ensure_branch_present()`` 之前，零 ``gh``
+    调用、零 ``git ls-remote``。任一不满足 → ``MergeGuardError``（rc2、stdout 空、
+    stderr 恰一行）。
+
+    正则一律复用 :mod:`team_board.merges`（``MERGE_CARD_RE`` / ``MERGE_BY_RE``）与
+    ``check_message``，**不在本模块复制一份** —— 两份口径迟早会分叉，而分叉的那一侧
+    会让合并提交通过本工具、却被 ``merge-audit --require`` 判红。
+    """
+
+    given = [
+        flag
+        for flag, value in (
+            ("--card", args.card),
+            ("--by", args.by),
+            ("--subject", args.subject),
+            ("--body-file", args.body_file),
+        )
+        if value is not None
+    ]
+    if args.verify_only:
+        if given:
+            raise MergeGuardError(
+                f"--verify-only 与 {'/'.join(given)} 互斥：verify-only 不合并、"
+                "不产生合并提交，给了认账参数说明调用方误判"
+            )
+        return None
+
+    for flag in ACCOUNTING_FLAGS:
+        value = {
+            "--card": args.card,
+            "--by": args.by,
+            "--subject": args.subject,
+            "--body-file": args.body_file,
+        }[flag]
+        if value is None:
+            raise MergeGuardError(
+                f"合并命令缺少 {flag}（合并提交必须带认账三字段 merged-by / merge-card / "
+                "merge-pr；没有 --subject / --body-file 时 gh 用默认文案，合出来的提交"
+                "过不了 merge-audit --require）"
+            )
+
+    card = args.card
+    if MERGE_CARD_RE.fullmatch(card) is None:
+        raise MergeGuardError(
+            f"--card 形态非法：{card!r}（应为 t_ 加 8 位小写十六进制，例 t_1234abcd）"
+        )
+    by = args.by
+    if MERGE_BY_RE.fullmatch(by) is None:
+        raise MergeGuardError(
+            f"--by 形态非法：{by!r}（应为 <profile>/run<NNN>，例 pm/run200）"
+        )
+    subject = check_subject(args.subject)
+    body_file = args.body_file
+    body = read_body_file(body_file)
+
+    problems = check_message(body, card=card, by=by, pr=pr)
+    if problems:
+        detail = "；".join(f"{problem.kind}：{problem.detail}" for problem in problems)
+        raise MergeGuardError(
+            f"--body-file 内容不合认账字段要求（{body_file}）：{detail}；"
+            "可先用 team-board merge-record 生成 body"
+        )
+    return Accounting(card=card, by=by, subject=subject, body_file=body_file)
+
+
 def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
     """解析 ``gh pr view --json number,state,headRefName,baseRefName``。"""
 
@@ -874,6 +1086,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="不合并，只验证远端分支是否已删（巡检 / 取红样例用）",
     )
+    parser.add_argument(
+        "--card",
+        default=None,
+        metavar="CARD",
+        help=(
+            "必填（合并模式）：合并提交的 merge-card（形如 t_1234abcd）；"
+            "--verify-only 时不许给"
+        ),
+    )
+    parser.add_argument(
+        "--by",
+        default=None,
+        metavar="WHO",
+        help=(
+            "必填（合并模式）：合并提交的 merged-by（形如 pm/run200）；"
+            "--verify-only 时不许给"
+        ),
+    )
+    parser.add_argument(
+        "--subject",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "必填（合并模式）：合并提交标题（单行非空白，含换行 → rc2）；"
+            "--verify-only 时不许给"
+        ),
+    )
+    parser.add_argument(
+        "--body-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "必填（合并模式）：认账 body 文件（含 merged-by / merge-card / merge-pr 三行 "
+            "trailer，由 team-board merge-record --body-out 生成）；--verify-only 时不许给"
+        ),
+    )
     return parser
 
 
@@ -890,6 +1138,8 @@ class Options:
     interval: int
     command_timeout: int
     verify_only: bool
+    #: 认账四参数（仅合并模式有值；``--verify-only`` 恒为 ``None``）
+    accounting: Accounting | None = None
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -907,6 +1157,9 @@ def validate(args: argparse.Namespace) -> Options:
     # 形态校验排在 --pr / --repo / 一切 gh / git 调用之前：畸形分支名一条外部命令都不发
     check_branch_shape(branch)
     pr = parse_positive_int("--pr", args.pr, maximum=MAX_PR)
+    # 认账四参数：形态、body 文件、body 内容全部在这里判完 —— 即一次 gh / git 调用之前。
+    # --verify-only 与它们互斥（见 validate_accounting）。
+    accounting = validate_accounting(args, pr)
     check_branch_is_not_main(branch)
     timeout = parse_positive_int("--timeout", args.timeout, maximum=MAX_TIMEOUT)
     interval = parse_positive_int("--interval", args.interval, maximum=MAX_INTERVAL)
@@ -936,6 +1189,7 @@ def validate(args: argparse.Namespace) -> Options:
         interval=interval,
         command_timeout=command_timeout,
         verify_only=bool(args.verify_only),
+        accounting=accounting,
     )
 
 
@@ -1160,6 +1414,11 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
 def _run_merge(opts: Options) -> tuple[list[str], int]:
     """分支存在预检 → gh 预检 → 合并 → 删除验证。"""
 
+    accounting = opts.accounting
+    if accounting is None:  # pragma: no cover - validate 已拦住（合并模式必填）
+        raise MergeGuardError(
+            "合并模式缺少认账参数 --card/--by/--subject/--body-file（内部错误）"
+        )
     # 合并**前**的「源分支必须存在」闸门：排在所有 gh 调用之前，失败即 rc2 且 stdout 空。
     presence = ensure_branch_present(opts)
     view_argv = (
@@ -1213,22 +1472,17 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
     ]
 
-    merge_argv = (
-        "gh",
-        "pr",
-        "merge",
-        str(opts.pr),
-        f"--{opts.method}",
-        "--delete-branch",
-        # 钉住预检看到的那个提交：预检到合并之间被 force-push / 追加提交时，
-        # gh 自己会拒（非 0），工具拿不到「合并 | PASS」+ rc0。
-        "--match-head-commit",
+    merge_argv_value = merge_argv(
+        opts.pr,
+        opts.method,
         info.head_oid,
+        accounting.subject,
+        accounting.body_file,
     )
     # 从这一行起合并随时可能已经发生：任何异常都必须带着上面那条「预检 | PASS」
     # （以及合并成功后的「合并 | PASS」）走 rc2，不许落 rc1、不许冒 traceback。
     with _keep_evidence(lines):
-        merge = _run(merge_argv, cwd=opts.repo, timeout=opts.command_timeout)
+        merge = _run(merge_argv_value, cwd=opts.repo, timeout=opts.command_timeout)
         if merge.returncode != 0:
             if _match_head_unsupported(merge):
                 # 老版本 gh 不认这个 flag：它在解析 argv 时就退出，**合并没发生**。

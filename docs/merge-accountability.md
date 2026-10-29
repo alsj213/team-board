@@ -146,9 +146,12 @@ gh pr checks NN -R alsj213/team-board; echo "rc=$?"          # rc=0；no checks 
 gh pr view NN -R alsj213/team-board --json headRefName        # 必须是 wt/t_xxx
 # 卡上 R3 证据（本机实跑命令 + 真实退出码）齐
 
-# 3. 合并（body-file 带进合并提交 message）
-gh pr merge NN -R alsj213/team-board --merge \
-  --subject "<subject>" --body-file /tmp/t_xxx-merge-body.txt
+# 3. 合并（唯一入口 merge_guard：--body-file 带进合并提交 message，认账三字段随命令走）
+python -m team_board.merge_guard --pr NN --branch wt/t_xxx --method merge --delete-branch \
+  --card t_xxx --by pm/runNNN --subject "<subject>" \
+  --body-file /tmp/t_xxx-merge-body.txt; echo "rc=$?"
+# --subject / --body-file 缺任一项即 rc2、零 gh 调用：不带它们时 gh 用默认文案生成合并
+# 提交，message 里没有任何 trailer，第 5 步的 merge-audit --require 必红。
 
 # 4. 记 sha
 gh pr view NN -R alsj213/team-board --json mergeCommit
