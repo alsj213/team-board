@@ -25,6 +25,18 @@
 「合并失败」。gh 自己的 stderr 警告（如 worktree 里 ``failed to delete local branch``）
 同样不算失败 —— 判定只看远端。
 
+合并前钉到提交，不只钉分支名
+--------------------------
+``gh pr view`` 除了 ``state`` / ``headRefName`` 还要读 ``headRefOid``（40 或 64 位十六
+进制，缺字段或格式不对一律 rc2），并让 ``gh pr merge`` 带上
+``--match-head-commit <sha>``。原因：预检（读到 ``OPEN`` + ``headRefName``）与 ``gh pr
+merge`` 之间隔着一次网络往返，期间源分支可能被 force-push / 追加提交 —— 只比分支名
+时，合进去的是预检**从未见过**的提交，工具却照样打「预检 | PASS」「合并 | PASS」+
+rc0。预检通过时把 sha 记进证据（``head sha | PASS | <sha>``），合并时由 gh 自己比对：
+head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown flag:
+--match-head-commit`` → rc2、stderr 一行、stdout 空，**不许**静默降级成「不带 sha
+合并」（那等于把 check-then-act 的洞重新打开）。
+
 合并方式只认一种
 ----------------
 ``--method`` 只接受 ``merge``（默认值就是 ``merge``，可省略）。``squash`` / ``rebase``
@@ -44,6 +56,7 @@
   ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
+  ``headRefOid`` 缺失或不是 40/64 位十六进制、gh 不支持 ``--match-head-commit``、
   源分支在远端**不存在**、PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、
   gh/git 输出不是 UTF-8、stdout 编码表示不了中文、子命令超时、合并后通信持续失败
   导致无法判定。
@@ -116,6 +129,8 @@ PROBE_TIMEOUT_RC = -1
 
 STEP_BRANCH_PRESENT = "分支存在"
 STEP_PREFLIGHT = "预检"
+#: 预检读到的 head 提交（钉住「合并的到底是哪个提交」，见模块 docstring）
+STEP_HEAD_SHA = "head sha"
 STEP_MERGE = "合并"
 STEP_DELETE = "分支删除"
 
@@ -135,11 +150,25 @@ MISSING_DELETE_BRANCH = (
 #: 只认 ASCII 十进制：``int()`` 认空白、正负号、下划线与非 ASCII 数字
 _DIGITS = re.compile(r"[0-9]+", re.ASCII)
 
-_PR_VIEW_FIELDS = "number,state,headRefName,baseRefName"
+#: ``gh pr view`` 要的字段：``headRefOid`` 是「合并前钉到提交」的凭据
+_PR_VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
+
+#: 合法提交 SHA：40 位（SHA-1）或 64 位（SHA-256）十六进制
+_HEAD_OID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 
 
 class MergeGuardError(Exception):
     """参数 / 环境级错误，CLI 转 rc2（stderr ``错误: …``，stdout 空）。"""
+
+
+class UnsupportedMatchHeadCommit(MergeGuardError):
+    """``gh pr merge`` 不认 ``--match-head-commit``（老版本 gh）。
+
+    单独一个类是为了**不被** :func:`_keep_evidence` 包装成 :class:`PartialFailure`：
+    gh 在解析 argv 阶段就退出，合并**一定没发生**，所以 stdout 必须保持空（rc2 档的
+    契约），只留 stderr 一行。也**不许**降级成「不带 sha 合并」—— 那就把预检到合并
+    之间 check-then-act 的洞又打开了。
+    """
 
 
 class CommandTimeout(MergeGuardError):
@@ -202,12 +231,14 @@ class CommandResult:
 
 @dataclass(frozen=True)
 class Preflight:
-    """``gh pr view`` 里本工具关心的四个字段。"""
+    """``gh pr view`` 里本工具关心的五个字段。"""
 
     number: int
     state: str
     head_ref: str
     base_ref: str
+    #: 预检时源分支的 head 提交；合并命令要用它钉住「合的是哪一个提交」
+    head_oid: str
 
 
 @dataclass(frozen=True)
@@ -438,10 +469,15 @@ def ls_remote_argv(repo: str, remote: str, branch: str) -> tuple[str, ...]:
     )
 
 
-def make_probe(
-    repo: str, remote: str, branch: str, *, timeout: float
-) -> Callable[[], CommandResult]:
-    """返回一个无参探针：每次调用跑一次 ``git ls-remote``（``timeout`` 秒硬超时）。
+class Probe:
+    """一次 ``git ls-remote`` 探针；每次调用只肯等「剩余总预算」。
+
+    ``--timeout`` 在 README 里是**总**等待预算（「总等待不超过 ``--timeout``」），而单次
+    子命令只受 ``--command-timeout`` 约束 —— 两者一叠加，``--timeout 1
+    --command-timeout 60`` 遇到一次卡 3 秒的 ``git`` 会实打实跑 3.1 秒，声明就不再成立。
+    所以轮询每轮调 :meth:`with_limit`，把「还剩多少预算」交给探针，探针取
+    ``min(--command-timeout, 剩余预算)`` 作为这一次的超时；剩余预算 ≤ 0 时轮询器根本
+    不调用探针（不起子进程）。
 
     探针超时**不等于**判定：转成退出码 :data:`PROBE_TIMEOUT_RC` 的
     ``CommandResult``，由 :func:`classify_probe_rc` 判成 :data:`PROBE_ERROR`
@@ -449,19 +485,49 @@ def make_probe(
     其它环境错误（``git`` 不在 ``PATH``、输出不是 UTF-8）照旧 ``MergeGuardError``。
     """
 
-    def probe() -> CommandResult:
-        argv = ls_remote_argv(repo, remote, branch)
-        try:
-            return _run(argv, cwd=repo, timeout=timeout)
-        except CommandTimeout as exc:
-            return CommandResult(
-                argv=argv,
-                returncode=PROBE_TIMEOUT_RC,
-                stdout="",
-                stderr=f"{exc}\n",
-            )
+    def __init__(self, repo: str, remote: str, branch: str, *, timeout: float) -> None:
+        self.repo = repo
+        self.remote = remote
+        self.branch = branch
+        #: ``--command-timeout``：单次子命令的硬上限（永远不越过它）
+        self.timeout = timeout
 
-    return probe
+    def with_limit(self, limit: float) -> Callable[[], CommandResult]:
+        """返回一个「最多等 ``min(--command-timeout, limit)`` 秒」的无参探针。"""
+
+        budget = min(float(self.timeout), max(0.0, float(limit)))
+        argv = ls_remote_argv(self.repo, self.remote, self.branch)
+
+        def probe() -> CommandResult:
+            if budget <= 0:  # 兜底：调用方本该在预算耗尽时直接判「无法判定」
+                return CommandResult(
+                    argv=argv,
+                    returncode=PROBE_TIMEOUT_RC,
+                    stdout="",
+                    stderr="--timeout 总预算已用完，未执行 git ls-remote\n",
+                )
+            try:
+                return _run(argv, cwd=self.repo, timeout=budget)
+            except CommandTimeout as exc:
+                return CommandResult(
+                    argv=argv,
+                    returncode=PROBE_TIMEOUT_RC,
+                    stdout="",
+                    stderr=f"{exc}\n",
+                )
+
+        return probe
+
+    def __call__(self) -> CommandResult:
+        """按 ``--command-timeout`` 全量调用（没有预算约束时的用法）。"""
+
+        return self.with_limit(self.timeout)()
+
+
+def make_probe(repo: str, remote: str, branch: str, *, timeout: float) -> Probe:
+    """造一个 :class:`Probe`（``timeout`` = ``--command-timeout``）。"""
+
+    return Probe(repo, remote, branch, timeout=timeout)
 
 
 def classify_probe_rc(rc: int) -> str:
@@ -479,22 +545,72 @@ def classify_probe_rc(rc: int) -> str:
     return PROBE_ERROR
 
 
+def _call_probe(probe: Callable[..., CommandResult], limit: float) -> CommandResult:
+    """按剩余预算调用探针。
+
+    有 ``with_limit``（本模块的 :class:`Probe`）就夹到剩余预算；测试里塞进来的裸函数
+    照原样零参调用 —— 预算闸门由本函数的调用方（:func:`poll_branch_deleted`）先判一遍。
+    """
+
+    factory: Callable[[float], Callable[[], CommandResult]] | None = getattr(
+        probe, "with_limit", None
+    )
+    if factory is not None:
+        probe_fn = factory(limit)
+        return probe_fn()
+    return probe()
+
+
 def poll_branch_deleted(
-    probe: Callable[[], CommandResult],
+    probe: Callable[..., CommandResult],
     *,
     timeout: int,
     interval: int,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> PollResult:
-    """轮询 ``probe`` 直到确认分支已删或超时；总等待不超过 ``timeout`` 秒。"""
+    """轮询 ``probe`` 直到确认分支已删或总预算用完；**总等待不超过 ``timeout`` 秒**。
+
+    ``timeout`` 是总预算，不是「每轮各等这么长」：
+
+    - 每次探针的超时 = ``min(--command-timeout, 剩余预算)``（见 :class:`Probe`），
+      所以一次卡住的 ``git`` 最多只吃掉剩余预算，不会把整条命令拖成
+      ``--timeout + --command-timeout``；
+    - 剩余预算 ≤ 0 时**不再起子进程**：已有明确结论（上一轮 ``rc=0`` = 分支还在）就按
+      它返回，否则判「无法判定」并说清 ``--timeout`` 已用完。
+    """
 
     deadline = clock() + timeout
     probes = 0
     errors = 0
+    last: CommandResult | None = None
     while True:
-        proc = probe()
+        remaining = deadline - clock()
+        if probes and remaining <= 0:
+            # 预算已用完：不许再起子进程（超时传 0 的 subprocess 语义是「立即超时」，
+            # 那只会把「判不了」伪装成一次通信错误）。
+            last_rc = last.returncode if last is not None else PROBE_TIMEOUT_RC
+            if last is not None and classify_probe_rc(last.returncode) == PROBE_PRESENT:
+                return PollResult(
+                    outcome=OUT_PRESENT,
+                    probes=probes,
+                    returncode=last_rc,
+                    key=key_line(last),
+                )
+            return PollResult(
+                outcome=OUT_UNDETERMINED,
+                probes=probes,
+                returncode=last_rc,
+                key=key_line(last) if last is not None else "(无探针输出)",
+                reason=(
+                    f"共 {probes} 次检查、其中 {errors} 次通信错误，"
+                    f"最后一次退出码 {last_rc}；"
+                    f"--timeout={timeout} 秒总预算已用完，未再起新探针"
+                ),
+            )
+        proc = _call_probe(probe, remaining)
         probes += 1
+        last = proc
         kind = classify_probe_rc(proc.returncode)
         if kind == PROBE_DELETED:
             return PollResult(
@@ -521,7 +637,8 @@ def poll_branch_deleted(
                 key=key_line(proc),
                 reason=(
                     f"共 {probes} 次检查、其中 {errors} 次通信错误，"
-                    f"最后一次退出码 {proc.returncode}"
+                    f"最后一次退出码 {proc.returncode}；"
+                    f"--timeout={timeout} 秒总预算已用完"
                 ),
             )
         sleep(min(float(interval), remaining))
@@ -571,6 +688,7 @@ def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
         state = payload["state"]
         head_ref = payload["headRefName"]
         base_ref = payload["baseRefName"]
+        head_oid = payload["headRefOid"]
     except KeyError as exc:
         raise MergeGuardError(
             f"gh pr view {pr} 的输出缺少字段 {exc.args[0] if exc.args else '?'}"
@@ -581,7 +699,18 @@ def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
         base_ref, str
     ):
         raise MergeGuardError(f"gh pr view {pr} 的 state/headRefName/baseRefName 不是字符串")
-    return Preflight(number=number, state=state, head_ref=head_ref, base_ref=base_ref)
+    if not isinstance(head_oid, str) or not _HEAD_OID.fullmatch(head_oid):
+        # 没有合法的 head sha 就没法钉住「合的是哪个提交」——不许退回「只比分支名」
+        raise MergeGuardError(
+            f"gh pr view {pr} 的 headRefOid 不是 40/64 位十六进制提交 SHA: {head_oid!r}"
+        )
+    return Preflight(
+        number=number,
+        state=state,
+        head_ref=head_ref,
+        base_ref=base_ref,
+        head_oid=head_oid,
+    )
 
 
 # ------------------------------------------------------------------ 命令行
@@ -632,7 +761,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         default="60",
         metavar="SEC",
-        help=f"删除验证的最长等待秒数（默认 60，1–{MAX_TIMEOUT}）",
+        help=(
+            "删除验证的**总**等待秒数（默认 60，1–3600）；每次探针的超时取"
+            " min(--command-timeout, 剩余预算)，预算用完即判「无法判定」"
+        ),
     )
     parser.add_argument(
         "--interval",
@@ -805,6 +937,11 @@ def _keep_evidence(lines: list[str]) -> Iterator[None]:
         yield
     except PartialFailure:
         raise
+    except UnsupportedMatchHeadCommit:
+        # gh 在解析 argv 时就拒了 --match-head-commit，合并一定没发生：
+        # 证据行（分支存在 / 预检 / head sha）留着只会让人读成「合了一半」，
+        # 所以原样抛出，main 按「合并前 rc2」处理（stdout 空、stderr 一行）。
+        raise
     except CommandTimeout as exc:
         raise PartialFailure(
             f"{exc}；合并是否已发生无法确认，请人工核对 PR 状态，不要直接重跑合并",
@@ -843,6 +980,28 @@ def ensure_branch_present(opts: Options) -> CommandResult:
             f"{key_line(proc)}；合并前源分支必须先存在，拒绝合并"
         )
     return proc
+
+
+#: gh / cobra 报「不认识这个 flag」的几种原文（大小写不敏感）
+_UNSUPPORTED_FLAG_HINTS: tuple[str, ...] = (
+    "unknown flag",
+    "unknown shorthand flag",
+    "flag provided but not defined",
+)
+
+
+def _match_head_unsupported(proc: CommandResult) -> bool:
+    """``gh pr merge`` 是否明确报了「不认 ``--match-head-commit``」。
+
+    只在**同一次输出里**同时出现 flag 名与「unknown flag」这类原文时才判真：
+    普通的合并失败（分支保护、非快进、删本地分支失败）不许被误判成环境错误，
+    那会把 rc1「合并失败」改成 rc2。
+    """
+
+    text = f"{proc.stdout}\n{proc.stderr}".lower()
+    if "--match-head-commit" not in text:
+        return False
+    return any(hint in text for hint in _UNSUPPORTED_FLAG_HINTS)
 
 
 def fetch_pr_state(opts: Options) -> str | None:
@@ -959,6 +1118,8 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
                 f"baseRefName={info.base_ref}"
             ),
         ),
+        # 预检钉到**提交**：这条 sha 就是合并时交给 --match-head-commit 的那个值。
+        f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
     ]
 
     merge_argv = (
@@ -968,12 +1129,27 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         str(opts.pr),
         f"--{opts.method}",
         "--delete-branch",
+        # 钉住预检看到的那个提交：预检到合并之间被 force-push / 追加提交时，
+        # gh 自己会拒（非 0），工具拿不到「合并 | PASS」+ rc0。
+        "--match-head-commit",
+        info.head_oid,
     )
     # 从这一行起合并随时可能已经发生：任何异常都必须带着上面那条「预检 | PASS」
     # （以及合并成功后的「合并 | PASS」）走 rc2，不许落 rc1、不许冒 traceback。
     with _keep_evidence(lines):
         merge = _run(merge_argv, cwd=opts.repo, timeout=opts.command_timeout)
         if merge.returncode != 0:
+            if _match_head_unsupported(merge):
+                # 老版本 gh 不认这个 flag：它在解析 argv 时就退出，**合并没发生**。
+                # 先反查一次 PR 状态兜底（万一真是合并后报的这句），仍不是 MERGED
+                # 就按「合并前 rc2」处理 —— 绝不允许退回「不带 sha 合并」。
+                state = fetch_pr_state(opts)
+                if state != "MERGED":
+                    raise UnsupportedMatchHeadCommit(
+                        "gh pr merge 不接受 --match-head-commit"
+                        f"（{key_line(merge)}）：本工具不提供不带 head sha 的合并路径，"
+                        "请升级 gh（2.103.3 起支持）或人工核对 PR 状态"
+                    )
             # gh 非 0 **不等于**合并失败：2.103.3 的 mergeRun 是 merge() → 删本地分支
             # → 删远端分支，删本地分支失败就返回非 0，那时 PR 已合、远端分支还没删。
             # 所以先反查 PR 状态，再决定是「合并失败」还是「合并已发生」。

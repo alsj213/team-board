@@ -298,9 +298,17 @@ python3 -m team_board.merge_guard \
   `gh pr view` 之前）。没有这一步，「这个 ref 从来没存在过」会被出口判定读成「已删除」：
   PR 来自 fork（gh 不删 fork 侧分支，探针在本仓 origin 上必然 rc2）或 `--remote` 指到
   另一个没有该分支的 remote 时，这条误判必现。
-- 合并前预检 `gh pr view <pr> --json number,state,headRefName,baseRefName`：`state`
-  必须是 `OPEN`、`headRefName` 必须与 `--branch` **逐字相等**，否则 rc2 并说清实际值。
-- 合并只用 `gh pr merge <pr> --<method> --delete-branch`。**gh 返回非 0 不等于合并失败**：
+- 合并前预检 `gh pr view <pr> --json
+  number,state,headRefName,baseRefName,headRefOid`：`state` 必须是 `OPEN`、
+  `headRefName` 必须与 `--branch` **逐字相等**，`headRefOid` 必须是 40 位（SHA-1）或
+  64 位（SHA-256）十六进制提交 SHA —— 缺字段或格式不对一律 rc2，说清实际值。预检通过
+  后把提交钉进证据：`head sha | PASS | <sha>`。
+- 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>`
+  （`<sha>` = 预检读到的 `headRefOid`）。只比分支名不约束内容：预检到合并之间源分支被
+  force-push / 追加提交时，合的会是预检**从未见过**的提交，工具却照样打 PASS + rc0。
+  带上 `--match-head-commit` 后由 gh 自己比对，head 变了直接拒。老版本 gh 报
+  `unknown flag: --match-head-commit` → **rc2**、stdout 空、stderr 一行，**不许**静默
+  降级成「不带 sha 合并」。**gh 返回非 0 不等于合并失败**：
   2.103.3 的 `mergeRun` 顺序是 `merge()` → `deleteLocalBranch()` → `deleteRemoteBranch()`，
   删本地分支失败就返回非 0（`failed to delete local branch …`），而那时 PR 已合、远端
   分支还没删。所以非 0 之后必须 `gh pr view <pr> --json state` 反查：
@@ -310,7 +318,10 @@ python3 -m team_board.merge_guard \
 - 合并后的唯一判据是轮询
   `git -C <repo> ls-remote --exit-code --refs <remote> refs/heads/<branch>`：`rc=0` =
   分支仍在远端、`rc=2` = 没有这个 ref（已删除**或从未存在过**，单看这一步分不出来）、
-  其它 rc = 判不了（记一次继续轮询）。轮询间隔 `--interval`，总等待不超过 `--timeout`。
+  其它 rc = 判不了（记一次继续轮询）。轮询间隔 `--interval`，总等待不超过 `--timeout`：
+  `--timeout` 是**总**预算 —— 每次探针的超时 = `min(--command-timeout, 剩余预算)`，
+  剩余预算 ≤ 0 时不再起子进程，直接按「无法判定」收尾（合并路径 rc2、`--verify-only`
+  rc1），所以一次卡住的 `git` 不会把总耗时顶成 `--timeout + --command-timeout`。
 - `--verify-only`：不合并，只回答「远端分支**现在**在不在」，**一次 gh 都不调**
   （巡检 / 取红样例用）。它**不能**证明「曾经存在并被删」：远端没有这个 ref 时结论是
   `结论：远端没有这个 ref（已删除，或从未存在过）`，rc 仍是 0 —— 要证明「被删」，
@@ -327,6 +338,7 @@ python3 -m team_board.merge_guard \
   `rebase`）。也包含：`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
   **合并前源分支在远端不存在**、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、
+  `headRefOid` 缺失或不是 40/64 位十六进制、gh 不支持 `--match-head-commit`、
   PR 不是 `OPEN`、`PATH` 里没有 `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示
   不了中文、收到 `SIGTERM` / `SIGINT` / `SIGHUP`（转成「无法判定」收尾），以及
   **合并已发生但通信持续失败导致判不了**（这一种不算 1：判不了就是未通过，
@@ -353,13 +365,15 @@ stdout 失败」，`141` 是 SIGPIPE）。
 「没合并、可以重跑」。
 
 输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
-`分支存在` / `预检` / `合并` / `分支删除`（按执行顺序），末行固定 `结论：` 前缀。下面这段
-是假 gh / 假 git 跑出来的端到端样例（真仓库只有路径那段不同）：
+`分支存在` / `预检` / `合并` / `分支删除`（按执行顺序；预检后另有一行 `head sha | PASS |
+<sha>` 记下钉住的提交），末行固定 `结论：` 前缀。下面这段是假 gh / 假 git 跑出来的端到端
+样例（真仓库只有路径与 sha 那段不同）：
 
 ```
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
-预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
-合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | (无输出)
+预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
+head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
+合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 | rc=0 | (无输出)
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
 ```

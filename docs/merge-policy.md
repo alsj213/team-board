@@ -19,7 +19,8 @@ python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --
 ```
 
 `--method` 只允许取 `merge`；`squash` / `rebase` 一律拒绝（该 CLI 落地时按本条写死默认值与合法值域）。
-**在 `merge_guard` 落地之前**（它现在还在 `scheduled`，`main` 上没有这个文件），过渡期用平台命令原文，不许用别的：
+**`merge_guard` 已强制**（合并入口只有 ② 与模板 ⑦ 那同一条命令，脚本是 `src/team_board/merge_guard.py`，PR #20 已落地）：
+下面的平台命令原文只作历史对照，**不许再用它合并**：
 
 ```
 gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
@@ -96,8 +97,8 @@ $ gh pr view <n> -R alsj213/team-board --json headRefName
    B 档另附 R9 夜间五条：CI rc=0 且非 no checks reported / 双问无 P1P2 / nfiles≤10 / 不碰凭据迁移删库且删除≤100 行 / R3 证据齐；夜间自合标 B·night
    C 档（或夜间撞「绝不做」四条）：不合并，标 [night-queue]，写「第 N 条不满足 + 实测输出」
 ⑦ 合并（R13 ②，唯一命令）：
-   有 merge_guard：python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch; echo rc=$?
-   无 merge_guard（过渡期）：gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
+   merge_guard 已强制（见 PR #20）：python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch; echo rc=$?
+   历史原文（已完成，勿用）：gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
 ⑧ 用的是哪一种（R13 ⑤，判本 PR 的合并提交）：
 $ sha=$(gh pr view <n> -R alsj213/team-board --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid'); echo "sha=$sha"
 $ git -C <checkout> cat-file -e "$sha" 2>/dev/null || git -C <checkout> fetch origin -q   # 本地没这个对象才 fetch；fetch 失败按 R10 ③

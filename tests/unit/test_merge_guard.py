@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections.abc import Callable
 
 import pytest
 
 from team_board import merge_guard as mg
+
+#: 假 ``gh pr view`` 报出来的 head 提交（40 位十六进制）
+HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
 
 
 class FakeClock:
@@ -90,7 +94,8 @@ def test_poll_present_until_timeout() -> None:
     assert result.outcome == mg.OUT_PRESENT
     assert result.returncode == 0
     assert "refs/heads/wt/t_bbeab29f" in result.key
-    assert len(calls) == result.probes == 4  # t=0,2,4,5
+    # t=0,2,4 各一次；t=5 预算为 0 → 不再起新探针，按上一次 rc=0 判「分支还在」
+    assert len(calls) == result.probes == 3
     assert sum(clock.slept) <= 5  # 总等待不超过 --timeout
     assert clock.slept == [2.0, 2.0, 1.0]  # 最后一次只睡剩余时间
 
@@ -138,7 +143,7 @@ def test_poll_only_errors_is_undetermined() -> None:
     assert result.returncode == 128
     assert "128" in result.reason
     assert "通信错误" in result.reason
-    assert len(calls) == result.probes == 3  # t=0,1,2
+    assert len(calls) == result.probes == 2  # t=0,1；t=2 预算为 0 → 不再起新探针
     assert sum(clock.slept) <= 2
 
 
@@ -153,8 +158,93 @@ def test_poll_single_shot_timeout() -> None:
     )
 
     assert result.outcome == mg.OUT_PRESENT
-    assert len(calls) == 2
+    assert len(calls) == 1  # t=1 时预算已为 0 → 不再起第二个探针
     assert sum(clock.slept) <= 1
+
+
+# ------------------- 总预算硬约束：--timeout 是「总」等待，不是「每次」等待
+#
+# 依据 README:313「总等待不超过 --timeout」。修之前单次探针只受 --command-timeout
+# 约束：--timeout 1 --command-timeout 60 + 一次卡 3 秒的 git → 3.1 秒才返回。
+
+def test_poll_budget_exhausted_skips_new_probe() -> None:
+    """预算用完就不再起子进程（FakeClock 已推进到终点）。"""
+
+    probe, calls = make_probe(0)
+    clock = FakeClock()
+
+    result = mg.poll_branch_deleted(
+        probe, timeout=2, interval=2, sleep=clock.sleep, clock=clock.now
+    )
+
+    assert result.outcome == mg.OUT_PRESENT  # 上一次 rc=0 已经是明确结论
+    assert len(calls) == result.probes == 1  # t=2 时没再探一次
+    assert clock.slept == [2.0]
+
+
+def test_poll_budget_exhausted_without_conclusion_is_undetermined() -> None:
+    """预算用完且没有明确结论 → 「无法判定」，理由里说清 --timeout 用完了。"""
+
+    probe, calls = make_probe(128)
+    clock = FakeClock()
+
+    result = mg.poll_branch_deleted(
+        probe, timeout=1, interval=1, sleep=clock.sleep, clock=clock.now
+    )
+
+    assert result.outcome == mg.OUT_UNDETERMINED
+    assert len(calls) == result.probes == 1
+    assert result.returncode == 128
+    assert "总预算" in result.reason
+    assert "128" in result.reason
+
+
+def test_probe_with_limit_never_exceeds_command_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``with_limit`` 只取小：剩余预算再大也不越过 ``--command-timeout``。"""
+
+    seen: list[float] = []
+
+    def fake_run(argv: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        seen.append(timeout)
+        raise mg.CommandTimeout("git 命令超时")
+
+    monkeypatch.setattr(mg, "_run", fake_run)
+
+    probe = mg.make_probe(".", "origin", "wt/x", timeout=1)
+    probe.with_limit(60)()
+    probe.with_limit(0.25)()
+
+    assert seen == [1, 0.25]
+
+
+def test_probe_timeout_clamped_to_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--timeout 1`` + 卡 3 秒的 git：总耗时 ≈ 1 秒（不是 command-timeout 的 60）。"""
+
+    seen: list[float] = []
+
+    def slow_run(argv: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        seen.append(timeout)
+        time.sleep(timeout)  # 模拟子进程一直不返回，直到耗尽允许的超时
+        raise mg.CommandTimeout(f"git 命令超时：{timeout:g} 秒内没有返回")
+
+    monkeypatch.setattr(mg, "_run", slow_run)
+
+    started = time.monotonic()
+    result = mg.poll_branch_deleted(
+        mg.make_probe(".", "origin", "wt/x", timeout=60), timeout=1, interval=1
+    )
+    elapsed = time.monotonic() - started
+
+    assert len(seen) == 1
+    assert 0 < seen[0] <= 1  # 被剩余预算夹住，不是 60（有微小时钟漂移）
+    assert elapsed <= 1.5
+    assert result.outcome == mg.OUT_UNDETERMINED
+    assert result.probes == 1
+    assert "总预算" in result.reason
 
 
 # ------------------------------------------------------- parse_positive_int
@@ -209,6 +299,7 @@ def test_parse_pr_view_ok() -> None:
             "state": "OPEN",
             "headRefName": "wt/t_f43fa954",
             "baseRefName": "main",
+            "headRefOid": HEAD_OID,
         }
     )
     info = mg.parse_pr_view(_view_proc(payload), 9)
@@ -217,6 +308,55 @@ def test_parse_pr_view_ok() -> None:
     assert info.state == "OPEN"
     assert info.head_ref == "wt/t_f43fa954"
     assert info.base_ref == "main"
+    assert info.head_oid == HEAD_OID  # 预检钉到提交：合并要用它 --match-head-commit
+
+
+@pytest.mark.parametrize(
+    "head_oid",
+    [
+        None,  # 字段缺失
+        "",  # 空串
+        "4f2a9c0",  # 7 位缩写
+        "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a",  # 39 位
+        "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2f",  # 41 位
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",  # 非十六进制
+        " 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2",  # 前导空格
+    ],
+    ids=["missing", "empty", "short", "39", "41", "non-hex", "leading-space"],
+)
+def test_parse_pr_view_rejects_bad_head_oid(head_oid: str | None) -> None:
+    """没有合法的 head sha 就不许合并（rc2）：只比分支名约束不了「合的哪个提交」。"""
+
+    payload: dict[str, object] = {
+        "number": 9,
+        "state": "OPEN",
+        "headRefName": "wt/t_f43fa954",
+        "baseRefName": "main",
+    }
+    if head_oid is not None:
+        payload["headRefOid"] = head_oid
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.parse_pr_view(_view_proc(json.dumps(payload)), 9)
+
+    assert "headRefOid" in str(excinfo.value)
+
+
+def test_parse_pr_view_accepts_sha256_length() -> None:
+    """SHA-256 仓库的 64 位 oid 也合法。"""
+
+    oid = "a" * 64
+    payload = json.dumps(
+        {
+            "number": 9,
+            "state": "OPEN",
+            "headRefName": "wt/t_x",
+            "baseRefName": "main",
+            "headRefOid": oid,
+        }
+    )
+
+    assert mg.parse_pr_view(_view_proc(payload), 9).head_oid == oid
 
 
 def test_parse_pr_view_not_json() -> None:
@@ -240,7 +380,13 @@ def test_parse_pr_view_missing_field() -> None:
 
 def test_parse_pr_view_number_not_int() -> None:
     payload = json.dumps(
-        {"number": True, "state": "OPEN", "headRefName": "x", "baseRefName": "main"}
+        {
+            "number": True,
+            "state": "OPEN",
+            "headRefName": "x",
+            "baseRefName": "main",
+            "headRefOid": HEAD_OID,
+        }
     )
     with pytest.raises(mg.MergeGuardError) as excinfo:
         mg.parse_pr_view(_view_proc(payload), 9)

@@ -23,6 +23,14 @@ from team_board import merge_guard as mg
 
 CARD_BRANCH = "wt/t_bbeab29f"
 
+#: 假 gh 的 ``pr view`` 报出来的 head 提交（40 位十六进制）：合并 argv 必须带它
+HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
+#: ``gh pr view`` 要的字段（``headRefOid`` 是「预检钉到提交」的凭据）
+VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
+VIEW_CALL = f"gh pr view 9 --json {VIEW_FIELDS}"
+#: 合并命令原文：分支名 + 钉住的 head 提交，一条都不许少
+MERGE_CALL = f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID}"
+
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
@@ -86,13 +94,23 @@ class Stub:
     def git_calls(self) -> list[str]:
         return [call for call in self.calls() if call.startswith("git ")]
 
-    def view(self, *, state: str = "OPEN", head: str = CARD_BRANCH, base: str = "main") -> None:
-        self.setenv(
-            "FAKE_VIEW_JSON",
-            json.dumps(
-                {"number": 9, "state": state, "headRefName": head, "baseRefName": base}
-            ),
-        )
+    def view(
+        self,
+        *,
+        state: str = "OPEN",
+        head: str = CARD_BRANCH,
+        base: str = "main",
+        head_oid: str | None = HEAD_OID,
+    ) -> None:
+        payload: dict[str, object] = {
+            "number": 9,
+            "state": state,
+            "headRefName": head,
+            "baseRefName": base,
+        }
+        if head_oid is not None:  # None = 故意让假 gh 少报 headRefOid
+            payload["headRefOid"] = head_oid
+        self.setenv("FAKE_VIEW_JSON", json.dumps(payload))
 
     def view_after_merge(self, *, state: str = "MERGED", rc: int = 0) -> None:
         """合并之后（``gh pr merge`` 已经跑过）的 ``gh pr view --json state`` 输出。"""
@@ -231,7 +249,7 @@ def test_merge_ok_but_branch_remains_rc1(
     assert "结论：合并成功但源分支仍在远端（合并不算完成）" in out
     assert "分支删除 | FAIL" in out
     assert out.splitlines()[0].startswith("分支存在 | PASS | git -C ")
-    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+    assert MERGE_CALL in stub.gh_calls()
     assert stub.git_calls()  # 确实做了远端判定
 
 
@@ -251,19 +269,164 @@ def test_merge_ok_and_branch_deleted_rc0(
         f"分支存在 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=0 | "
     )
-    assert lines[1].startswith(
-        "预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName | rc=0 | "
-    )
-    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | ")
-    assert lines[3].startswith(
+    assert lines[1].startswith(f"预检 | PASS | {VIEW_CALL} | rc=0 | ")
+    # 预检钉到提交：新增一行 head sha 证据（值是假 gh 报的 headRefOid）
+    assert lines[2] == f"head sha | PASS | {HEAD_OID}"
+    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | rc=0 | ")
+    assert lines[4].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
     )
     assert lines[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
     assert stub.gh_calls() == [
-        "gh pr view 9 --json number,state,headRefName,baseRefName",
-        "gh pr merge 9 --merge --delete-branch",
+        VIEW_CALL,
+        MERGE_CALL,
     ]
+
+
+# -------- 1c. 预检钉到提交（P2-3）：--match-head-commit + head sha 证据行
+#
+# 修之前：预检只比分支名，预检到合并之间被 force-push / 追加提交时，合的是预检从未
+# 见过的提交，工具照样 PASS + rc0。现在 gh pr view 读 headRefOid、合并命令带
+# --match-head-commit，预检通过后把 sha 记进证据。
+
+def test_merge_pins_head_sha(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """``gh pr merge`` 必须收到 ``--match-head-commit <headRefOid>``，并留一行 head sha 证据。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0
+    assert err == ""
+    assert f"head sha | PASS | {HEAD_OID}" in out  # 预检钉到提交的证据行
+    assert MERGE_CALL in stub.gh_calls()
+    # 每一次合并调用都必须带 sha：一条不带 sha 的重试都不许有
+    merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
+    assert merge_calls == [MERGE_CALL]
+
+
+def test_view_missing_head_oid_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """假 gh 少报 ``headRefOid`` → rc2、stdout 空、stderr 一行、绝不合并。"""
+
+    stub.view(head_oid=None)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "headRefOid" in err
+    assert "gh pr merge" not in " ".join(stub.gh_calls())
+
+
+@pytest.mark.parametrize(
+    "head_oid",
+    ["4f2a9c0", "zz" * 20, ""],
+    ids=["short", "non-hex", "empty"],
+)
+def test_view_bad_head_oid_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str], head_oid: str
+) -> None:
+    """``headRefOid`` 不是 40/64 位十六进制 → rc2（没有合法 sha 就不许合并）。"""
+
+    stub.view(head_oid=head_oid)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "gh pr merge" not in " ".join(stub.gh_calls())
+
+
+def test_old_gh_unknown_match_head_commit_rc2_no_downgrade(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """老版本 gh 报 ``unknown flag: --match-head-commit`` → rc2，**不许**降级合并。
+
+    判据：stdout 空、stderr 恰一行、只发过一次合并调用（就是带 sha 那次）、
+    合并后的删除验证一次都没跑。
+    """
+
+    stub.setenv("FAKE_MERGE_RC", "1")
+    stub.setenv("FAKE_MERGE_ERR", "unknown flag: --match-head-commit")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2  # 不是 1：环境不支持，判不了
+    assert out == ""  # 合并一定没发生 → 一个字的证据都不该有
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "--match-head-commit" in err
+    assert "不提供不带 head sha 的合并路径" in err
+    merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
+    assert merge_calls == [MERGE_CALL]  # 没有「不带 sha 再试一次」
+    assert len(stub.git_calls()) == 1  # 只有合并前那次存在性探针，没有删除验证
+
+
+# ------------------- 1d. --timeout 是总预算（P2-1）：单次卡住也不许击穿它
+#
+# 修之前：单次探针只受 --command-timeout 约束，--timeout 1 + 卡 3 秒的 git → 3.1s。
+
+def test_verify_only_timeout_is_total_budget(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--timeout 1`` + 单次 probe 3 秒 → 总耗时 ≤ ~1.5s，结论「无法判定」rc1。"""
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # 别让「第一次」跳过 sleep
+    stub.setenv("FAKE_GIT_SLEEP", "3")
+    stub.setenv("FAKE_LS_REMOTE_RC", "128")
+
+    started = time.monotonic()
+    rc, out, err = run(
+        args_for(
+            stub,
+            "--verify-only",
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+            "--command-timeout",
+            "60",
+        ),
+        capsys,
+    )
+    elapsed = time.monotonic() - started
+
+    assert rc == 1  # --verify-only 的「无法判定」按现有口径是 1
+    assert err == ""
+    assert elapsed <= 1.5  # 不许跑满 3 秒
+    assert "结论：无法判定" in out
+    assert "总预算" in out
+
+
+def test_merge_path_timeout_is_total_budget_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """合并已发生后删除验证卡住 + ``--timeout 1`` → rc2（判不了），耗时 ≈ 1 秒。"""
+
+    stub.setenv("FAKE_GIT_SLEEP", "3")
+    stub.setenv("FAKE_LS_REMOTE_RC", "128")  # 第 2 次起的探针：睡满再报通信错误
+
+    started = time.monotonic()
+    rc, out, err = run(
+        args_for(stub, "--timeout", "1", "--interval", "1", "--command-timeout", "60"),
+        capsys,
+    )
+    elapsed = time.monotonic() - started
+
+    assert rc == 2  # 合并已发生但判不了 → rc2，不是 1
+    assert elapsed <= 1.5
+    assert f"合并 | PASS | {MERGE_CALL}" in out  # 证据必须留住
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "无法判定" in err
+    assert "总预算" in err
 
 
 # ------------------------------- 3b. --method 只认 merge（R13）：默认值 + 拒绝两值
@@ -294,10 +457,10 @@ def test_method_defaults_to_merge_without_flag(
 
     assert rc == 0
     assert err == ""
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | " in out
+    assert f"合并 | PASS | {MERGE_CALL} | rc=0 | " in out
     assert stub.gh_calls() == [
-        "gh pr view 9 --json number,state,headRefName,baseRefName",
-        "gh pr merge 9 --merge --delete-branch",
+        VIEW_CALL,
+        MERGE_CALL,
     ]
 
 
@@ -352,7 +515,7 @@ def test_merge_failure_rc1_and_no_verification(
     # 只有合并前那一次「源分支存在」探针，合并后一次删除验证都没跑
     assert len(stub.git_calls()) == 1
     assert stub.git_calls()[0].startswith("git -C ")
-    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+    assert MERGE_CALL in stub.gh_calls()
     assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
     assert "合并 | FAIL" in out
     assert "合并失败" in out
@@ -381,7 +544,7 @@ def test_merge_gh_nonzero_but_state_merged_then_verification_deleted_rc0(
     assert rc == 0
     assert "合并失败" not in out
     assert "gh pr view 9 --json state" in stub.gh_calls()
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=1 | " in out
+    assert f"合并 | PASS | {MERGE_CALL} | rc=1 | " in out
     assert "PR 状态已是 MERGED" in out
     assert "分支删除 | PASS | " in out
     assert out.splitlines()[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
@@ -420,7 +583,7 @@ def test_merge_gh_nonzero_state_undetermined_rc2_keeps_evidence(
     assert rc == 2  # 不是 1
     assert "合并失败" not in out
     assert out.splitlines()[0].startswith("分支存在 | PASS | ")
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert f"合并 | PASS | {MERGE_CALL}" in out
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
     assert "无法判定" in err
@@ -468,6 +631,9 @@ def test_verify_only_branch_deleted_rc0(
     """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
+    # --verify-only 没有「合并前存在性」那道闸门：别让第一次调用被 FIRST_RC 抢走
+    # （否则第一次报「分支在」，--timeout 1 的预算就只够一次探针，结论变成 rc1）
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")
 
     rc, out, err = run(args_for(stub, "--verify-only"), capsys)
 
@@ -483,6 +649,7 @@ def test_verify_only_undetermined_rc1(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
     stub.setenv("FAKE_LS_REMOTE_RC", "128")
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # 同上：第一次就该是 128，不是「分支在」
 
     rc, out, _err = run(args_for(stub, "--verify-only"), capsys)
 
@@ -549,7 +716,10 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
 
     assert rc == 0
     # 未传 --method → 默认 merge（gh 收到的是 --merge）
-    assert "gh pr merge 999999999 --merge --delete-branch" in stub.gh_calls()
+    assert (
+        f"gh pr merge 999999999 --merge --delete-branch --match-head-commit {HEAD_OID}"
+        in stub.gh_calls()
+    )
     assert "结论：合并完成" in out
 
 
@@ -607,7 +777,7 @@ def test_branch_equals_base_ref_rejected(
     assert out == ""
     assert "baseRefName" in err
     # 只跑了 preflight，没有发起合并
-    assert stub.gh_calls() == ["gh pr view 9 --json number,state,headRefName,baseRefName"]
+    assert stub.gh_calls() == [VIEW_CALL]
 
 
 # ------------------------------- 8. --branch 与 PR headRefName 不一致 → rc2
@@ -736,12 +906,12 @@ def test_git_vanishes_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
     assert "git" in err
-    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+    assert MERGE_CALL in stub.gh_calls()
 
 
 # ------------------------------- 合并后通信一直失败 → rc2（明确未通过，不当绿）
@@ -757,7 +927,7 @@ def test_merge_ok_but_undetermined_rc2(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch")
+    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL}")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -909,7 +1079,7 @@ def test_probe_timeout_after_merge_is_not_rc0(
     assert rc == 2
     assert out.splitlines()[0].startswith("分支存在 | PASS | ")
     assert "预检 | PASS | " in out
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert f"合并 | PASS | {MERGE_CALL}" in out
     assert "分支删除 | FAIL" in out  # 超时不算 PASS
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -932,7 +1102,7 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
@@ -1015,7 +1185,7 @@ def test_documented_command_runs_to_preflight_and_merge(
         assert err == ""
         assert "分支存在 | PASS | " in out
         assert "预检 | PASS | " in out
-        assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+        assert MERGE_CALL in stub.gh_calls()
 
 
 # ---------------- 15. stdout 断管 / 关闭：rc 必须是本次运行的真实结论
@@ -1055,7 +1225,7 @@ def test_broken_pipe_keeps_true_rc(
 
     assert rc == expected
     assert len(stub.gh_calls()) == 2  # 预检 + 合并都照常发生
-    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+    assert MERGE_CALL in stub.gh_calls()
 
 
 def test_broken_pipe_keeps_rc2_with_evidence(
@@ -1172,7 +1342,7 @@ def test_signal_after_merge_keeps_evidence_rc2(
             proc.communicate()
 
     assert proc.returncode == 2  # 不是 143 / 130 / 124 / 0
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert f"合并 | PASS | {MERGE_CALL}" in out
     assert "分支存在 | PASS | " in out  # 合并前那一步也留着
     assert err.startswith(f"错误: 收到信号 {signame}（")
     assert err.count("\n") == 1  # 恰好一行
