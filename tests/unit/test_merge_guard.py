@@ -622,3 +622,166 @@ def test_keep_evidence_no_exception_no_change() -> None:
 
     assert lines == ["预检 | PASS | x", "合并 | PASS | y"]
 
+
+
+# ------------------------ stdout 断管 / 关闭：不冒 traceback、不改真实退出码
+
+class DeadStream:
+    """写就抛的替身流；**没有 fileno**，所以测试不碰进程的 fd 1。"""
+
+    def __init__(self, exc: BaseException, *, encoding: str | None = "utf-8") -> None:
+        self.exc = exc
+        self.encoding = encoding
+        self.written: list[str] = []
+
+    def write(self, text: str) -> None:
+        raise self.exc
+
+    def flush(self) -> None:
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BrokenPipeError(32, "Broken pipe"),
+        OSError(32, "Broken pipe"),
+        OSError(9, "Bad file descriptor"),
+        ValueError("I/O operation on closed file"),
+    ],
+    ids=["broken-pipe", "epipe", "ebadf", "closed-file"],
+)
+def test_write_stdout_swallows_dead_stream(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    """写不出去不是运行结论 —— 不许抛，也不许让调用方改退出码。"""
+
+    monkeypatch.setattr(mg.sys, "stdout", DeadStream(exc))
+
+    mg._write_stdout(["分支删除 | PASS | git ls-remote | rc=2 | 分支已不在远端"])  # 不抛
+
+    # 换成了 /dev/null 上的流：解释器退出时再 flush 也不会冒 "Exception ignored"
+    assert mg.sys.stdout is not None
+    assert getattr(mg.sys.stdout, "name", "") == mg.os.devnull
+
+
+def test_write_stdout_none_stdout_redirects_fd1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``1>&-`` 时 ``sys.stdout is None``：把 fd 1 接到 /dev/null，然后静默返回。"""
+
+    dup2_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(mg.os, "dup2", lambda fd, target: dup2_calls.append((fd, target)))
+    monkeypatch.setattr(mg.sys, "stdout", None)
+
+    mg._write_stdout(["结论：分支仍在远端"])
+
+    assert [target for _fd, target in dup2_calls] == [1]  # fd 1 真的被重定向了
+    assert mg.sys.stdout is not None
+    assert getattr(mg.sys.stdout, "name", "") == mg.os.devnull
+
+
+def test_silence_stdout_leaves_fd1_alone_for_fake_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """替身流（StringIO 之类）没有 fileno 1 → 不许动进程的 fd 1。"""
+
+    dup2_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(mg.os, "dup2", lambda fd, target: dup2_calls.append((fd, target)))
+
+    mg._silence_stdout(DeadStream(BrokenPipeError(32, "Broken pipe")))
+
+    assert dup2_calls == []
+
+
+def test_write_stdout_encoding_error_is_still_rc2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """编码表示不了中文仍是 rc2（原有契约不许被断管修复改掉）。"""
+
+    bad = UnicodeEncodeError("ascii", "中文", 0, 1, "ordinal not in range(128)")
+    monkeypatch.setattr(mg.sys, "stdout", DeadStream(bad, encoding="ascii"))
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg._write_stdout(["结论：分支仍在远端"])
+
+    assert "UTF-8" in str(excinfo.value)
+
+
+# ------------------------------ stderr 写不出去：rc2 不许因为写日志变成 rc1
+
+def test_write_stderr_error_survives_missing_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``2>&-``（``sys.stderr is None``）时写 stderr 不许炸。"""
+
+    monkeypatch.setattr(mg.sys, "stderr", None)
+
+    mg._write_stderr_error("合并命令缺少 --delete-branch")  # 不抛
+    mg._write_stderr_raw("gh: 原始输出\n")  # 不抛
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [BrokenPipeError(32, "Broken pipe"), OSError(9, "Bad file descriptor")],
+    ids=["broken-pipe", "ebadf"],
+)
+def test_write_stderr_error_survives_broken_stream(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    monkeypatch.setattr(mg.sys, "stderr", DeadStream(exc))
+
+    mg._write_stderr_error("内部错误：RuntimeError: boom")  # 不抛
+
+
+# ------------------------------------------------- 信号：转成 rc2，不许被直接杀掉
+
+def test_interrupted_message_format() -> None:
+    """stderr 那一行必须是单行、写清信号名、并提醒「退出码不是 1」。"""
+
+    text = str(mg.Interrupted("SIGTERM"))
+
+    assert text == "收到信号 SIGTERM（退出码不是 1；合并是否已发生请人工核对）"
+    assert "\n" not in text
+
+
+def test_signal_name_maps_signum() -> None:
+    import signal as signal_module
+
+    assert mg.signal_name(signal_module.SIGTERM) == "SIGTERM"
+    assert mg.signal_name(signal_module.SIGINT) == "SIGINT"
+
+
+def test_handle_signals_restores_previous_handlers() -> None:
+    """退出时恢复原 handler：不许污染宿主进程（否则 pytest 自己收不到 Ctrl-C）。"""
+
+    import signal as signal_module
+
+    before = {signum: signal_module.getsignal(signum) for signum in mg._interrupt_signals()}
+
+    with mg.handle_signals():
+        inside = [
+            signal_module.getsignal(signum) for signum in mg._interrupt_signals()
+        ]
+        assert all(handler is not before[signum] for handler, signum in zip(
+            inside, mg._interrupt_signals(), strict=True
+        ))
+
+    after = {signum: signal_module.getsignal(signum) for signum in before}
+    assert after == before
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT"])
+def test_handle_signals_turns_signal_into_interrupted(
+    signame: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真发一次信号：处理期内的 SIGTERM / SIGINT 必须变成 Interrupted（不是 traceback）。"""
+
+    import os
+    import signal as signal_module
+
+    signum = getattr(signal_module, signame, None)
+    if signum is None:  # pragma: no cover - Windows
+        pytest.skip(f"平台没有 {signame}")
+
+    with pytest.raises(mg.Interrupted) as excinfo, mg.handle_signals():
+        os.kill(os.getpid(), signum)
+
+    assert excinfo.value.signame == signame
+    assert "退出码不是 1" in str(excinfo.value)

@@ -52,6 +52,22 @@ rc2 一律 stderr 一行 ``错误: …``、不冒 traceback，且**退出码绝�
 「未达成」专用码：任何异常都不许落到它上面）。stdout 只有一种反例：**合并已经发生
 之后**才出错时，stdout 仍保留已完成的「预检」「合并」两步证据 —— 后面的崩溃不能把
 「合并成功了」这条证据一起丢掉，否则下一轮会把 rc2 读成「没合并、可以重跑」。
+
+「写不出去」不许改变退出码
+--------------------------
+stdout 被提前关掉是常态（``… | head -0``、``1>&-``）。管道断开（``BrokenPipeError``
+/ ``EPIPE``）、流已关闭（``ValueError``）、``sys.stdout is None`` 三种形态一律**不冒
+traceback**：把 fd 1 接到 ``/dev/null`` 后按本次运行的**真实结论**返回 —— 本来 rc0
+仍是 0、本来 rc1 仍是 1、本来 rc2 仍是 2，不许变成 120 / 141。只吞异常不够：缓冲区
+里剩下的字节会在解释器退出时再 flush 一次，冒出 ``Exception ignored while flushing
+sys.stdout`` 并把退出码改成 120，所以必须重定向 fd 1。
+
+收到信号也要留住证据
+--------------------
+``main()`` 期间 ``SIGTERM`` / ``SIGINT`` / ``SIGHUP`` 一律转成「无法判定」收尾：
+已完成的证据行照常写到 stdout，stderr 一行 ``错误: 收到信号 <SIGx>（退出码不是 1；
+合并是否已发生请人工核对）``，退出码 ``2``（不是 124 / 130 / 143）。合并已经发生之后
+被杀掉却留下 0 字节 stdout，下一轮就会把「合并成功」读成「没合并、可以重跑」。
 """
 
 from __future__ import annotations
@@ -60,13 +76,14 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess  # nosec B404
 import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import Any, NoReturn
 
 #: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
 METHODS: tuple[str, ...] = ("merge",)
@@ -134,6 +151,26 @@ class CommandTimeout(MergeGuardError):
     """
 
 
+class Interrupted(MergeGuardError):
+    """收到 ``SIGTERM`` / ``SIGINT`` / ``SIGHUP``：按「无法判定」收尾（rc2）。
+
+    为什么单独一个类：被杀掉时进程**不能**直接消失。合并可能已经发生，证据还攒在
+    ``lines`` 里；默认处理下 SIGTERM 让进程带走 rc=143（``timeout`` 报 124）、stdout
+    0 字节，下一轮就会把「合并成功」读成「没合并、可以重跑」，再去合一次会撞 PR 已
+    MERGED。所以信号转成异常，走 :class:`PartialFailure` 同一条收尾路径：
+    先写已完成证据，再写 stderr 一行，退出码 2。
+
+    作为 :class:`MergeGuardError` 的子类，它天然满足「异常不许落 rc1」这条：不论合并
+    有没有发生，最终都是 rc2。
+    """
+
+    def __init__(self, signame: str) -> None:
+        super().__init__(
+            f"收到信号 {signame}（退出码不是 1；合并是否已发生请人工核对）"
+        )
+        self.signame = signame
+
+
 class PartialFailure(MergeGuardError):
     """合并已经发生之后才出错：必须把已完成的步骤证据一起带到 stdout（仍是 rc2）。
 
@@ -186,29 +223,44 @@ class PollResult:
 
 # --------------------------------------------------------------------- 输出
 
-def _write_stderr_error(message: str) -> None:
-    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。
+def _write_stderr_text(text: str) -> None:
+    """往 stderr 写一段文本，**写不出去也不许抛**（否则 rc2 会变成 traceback + rc1）。
 
     与 ``cli._write_stderr_error`` 同款做法（刻意不 import cli：本模块独立可跑）：
-    先问 stderr 的编码能不能表示整行，能就正常写，不能就按 UTF-8 字节直写
+    先问 stderr 的编码能不能表示整段，能就正常写，不能就按 UTF-8 字节直写
     ``stderr.buffer``，避免 ``UnicodeEncodeError`` 变成 traceback。
+
+    另外三种「写不出去」也一并吞掉，它们都是同一个洞：``stderr`` 被关掉
+    （``2>&-`` → ``sys.stderr is None``）、接的管道断开（``BrokenPipeError`` /
+    ``EPIPE``）、流已关闭（``ValueError``）。这几种情况下抛出去只会让
+    ``except MergeGuardError`` 自己崩掉 —— 结果是 traceback + rc1，正好撞上
+    「任何异常都不许落 rc1」这条红线。stderr 崩了就是没人看得到，但退出码必须对。
     """
 
-    line = f"错误: {message}\n"
-    encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
-    try:
-        line.encode(encoding)
-    except UnicodeEncodeError:
-        data = line.encode("utf-8")
-        buffer = getattr(sys.stderr, "buffer", None)
-        if buffer is not None:
-            buffer.write(data)
-            buffer.flush()
-        else:  # pragma: no cover - 没有 buffer 的替身对象（极少见）
-            sys.stderr.write(data.decode("utf-8", "backslashreplace"))
+    stream = sys.stderr
+    if stream is None:  # 2>&-
         return
-    sys.stderr.write(line)
-    sys.stderr.flush()
+    with suppress(OSError, ValueError, AttributeError):
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        try:
+            text.encode(encoding)
+        except UnicodeEncodeError:
+            data = text.encode("utf-8")
+            buffer = getattr(stream, "buffer", None)
+            if buffer is not None:
+                buffer.write(data)
+                buffer.flush()
+            else:  # pragma: no cover - 没有 buffer 的替身对象（极少见）
+                stream.write(data.decode("utf-8", "backslashreplace"))
+            return
+        stream.write(text)
+        stream.flush()
+
+
+def _write_stderr_error(message: str) -> None:
+    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。"""
+
+    _write_stderr_text(f"错误: {message}\n")
 
 
 def _write_stderr_raw(text: str) -> None:
@@ -216,37 +268,93 @@ def _write_stderr_raw(text: str) -> None:
 
     if not text:
         return
-    encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
+    _write_stderr_text(text if text.endswith("\n") else f"{text}\n")
+
+
+def _fileno(stream: object | None) -> int | None:
+    """取流的 fd；没有 ``fileno`` / 已关闭 / 非真实流 → ``None``；``None`` 流当作 fd 1。
+
+    ``sys.stdout is None`` 恰恰是 ``1>&-`` 的样子（Python 启动时 fd 1 已关），所以
+    「没有流」= 目标就是 fd 1。
+    """
+
+    if stream is None:
+        return 1
+    fileno = getattr(stream, "fileno", None)
+    if fileno is None:
+        return None
     try:
-        text.encode(encoding)
-    except UnicodeEncodeError:
-        data = text.encode("utf-8")
-        buffer = getattr(sys.stderr, "buffer", None)
-        if buffer is not None:
-            buffer.write(data)
-            buffer.flush()
-        else:  # pragma: no cover
-            sys.stderr.write(data.decode("utf-8", "backslashreplace"))
-        return
-    sys.stderr.write(text)
-    if not text.endswith("\n"):
-        sys.stderr.write("\n")
-    sys.stderr.flush()
+        fd = fileno()
+    except (OSError, ValueError):  # 已关闭 / 不支持 fileno（io.UnsupportedOperation ⊂ 两者）
+        return None
+    return fd if isinstance(fd, int) else None
+
+
+def _silence_stdout(stream: object | None = None) -> None:
+    """把 stdout 接到 ``/dev/null``：写不出去之后不再冒 traceback、不改退出码。
+
+    只「吞掉异常」不够：``TextIOWrapper`` 缓冲区里剩下的字节会在解释器退出时再
+    flush 一次，冒出 ``Exception ignored while flushing sys.stdout``，并且 Python 用
+    **120** 作为「退出时 flush stdout 失败」的退出码 —— 结论被这套机制顶掉。所以按
+    Python 官方建议（``signal`` 模块里 SIGPIPE 那一段）把 **fd 1 重定向到
+    ``/dev/null``**，再把 ``sys.stdout`` 换成一个指向 ``/dev/null`` 的流：剩下的
+    flush 写进空设备，退出码回到本次运行的真实结论。
+
+    只在「失败的流真的是 fd 1」时动 fd 1 —— 测试里换成 ``StringIO`` 之类替身时
+    不碰进程的 fd 1，免得把别的输出一起吞掉。stderr（fd 2）一律不动：``错误: …``
+    必须还能被看到。
+    """
+
+    if _fileno(stream) == 1:
+        devnull_fd = -1
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        except OSError:  # pragma: no cover - 极端环境（/dev/null 打不开）
+            devnull_fd = -1
+        if devnull_fd >= 0:
+            try:
+                # fd 1 已关时 os.open 可能正好把它拿回来，那就已经指向 /dev/null 了
+                if devnull_fd != 1:
+                    os.dup2(devnull_fd, 1)
+            except OSError:  # pragma: no cover
+                pass
+            finally:
+                if devnull_fd > 1:
+                    with suppress(OSError):
+                        os.close(devnull_fd)
+    with suppress(OSError, ValueError):
+        # 故意不关：这个流要活到进程结束，退出时解释器 flush 它（写进 /dev/null）
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
 
 def _write_stdout(lines: list[str]) -> None:
-    """一次性写出所有输出行；编码表示不了中文 → ``MergeGuardError``（rc2）。"""
+    """一次性写出所有输出行；写不出去**不改变退出码**。
+
+    - stdout 编码表示不了中文 → ``MergeGuardError``（rc2，与原口径一致，契约没变）；
+    - 管道断开（``BrokenPipeError`` / ``OSError(EPIPE)``）、流已关闭
+      （``ValueError``）、``sys.stdout is None``（``1>&-``）→ **不抛**：走
+      :func:`_silence_stdout` 后静默返回，调用方按本次运行的**真实结论**返回退出码
+      （本来 rc0 仍 0、本来 rc2 仍 2；不许变成 120 / 141，也不许落到 rc1）。
+    """
 
     text = "\n".join(lines) + "\n"
+    out = sys.stdout
+    if out is None:
+        _silence_stdout(out)
+        return
     try:
-        sys.stdout.write(text)
-        sys.stdout.flush()
-    except UnicodeEncodeError as exc:
+        out.write(text)
+        out.flush()
+    except UnicodeEncodeError as exc:  # 必须排在 ValueError 前面：它是 ValueError 子类
         raise MergeGuardError(
             "当前 stdout 编码 "
             f"{getattr(sys.stdout, 'encoding', None)!r} 无法表示输出里的中文，"
             "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
         ) from exc
+    except ValueError:  # 「I/O operation on closed file」
+        _silence_stdout(out)
+    except OSError:  # 含 BrokenPipeError / EPIPE / EBADF
+        _silence_stdout(out)
 
 
 def key_line(proc: CommandResult) -> str:
@@ -613,6 +721,70 @@ def validate(args: argparse.Namespace) -> Options:
 
 # -------------------------------------------------------------------- 主流程
 
+#: 收到就要收尾的信号名（SIGHUP = 终端关掉；三个都按「无法判定」处理）
+INTERRUPT_SIGNAL_NAMES: tuple[str, ...] = ("SIGTERM", "SIGINT", "SIGHUP")
+
+
+def _interrupt_signals() -> tuple[int, ...]:
+    """本平台认得的收尾信号编号（Windows 上 SIGHUP / SIGTERM 不全，缺就跳过）。"""
+
+    return tuple(
+        signum
+        for signum in (getattr(signal, name, None) for name in INTERRUPT_SIGNAL_NAMES)
+        if isinstance(signum, int)
+    )
+
+
+def signal_name(signum: int) -> str:
+    """``15`` → ``SIGTERM``；平台专有信号回落到数字（stderr 那行要能读懂）。"""
+
+    try:
+        return signal.Signals(signum).name
+    except ValueError:  # pragma: no cover - 平台专有信号
+        return f"信号 {signum}"
+
+
+@contextmanager
+def handle_signals() -> Iterator[None]:
+    """``SIGTERM`` / ``SIGINT`` / ``SIGHUP`` → :class:`Interrupted`；退出时恢复原 handler。
+
+    没有这一层时：SIGTERM 直接杀进程（rc=143，``timeout`` 报 124）、SIGINT 冒
+    ``KeyboardInterrupt`` traceback —— 两种都是 **0 字节 stdout**，而 ``lines`` 里可能
+    已经攒着「合并 | PASS」。下一轮读板的人会把 rc 读成「没合并、可以重跑」。
+
+    转成异常后走的是和 :class:`PartialFailure` 同一条路径：先写已完成证据、再写
+    stderr 一行、退出码 2。**只转第一次信号**：收尾过程中再来一次信号直接忽略，
+    免得证据写一半又被打断。
+
+    ``signal.signal`` 只能在主线程调用：拿不到就跳过（测试里常从辅助线程跑
+    ``main()``），此时行为回落到默认处理，不影响其余口径。
+    """
+
+    fired = False
+
+    def _handler(signum: int, _frame: object) -> None:
+        nonlocal fired
+        if fired:
+            return
+        fired = True
+        raise Interrupted(signal_name(signum))
+
+    saved: list[tuple[int, Any]] = []
+    for signum in _interrupt_signals():
+        previous = signal.getsignal(signum)
+        try:
+            signal.signal(signum, _handler)
+        except (OSError, RuntimeError, ValueError):  # 非主线程 / 平台不支持
+            continue
+        saved.append((signum, previous))
+    try:
+        yield
+    finally:
+        for signum, previous in reversed(saved):
+            with suppress(OSError, RuntimeError, ValueError):
+                signal.signal(signum, previous)
+
+
 @contextmanager
 def _keep_evidence(lines: list[str]) -> Iterator[None]:
     """合并已经发生之后的兜底：任何异常都带上已完成的步骤证据走 rc2。
@@ -624,6 +796,9 @@ def _keep_evidence(lines: list[str]) -> Iterator[None]:
 
     所以这里把异常统一转成 :class:`PartialFailure`（携带 ``lines``），``main`` 先把
     已完成的「预检」「合并」两步写到 stdout，再写 stderr 一行，退出码固定 2。
+
+    收到信号（:class:`Interrupted`）走同一条路：``str(exc)`` 就是那行「收到信号 …」，
+    证据照常先写出去。
     """
 
     try:
@@ -892,6 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
     退出码口径：**任何异常都不许落 rc1**（rc1 只表示「未达成」）。合并已发生之后的
     失败走 :class:`PartialFailure`：先把已完成的步骤证据写到 stdout，再把
     ``错误: …`` 写到 stderr，返回 2 —— 崩溃既不能丢证据，也不能被读成「可以重跑」。
+    收到 SIGTERM / SIGINT / SIGHUP 同样走这条路径（:func:`handle_signals`）。
     """
 
     try:
@@ -904,7 +1080,8 @@ def main(argv: list[str] | None = None) -> int:
         return code if isinstance(code, int) else 2
 
     try:
-        lines, rc = run(args)
+        with handle_signals():
+            lines, rc = run(args)
     except PartialFailure as exc:
         if exc.lines:
             # stdout 编码表示不了中文时证据写不出，但仍然是 rc2（不许落 rc1）

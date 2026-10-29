@@ -9,6 +9,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
+import subprocess
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -1012,3 +1016,200 @@ def test_documented_command_runs_to_preflight_and_merge(
         assert "分支存在 | PASS | " in out
         assert "预检 | PASS | " in out
         assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+
+
+# ---------------- 15. stdout 断管 / 关闭：rc 必须是本次运行的真实结论
+#
+# 断管不是运行结论：``… | head -0`` 与 ``1>&-`` 下不许冒 traceback，也不许把
+# rc0/rc1 改成 120/141。这里两种形态各覆盖一遍。
+
+class DeadStdout:
+    """写就 EPIPE 的替身 stdout（没有 fileno：不碰进程的 fd 1）。"""
+
+    encoding = "utf-8"
+
+    def write(self, text: str) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.parametrize(
+    ("probe_rc", "expected"),
+    [("0", 1), ("2", 0)],
+    ids=["branch-present-rc1", "branch-deleted-rc0"],
+)
+def test_broken_pipe_keeps_true_rc(
+    stub: Stub,
+    monkeypatch: pytest.MonkeyPatch,
+    probe_rc: str,
+    expected: int,
+) -> None:
+    """合并路径上 stdout 断管：rc1 仍是 1、rc0 仍是 0，一条 traceback 都没有。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", probe_rc)
+    monkeypatch.setattr(sys, "stdout", DeadStdout())
+
+    rc = mg.main(args_for(stub))  # 不抛
+
+    assert rc == expected
+    assert len(stub.gh_calls()) == 2  # 预检 + 合并都照常发生
+    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+
+
+def test_broken_pipe_keeps_rc2_with_evidence(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """合并已发生 + 判不了 + stdout 断管：rc 仍 2（不是 1），stderr 一行仍在。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "128")
+    monkeypatch.setattr(sys, "stdout", DeadStdout())
+
+    rc = mg.main(args_for(stub))
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert captured.out == ""  # 写不出来就是写不出来
+    assert captured.err.startswith("错误: ")
+    assert captured.err.count("\n") == 1
+    assert "无法判定" in captured.err
+
+
+def _spawn(argv: list[str], *, cwd: Path) -> subprocess.Popen[str]:
+    """跑一个真子进程的 merge_guard（``python -m``），stdout/stderr 走管道。"""
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(mg.__file__).resolve().parents[1])
+    return subprocess.Popen(
+        [sys.executable, "-m", "team_board.merge_guard", *argv],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("等待前置条件超时（子进程没有走到预期位置）")
+
+
+def test_closed_stdout_keeps_true_rc(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``1>&-``（真关掉 fd 1）：rc 仍是真实结论，stderr 照常可读。
+
+    用 ``bash -c 'exec 1>&-; exec …'`` —— 这是 ``1>&-`` 的真实形态，不是
+    ``>/dev/null``（那只是丢弃输出，fd 1 还开着，压根走不到这条分支）。
+    """
+
+    stub.setenv("PYTHONPATH", str(Path(mg.__file__).resolve().parents[1]))
+    # ① 分支一直在远端 → --verify-only 轮询到超时 → 结论 1
+    # ② 缺 --delete-branch → 结论 2（一个 gh / git 调用都不发）
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")
+    stub.setenv("FAKE_LS_REMOTE_RC", "0")
+    cases = [
+        (args_for(stub, "--verify-only"), 1),
+        (args_for(stub, delete_branch=False), 2),
+    ]
+    for index, (argv, expected) in enumerate(cases):
+        stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"git-closed-{index}.count"))
+        script = "exec 1>&-; exec " + shlex.join(
+            [sys.executable, "-m", "team_board.merge_guard", *argv]
+        )
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            cwd=str(stub.repo),
+            env=os.environ.copy(),  # 每次重建：setenv 改的是 os.environ
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        captured = proc.stderr
+        assert proc.returncode == expected, (argv, proc.returncode, captured)
+        assert "Traceback" not in captured
+        assert captured.count("\n") <= 1  # 至多一行 错误: …（rc1 档干脆没有）
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT", "SIGHUP"])
+def test_signal_after_merge_keeps_evidence_rc2(
+    stub: Stub, tmp_path: Path, signame: str
+) -> None:
+    """合并已经发生、正在轮询删除验证时被信号杀掉：证据必须留在 stdout、rc=2。
+
+    复现路径（假 gh / 假 git，绝不真合并）：``gh pr merge`` 成功 → 探针卡住 →
+    外部发信号。旧行为是 0 字节 stdout + rc=143/130，下一轮会读成「没合并、可以重跑」。
+    """
+
+    signums: dict[str, int | None] = {
+        name: getattr(signal, name, None) for name in ("SIGTERM", "SIGINT", "SIGHUP")
+    }
+    signum = signums[signame]
+    if signum is None:  # pragma: no cover - Windows
+        pytest.skip(f"平台没有 {signame}")
+
+    stub.setenv("FAKE_GIT_SLEEP", "10")  # 合并后的探针卡住（合并前的闸门不睡）
+    stub.setenv("FAKE_LS_REMOTE_RC", "128")
+
+    proc = _spawn(
+        args_for(stub, "--timeout", "30", "--interval", "1"), cwd=stub.repo
+    )
+    try:
+        # git 第 2 次调用 = 合并后的轮询探针已启动 → 「合并 | PASS」那行已经攒好
+        _wait_until(lambda: len(stub.git_calls()) >= 2)
+        proc.send_signal(signum)
+        out, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:  # pragma: no cover - 兜底，别留僵尸
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 2  # 不是 143 / 130 / 124 / 0
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert "分支存在 | PASS | " in out  # 合并前那一步也留着
+    assert err.startswith(f"错误: 收到信号 {signame}（")
+    assert err.count("\n") == 1  # 恰好一行
+    assert "Traceback" not in out + err
+    assert "合并是否已发生请人工核对" in err
+
+
+def test_signal_before_merge_rc2_stdout_empty(stub: Stub) -> None:
+    """还没走到合并就被杀：stdout 空、rc2、stderr 一行（没有证据要保，也不许落 rc1）。"""
+
+    stub.setenv("FAKE_VIEW_SLEEP", "10")  # 预检的 gh pr view 卡住
+
+    proc = _spawn(args_for(stub), cwd=stub.repo)
+    try:
+        _wait_until(lambda: any("gh pr view" in call for call in stub.gh_calls()))
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:  # pragma: no cover
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 2
+    assert out == ""  # 合并没发生 → 没有证据可保
+    assert err.startswith("错误: 收到信号 SIGTERM（")
+    assert err.count("\n") == 1
+    assert "gh pr merge" not in stub.gh_calls()  # 一个写操作都没发
+
+
+def test_signals_restored_after_main_returns(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``main()`` 返回后 handler 回到原样：不许把宿主进程的信号处理改掉。"""
+
+    before = {signum: signal.getsignal(signum) for signum in mg._interrupt_signals()}
+
+    rc, _out, _err = run(args_for(stub), capsys)
+
+    assert rc == 0  # 默认 stub：分支已删 → 合并完成
+    assert {signum: signal.getsignal(signum) for signum in before} == before
