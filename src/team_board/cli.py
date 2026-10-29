@@ -15,12 +15,14 @@
   表示不了中文（``PYTHONIOENCODING=ascii``）
 
 ``merge-audit`` 子命令沿用同一组数字但语义是「认账问题」：
-- 0：区间内合并提交都有认账三字段（``--require`` 时该卡有零问题的合并）
+- 0：区间内合并提交都有认账三字段（``--require`` 时该卡有零问题的合并；给了
+  ``--card`` 时该卡的 ``merged-by`` 与看板库 ``tasks.assignee`` 一致）
 - 1：发现问题（缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区 /
-  ``--require`` 只有历史命中或两段都没命中）
+  ``merged-by 与卡 assignee 不符`` / ``--require`` 只有历史命中或两段都没命中）
 - 2：参数或环境错误（``merges.MergeAuditError`` → stderr ``错误: …``、stdout 空；
-  含仓库不是工作树、基线文件不存在 / 非 UTF-8 / 空 / 多行、``PATH`` 里没有
-  ``git``、git 输出不是 UTF-8、stdout 编码表示不了中文）
+  含仓库不是工作树、基线文件不存在 / 非 UTF-8 / 空 / 多行、看板库不可读或不是合法
+  SQLite、库里没有 ``--card`` 指定的卡、``PATH`` 里没有 ``git``、git 输出不是
+  UTF-8、stdout 编码表示不了中文）
 
 ``merge-record`` 子命令（合并**前**那一半）：
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
@@ -135,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
       ``--allow-file``；
     - ``merge-audit``：稽核合并提交的认账三字段（0 无问题 / 1 有问题 / 2 参数或
       环境错误），吃 ``--repo`` / ``--baseline`` / ``--baseline-file`` / ``--rev`` /
-      ``--card`` / ``--require``；
+      ``--card`` / ``--db`` / ``--require``（``--card`` + ``--db`` 时跑判据①）；
     - ``merge-record``：合并**前**生成认账 body（喂 ``gh pr merge --body-file``）或
       ``--check-file`` 预检（0 成功/通过 / 1 预检有问题 / 2 参数或环境错误），吃
       ``--card`` / ``--by`` / ``--pr`` / ``--subject`` / ``--body-out`` /
@@ -241,7 +243,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--card",
         default=None,
         metavar="CARD",
-        help="只列这张卡的合并记录（同时过滤判定段与历史段）",
+        help="只列这张卡的合并记录（同时过滤判定段与历史段）；给了它就同时判据①",
+    )
+    merge_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"判据① 读 assignee 用的看板库（只读；默认 {DEFAULT_DB}）",
     )
     merge_cmd.add_argument(
         "--require",
@@ -421,6 +429,9 @@ def _run_merge_audit(args: argparse.Namespace) -> int:
     报告整块生成后再一次性写出：stdout 编码表示不了中文（如
     ``PYTHONIOENCODING=ascii``）属于环境级错误 → rc2、stderr ``错误: …``，
     不许退化成 rc1 + traceback（rc1 是「有问题」的专用码）。
+
+    给了 ``--card`` 时会连判据①（``merged-by`` 的 profile == 该卡 assignee）一起跑，
+    ``--db`` 只决定读哪个看板库取 assignee（只读，默认 ``DEFAULT_DB``）。
     """
 
     try:
@@ -431,6 +442,7 @@ def _run_merge_audit(args: argparse.Namespace) -> int:
             rev=args.rev,
             only_card=args.card,
             require=args.require,
+            db_path=args.db,
         )
     except merges.MergeAuditError as exc:
         _write_stderr_error(str(exc))
@@ -618,7 +630,7 @@ def _run_merge_record(args: argparse.Namespace) -> int:
                     f"问题: {problem.kind}：{problem.detail}\n" for problem in problems
                 )
             else:
-                text = "通过：三字段齐（Merge-By/Merge-Card/Merge-PR）\n"
+                text = "通过：三字段齐（merged-by/merge-card/merge-pr）\n"
             if not _write_stdout(text):
                 return 2
             return 1 if problems else 0

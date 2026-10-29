@@ -5,22 +5,30 @@
 message 字符串与提交元数据，输出是 ``Problem`` / ``MergeRecord`` /
 ``MergeReport`` 与待提交的 message 文本，不调 git、不做文件 IO。
 
-唯一的取数入口是 :func:`audit`：它调 ``git log`` 扫合并提交、读基线文件，
-再把结果交给上面那些纯函数判定。git 调用层（``_git``）在本模块自写一份，
-**不 import ``team_board.branches``** —— 两个子命令各自封装，谁也不牵连谁。
+唯一的两处取数入口是 :func:`audit` 与 :func:`card_assignee`：前者调 ``git log``
+扫合并提交、读基线文件，再把结果交给上面那些纯函数判定；后者**只读**打开看板库
+取 ``tasks.assignee``（``mode=ro``，不建表、不写），供判据① 比对。git 调用层
+（``_git``）在本模块自写一份，**不 import ``team_board.branches``** —— 两个子命令
+各自封装，谁也不牵连谁。
 
-三字段写在合并提交 message 的**末尾 trailer 块**（每行一条，键名大小写敏感）：
+三字段写在合并提交 message 的**末尾 trailer 块**（每行一条，键名大小写敏感、
+**恒小写**）：
 
-    Merge-By: <profile>/run<NNN>
-    Merge-Card: t_[0-9a-f]{8}
-    Merge-PR: #<正整数>
+    merged-by: <profile>/run<NNN>
+    merge-card: t_[0-9a-f]{8}
+    merge-pr: #<正整数>
+
+``Merge-By`` / ``Merge-Card`` / ``Merge-PR`` 这套旧的大写键**一律不再接受**，也
+**不做大小写兼容别名**（两套口径并存会让「哪套算数」变成口头约定）：大写键在
+trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三个小写键各报一条
+``缺字段``。
 
 判定口径
 --------
 1. ``parse_trailers`` 从 message 末尾往上扫：先跳过空行，再取连续的
    ``^[A-Za-z][A-Za-z0-9-]*: `` 形态行构成 trailer 块，遇到第一个不匹配的行即停。
    只挑 ``TRAILER_KEYS`` 里的键，其它键（``Signed-off-by`` 等）忽略且不算问题。
-2. 三键之一出现在块外（正文里写了 ``Merge-Card: …``）→ ``字段未落在 trailer 区``；
+2. 三键之一出现在块外（正文里写了 ``merge-card: …``）→ ``字段未落在 trailer 区``；
    此时若块内也没有该键，**不再**报 ``缺字段``（否则同一件事报两次）。
 3. 同一键在块内出现多次 → ``重复字段``，值取最后一条。
 4. ``record_from_commit`` 在 ``parents`` 少于 2 时追加 ``不是合并提交``（不抛异常）；
@@ -40,12 +48,21 @@ message 字符串与提交元数据，输出是 ``Problem`` / ``MergeRecord`` /
 9. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
    merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
    小写十六进制 → ``MergeAuditError``（**不静默当成「没有基线」**）。
+10. **判据①**：``merged-by`` 的 profile 部分（``/`` 之前）必须**严格等于**该卡
+   ``tasks.assignee``。只在 ``audit(only_card=…)``（即 CLI 给了 ``--card``）时生效，
+   且只判 ``source="trailer"`` 的记录 —— 历史段（``source="legacy"``）没有
+   ``merged-by`` 值，照样只回显「by=无法判定」，不参与判据①。``assignee`` 由
+   :func:`card_assignee` 只读打开看板库取；库不存在 / 不是合法 SQLite / 没有
+   ``tasks`` 表 / 卡不存在 / 卡没有 assignee 一律 ``MergeAuditError``（rc2，
+   **不静默跳过判据**）。``merged-by`` 值本身缺失或格式非法时，``缺字段`` /
+   ``格式非法`` 已经报过，判据① 不再重复报第二条，输出行写「不适用」。
 """
 
 from __future__ import annotations
 
 import os
 import re
+import sqlite3
 
 # bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git），
 # 调用形式为 argv 列表、shell=False，不拼 shell 字符串
@@ -53,17 +70,22 @@ import subprocess  # nosec B404
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-#: ``Merge-By`` 取值：``<profile>/run<正整数>``，profile 为小写字母开头的短名
+from .db import BoardError
+from .db import connect as _connect_board
+from .model import DEFAULT_DB
+
+#: ``merged-by`` 取值：``<profile>/run<正整数>``，profile 为小写字母开头的短名
 MERGE_BY_RE = re.compile(r"^[a-z][a-z0-9-]*/run[0-9]+$")
 
-#: ``Merge-Card`` 取值：卡号 ``t_`` + 8 位小写十六进制
+#: ``merge-card`` 取值：卡号 ``t_`` + 8 位小写十六进制
 MERGE_CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
 
-#: ``Merge-PR`` 取值：``#`` + 正整数（大数字一样合法，不设上限）
+#: ``merge-pr`` 取值：``#`` + 正整数（大数字一样合法，不设上限）
 MERGE_PR_RE = re.compile(r"^#[1-9][0-9]*$")
 
-#: 认账三字段的键名（顺序即渲染与校验顺序，大小写敏感）
-TRAILER_KEYS = ("Merge-By", "Merge-Card", "Merge-PR")
+#: 认账三字段的键名（顺序即渲染与校验顺序，大小写敏感、恒小写；
+#: 旧的大写键 ``Merge-By`` / ``Merge-Card`` / ``Merge-PR`` 不再接受）
+TRAILER_KEYS = ("merged-by", "merge-card", "merge-pr")
 
 #: GitHub 默认合并提交标题：``Merge pull request #<pr> from <owner>/<branch>``，
 #: 分支名允许带 ``wt/`` 前缀
@@ -81,13 +103,16 @@ KIND_NOT_TRAILER = "字段未落在 trailer 区"
 KIND_MISMATCH = "字段与参数不一致"
 KIND_NOT_MERGE = "不是合并提交"
 
+#: 判据①：``merged-by`` 的 profile 部分与该卡 ``tasks.assignee`` 不符
+KIND_MERGED_BY_MISMATCH = "merged-by 与卡 assignee 不符"
+
 #: ``audit(require=True)`` 追加的两类「该卡没有可认账的合并」问题
 KIND_MISSING_HISTORY = "缺认账字段（历史，基线前）"
 KIND_NO_MERGE = "缺认账字段"
 
 #: 历史段命中的解释：基线之前的合并无法回填认账字段
 DETAIL_MISSING_HISTORY = (
-    "基线之前的合并无法回填认账字段；卡面只能写 PR/卡号/sha，Merge-By 无法判定"
+    "基线之前的合并无法回填认账字段；卡面只能写 PR/卡号/sha，merged-by 无法判定"
 )
 
 #: 两段都没命中（区间内没有该卡的合并，历史里也没有）
@@ -110,9 +135,9 @@ _JUDGE_FORMAT = "%x1e%H%x1f%P%x1f%s%x1f%B"
 _HISTORY_FORMAT = "%x1e%H%x1f%s"
 
 _FORMAT_BY_KEY = {
-    "Merge-By": MERGE_BY_RE,
-    "Merge-Card": MERGE_CARD_RE,
-    "Merge-PR": MERGE_PR_RE,
+    "merged-by": MERGE_BY_RE,
+    "merge-card": MERGE_CARD_RE,
+    "merge-pr": MERGE_PR_RE,
 }
 
 
@@ -144,7 +169,12 @@ class Problem:
 
 @dataclass(frozen=True)
 class MergeReport:
-    """一次合并认账稽核的结果。"""
+    """一次合并认账稽核的结果。
+
+    ``card`` / ``assignee`` 非 ``None`` 表示本次跑过判据①（CLI 给了 ``--card``）：
+    ``card`` 是过滤用的卡号，``assignee`` 是从看板库读到的 ``tasks.assignee``。
+    两个都默认 ``None``，其余调用方（不含判据① 的场景）构造 `MergeReport` 不用改。
+    """
 
     repo: str
     baseline: str
@@ -152,6 +182,8 @@ class MergeReport:
     records: tuple[MergeRecord, ...]
     problems: tuple[Problem, ...]
     history: tuple[MergeRecord, ...]
+    card: str | None = None
+    assignee: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -288,9 +320,9 @@ def record_from_commit(
         sha=sha,
         subject=subject,
         parents=tuple(parents),
-        by=values["Merge-By"],
-        card=values["Merge-Card"],
-        pr=values["Merge-PR"],
+        by=values["merged-by"],
+        card=values["merge-card"],
+        pr=values["merge-pr"],
         source="trailer",
     )
     return record, tuple(problems)
@@ -341,11 +373,11 @@ def check_message(
 
     expected: dict[str, str] = {}
     if card is not None:
-        expected["Merge-Card"] = card
+        expected["merge-card"] = card
     if by is not None:
-        expected["Merge-By"] = by
+        expected["merged-by"] = by
     if pr is not None:
-        expected["Merge-PR"] = f"#{pr}"
+        expected["merge-pr"] = f"#{pr}"
     for key, want in expected.items():
         got = scan.values.get(key)
         if got is not None and got != want:
@@ -353,6 +385,75 @@ def check_message(
                 Problem(KIND_MISMATCH, "", f'{key} 提交里是 "{got}"，参数要求 "{want}"')
             )
     return tuple(problems)
+
+
+def card_assignee(db_path: str | Path, card: str) -> str:
+    """**只读**打开看板库取 ``tasks.assignee``（判据① 的对照值）。
+
+    口径与 :mod:`team_board.db` 一致：``mode=ro`` 打开、不建表、不写任何东西
+    （库文件调用前后字节不变）。SQL 固定为
+    ``SELECT assignee FROM tasks WHERE id = ?``。
+
+    以下情形一律抛 :class:`MergeAuditError`（CLI 转 rc2，**不静默跳过判据**）：
+    卡号形态非法、库不存在 / 不是合法 SQLite / 没有 ``tasks`` 表、库里没有该卡、
+    该卡的 ``assignee`` 是 ``NULL``（空 assignee 没法与任何 bot 严格相等，
+    静默放过等于把判据变成永远通过）。
+    """
+
+    if not isinstance(card, str) or MERGE_CARD_RE.fullmatch(card) is None:
+        raise MergeAuditError(f"卡号非法：{card!r}（应形如 t_1234abcd）")
+
+    try:
+        conn = _connect_board(db_path)
+    except BoardError as exc:
+        raise MergeAuditError(
+            f"看板库不可读，无法做判据①（merged-by == 卡 assignee）：{exc}"
+        ) from exc
+    try:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (card,)).fetchone()
+    except sqlite3.Error as exc:
+        raise MergeAuditError(
+            f"读看板库 {db_path} 的 tasks 表失败，无法做判据①（merged-by == 卡 assignee）："
+            f"{exc}"
+        ) from exc
+    finally:
+        conn.close()
+
+    if row is None:
+        raise MergeAuditError(
+            f"看板库 {db_path} 里没有卡 {card}（判据① 需要该卡的 assignee，不静默跳过）"
+        )
+    assignee = row[0]
+    if not isinstance(assignee, str) or not assignee:
+        raise MergeAuditError(
+            f"看板库 {db_path} 里卡 {card} 的 assignee 为空（{assignee!r}），"
+            "无法与 merged-by 严格比对"
+        )
+    return assignee
+
+
+def check_merged_by(record: MergeRecord, assignee: str) -> tuple[Problem, ...]:
+    """判据①：``record.by`` 的 profile 部分（``/`` 之前）**严格等于** ``assignee``。
+
+    空元组 = 通过。两条不判（返回空元组）：
+
+    - ``record.source != "trailer"``：历史段没有 ``merged-by`` 值，不参与判据①；
+    - ``record.by is None``：值缺失 / 格式非法已经由 ``缺字段`` / ``格式非法``
+      报过，这里不重复报第二条（同一件事报两次会让问题数虚高）。
+    """
+
+    if record.source != "trailer" or record.by is None:
+        return ()
+    profile = record.by.partition("/")[0]
+    if profile == assignee:
+        return ()
+    return (
+        Problem(
+            KIND_MERGED_BY_MISMATCH,
+            record.sha,
+            f"merged-by={record.by} assignee={assignee}",
+        ),
+    )
 
 
 def build_message(*, card: str, by: str, pr: int, subject: str | None = None) -> str:
@@ -365,7 +466,7 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
     message 再喂 :func:`check_message` 就报「字段未落在 trailer 区」，闭环断掉。
 
     ``subject`` 去首尾空白后为空同样抛错：那样第一行是空行，git 的 ``%s`` 会把
-    ``Merge-By:`` 当提交标题。``subject=None`` 走契约默认标题。
+    ``merged-by:`` 当提交标题。``subject=None`` 走契约默认标题。
     """
 
     if not isinstance(card, str):
@@ -385,16 +486,16 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
         raise MergeAuditError(f"提交标题非法：{subject!r}（应为 str 或 None）")
     elif not subject.strip():
         raise MergeAuditError(
-            f"提交标题非法：{subject!r}（去首尾空白后为空，git 会把 Merge-By 行当标题）"
+            f"提交标题非法：{subject!r}（去首尾空白后为空，git 会把 merged-by 行当标题）"
         )
     else:
         title = subject
     return (
         f"{title}\n"
         "\n"
-        f"Merge-By: {by}\n"
-        f"Merge-Card: {card}\n"
-        f"Merge-PR: #{pr}\n"
+        f"merged-by: {by}\n"
+        f"merge-card: {card}\n"
+        f"merge-pr: #{pr}\n"
     )
 
 
@@ -583,6 +684,7 @@ def audit(
     rev: str = "HEAD",
     only_card: str | None = None,
     require: bool = False,
+    db_path: str | Path | None = None,
 ) -> MergeReport:
     """稽核 ``<baseline>..<rev>`` 区间内合并提交的认账三字段。
 
@@ -591,12 +693,19 @@ def audit(
 
     参数/环境级错误一律抛 :class:`MergeAuditError`（CLI 转 rc2），检查顺序：
     仓库 → ``baseline``/``baseline_file`` 互斥 → ``only_card`` 形态 →
-    ``require`` 依赖 → 基线取值与解析 → ``rev`` 解析。
+    ``require`` 依赖 → 判据① 的 ``assignee``（读看板库）→ 基线取值与解析 →
+    ``rev`` 解析。
 
     ``only_card`` 只过滤两段的**记录清单**，不吞掉已判出的问题（有问题的合并
     即使不属于该卡也照样红）。``require=True`` 时：区间内有该卡零问题的
     ``source="trailer"`` 记录 → 通过；只有历史段命中 → 追加
     ``缺认账字段（历史，基线前）``；两段都没命中 → 追加 ``缺认账字段``。
+
+    判据①（``merged-by`` 的 profile == 该卡 ``tasks.assignee``）只在给了
+    ``only_card`` 时跑：``db_path`` 为 ``None`` 时用 :data:`team_board.model.DEFAULT_DB`，
+    读失败一律 rc2（**不因为没传 db 就静默跳过判据**）。判据① 出的问题在
+    ``require`` 之前并入 ``problems``，于是「``merged-by`` 不符」的合并也不算
+    「零问题的认账合并」。
     """
 
     root = _resolve_repo(repo)
@@ -611,6 +720,10 @@ def audit(
         raise MergeAuditError(
             "--require 必须与 --card 同用（要判定「某张卡有没有认账合并」）"
         )
+
+    assignee: str | None = None
+    if only_card is not None:
+        assignee = card_assignee(DEFAULT_DB if db_path is None else db_path, only_card)
 
     if baseline is None:
         source = (
@@ -669,6 +782,13 @@ def audit(
         judged = [record for record in judged if record.card == only_card]
         history = [record for record in history if record.card == only_card]
 
+    # 判据①：只在给了 --card 时跑，且只判 trailer 记录（历史段没有该字段的值）。
+    # 必须放在 require 之前 —— 否则「merged-by 不符」的合并会被 require 当成
+    # 「零问题的认账合并」放过。
+    if assignee is not None:
+        for record in judged:
+            problems.extend(check_merged_by(record, assignee))
+
     if require:
         bad_shas = {problem.sha for problem in problems}
         clean_trailer = [
@@ -695,6 +815,8 @@ def audit(
         records=tuple(judged),
         problems=tuple(problems),
         history=tuple(history),
+        card=only_card,
+        assignee=assignee,
     )
 
 
@@ -704,8 +826,51 @@ def _short(sha: str) -> str:
     return sha[:7] if sha else "-"
 
 
+def _judgement_one_lines(report: MergeReport) -> list[str]:
+    """判据① 的输出行（只在给了 ``--card`` 时打印）。
+
+    格式固定（后续 CI / 文档会引用）：
+
+        判据①（merged-by == 卡 assignee）：卡 t_xxxxxxxx assignee=<x>，merged-by=<原值> → PASS
+
+    一条 trailer 记录一行；``merged-by`` 缺失或格式非法时该行写「不适用」——
+    那种情况已经由「缺字段 / 格式非法」计进问题段，判据① 不重复报。
+    """
+
+    card = report.card
+    assignee = report.assignee
+    if card is None or assignee is None:
+        return []
+    prefix = f"判据①（merged-by == 卡 assignee）：卡 {card} assignee={assignee}，"
+    trailer_records = [
+        record for record in report.records if record.source == "trailer"
+    ]
+    if not trailer_records:
+        return [f"{prefix}区间内无该卡的 trailer 记录 → 不适用"]
+    failed = {
+        problem.sha
+        for problem in report.problems
+        if problem.kind == KIND_MERGED_BY_MISMATCH
+    }
+    lines: list[str] = []
+    for record in trailer_records:
+        by = record.by if record.by is not None else "-"
+        if record.sha in failed:
+            verdict = "FAIL"
+        elif record.by is None:
+            verdict = "不适用（merged-by 缺失或非法，见问题段）"
+        else:
+            verdict = "PASS"
+        lines.append(f"{prefix}merged-by={by} → {verdict}")
+    return lines
+
+
 def render_report(report: MergeReport) -> str:
-    """把 ``MergeReport`` 渲染成人类可读文本（末行是结论，不打印退出码）。"""
+    """把 ``MergeReport`` 渲染成人类可读文本（末行是结论，不打印退出码）。
+
+    有 ``--card``（``report.card`` 非 ``None``）时在判定段之后插一段「判据①」；
+    无 ``--card`` 时该段整段不打印。
+    """
 
     lines: list[str] = [
         "合并认账稽核（合并提交三字段）",
@@ -721,6 +886,8 @@ def render_report(report: MergeReport) -> str:
             f"  {index}. {_short(record.sha)} {record.card or '-'} "
             f"{record.pr or '-'} by={record.by or '-'}"
         )
+
+    lines.extend(_judgement_one_lines(report))
 
     lines.append(f"问题（{len(report.problems)} 处）:")
     if not report.problems:

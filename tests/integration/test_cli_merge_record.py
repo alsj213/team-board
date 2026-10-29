@@ -80,9 +80,9 @@ def test_generate_prints_body_then_comment_block(
     assert len(lines) == 10, lines
     assert lines[0] == DEFAULT_TITLE
     assert lines[1] == ""
-    assert lines[2] == f"Merge-By: {BY}"
-    assert lines[3] == f"Merge-Card: {CARD}"
-    assert lines[4] == f"Merge-PR: #{PR}"
+    assert lines[2] == f"merged-by: {BY}"
+    assert lines[3] == f"merge-card: {CARD}"
+    assert lines[4] == f"merge-pr: #{PR}"
     assert lines[5] == ""
     assert lines[6].startswith("# 卡面认账块：")
     assert f"merge-audit --card {CARD} --require" in lines[6]
@@ -153,7 +153,7 @@ def test_check_file_green(
 
     assert rc == 0, (rc, out, err)
     assert err == ""
-    assert out == "通过：三字段齐（Merge-By/Merge-Card/Merge-PR）\n"
+    assert out == "通过：三字段齐（merged-by/merge-card/merge-pr）\n"
 
 
 def test_check_file_green_with_consistent_params(
@@ -175,12 +175,12 @@ def test_check_file_green_with_consistent_params(
 def test_check_file_missing_field_is_red(
     body_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """删掉 ``Merge-PR`` 那行 → rc1 ``问题: 缺字段：Merge-PR``。"""
+    """删掉 ``merge-pr`` 那行 → rc1 ``问题: 缺字段：merge-pr``。"""
 
     broken = tmp_path / "missing-pr.txt"
     broken.write_text(
         "".join(line for line in body_file.read_text(encoding="utf-8").splitlines(True)
-                if not line.startswith("Merge-PR: ")),
+                if not line.startswith("merge-pr: ")),
         encoding="utf-8",
     )
 
@@ -188,16 +188,16 @@ def test_check_file_missing_field_is_red(
 
     assert rc == 1, (rc, out, err)
     assert err == ""
-    assert "问题: 缺字段：Merge-PR" in out
+    assert "问题: 缺字段：merge-pr" in out
 
 
 def test_check_file_bad_format_is_red(
     body_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``Merge-By: pm``（没有 ``/run<N>``）→ rc1 ``问题: 格式非法：Merge-By``。"""
+    """``merged-by: pm``（没有 ``/run<N>``）→ rc1 ``问题: 格式非法：merged-by``。"""
 
     text = body_file.read_text(encoding="utf-8").replace(
-        f"Merge-By: {BY}", "Merge-By: pm"
+        f"merged-by: {BY}", "merged-by: pm"
     )
     broken = tmp_path / "bad-format.txt"
     broken.write_text(text, encoding="utf-8")
@@ -205,7 +205,7 @@ def test_check_file_bad_format_is_red(
     rc, out, err = run(["--check-file", str(broken)], capsys)
 
     assert rc == 1, (rc, out, err)
-    assert '问题: 格式非法：Merge-By 的值 "pm" 不合法' in out
+    assert '问题: 格式非法：merged-by 的值 "pm" 不合法' in out
 
 
 def test_check_file_param_mismatch_is_red(
@@ -219,7 +219,7 @@ def test_check_file_param_mismatch_is_red(
 
     assert rc == 1, (rc, out, err)
     assert "字段与参数不一致" in out
-    assert "Merge-Card" in out
+    assert "merge-card" in out
 
 
 def test_check_file_misplaced_field_is_red(
@@ -229,14 +229,14 @@ def test_check_file_misplaced_field_is_red(
 
     body = tmp_path / "misplaced.txt"
     body.write_text(
-        f"{DEFAULT_TITLE}\n\nMerge-Card: {CARD}\n\n后续说明段落不属于 trailer 块\n",
+        f"{DEFAULT_TITLE}\n\nmerge-card: {CARD}\n\n后续说明段落不属于 trailer 块\n",
         encoding="utf-8",
     )
 
     rc, out, err = run(["--check-file", str(body)], capsys)
 
     assert rc == 1, (rc, out, err)
-    assert "字段未落在 trailer 区：Merge-Card" in out
+    assert "字段未落在 trailer 区：merge-card" in out
 
 
 # ------------------------------------------------------------------- rc2 一组
@@ -312,7 +312,7 @@ def test_rc2_check_file_bad_input(
         target.write_text("", encoding="utf-8")
         path = str(target)
     elif kind == "non_utf8":
-        target.write_bytes(b"Merge-By: \xff\xfe\n")
+        target.write_bytes(b"merged-by: \xff\xfe\n")
         path = str(target)
     elif kind == "missing":
         path = str(tmp_path / "nope.txt")
