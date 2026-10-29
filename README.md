@@ -671,6 +671,67 @@ bash scripts/setup-bot-identity.sh <profile> <worktree>` 并 exit 1。钩子能�
 `--no-verify` / 重装 `core.hooksPath` 绕过，所以它只是早警，判定以 `commit-audit`
 与 CI job `commit-identity` 为准。
 
+## 卡正文上限（2048B）
+
+看板卡的正文（`tasks.body`）有 **2048 字节**硬上限（UTF-8，**按字节不按字符**）。
+超限的卡**建不出来**：`hermes kanban create` 与 `kanban_create` 工具都直接拒，
+rc=2、stderr 恰一行、卡不落库（不截断、没有开关）。
+
+存量卡（已经写进库的超限正文，本上限**不追溯改写**它们）用 `body-audit` 查 ——
+逐卡打印卡号 / 状态 / 负责人 / 字节 / 判定，外加分桶、合计、`NULL` 计数与超限清单：
+
+```
+$ PYTHONPATH=src python3 -m team_board.cli body-audit; echo rc=$?
+/home/liu/.hermes/kanban/boards/devteam/kanban.db
+口径：body 为 UTF-8 字节数；NULL body 记 NULL；上限 2048 字节
+范围：未结卡（status ∉ {done, archived}）
+分桶：
+  0          0
+  1-512      0
+  513-1024   0
+  1025-2048  9
+  2049-4096  6
+  4097-      2
+  NULL       0
+合计：17 张；超限：8 张；NULL：0 张
+明细（字节数降序：卡号 / 状态 / 负责人 / 字节 / 判定）：
+  t_3e2a3582  todo       engineer  10369  OVER
+  t_daba51a7  todo       engineer   6260  OVER
+  t_4b9d456d  ready      pm         3974  OVER
+  t_59c0eae1  scheduled  pm         3061  OVER
+  t_c9148b7c  scheduled  pm         3005  OVER
+  t_40fa5375  scheduled  pm         2728  OVER
+  t_0b2fd9a3  scheduled  pm         2698  OVER
+  t_c4ce9108  scheduled  pm         2665  OVER
+  t_4c08419a  running    engineer   2039  ok
+  t_27bc948e  todo       engineer   1932  ok
+  t_84adf65c  running    pm         1926  ok
+  t_f8978b9b  blocked    engineer   1880  ok
+  t_98ce4cf7  running    engineer   1832  ok
+  t_2f0b87d2  running    engineer   1694  ok
+  t_bfc7a403  todo       pm         1516  ok
+  t_cb6ac485  todo       pm         1316  ok
+  t_c4a840eb  scheduled  pm         1278  ok
+超限清单（8 张）：t_3e2a3582 t_daba51a7 t_4b9d456d t_59c0eae1 t_c9148b7c t_40fa5375 t_0b2fd9a3 t_c4ce9108
+rc=1
+```
+
+（快照：2026-10-29 23:42 CST，`origin/main` 91052f4 的 worktree 上实跑，输出逐字照贴、
+未截断。看板数据随时变，字节数与合计会跟着变（本卡定稿时重跑已从 17 张变过一次），
+**命令与判定口径不变**；`--all` 把已结卡也算进来，仍不含 `archived`。）
+
+超限建卡被拦的实测（正文 3000 字节）：
+
+```
+$ hermes kanban create "超限样例3000" --assignee engineer --body-file body-3000.txt
+kanban: body 超过硬上限：3000 字节（UTF-8），上限 2048 字节；长背景/证据请放附件或卡评论，卡正文只写差异部分。
+$ echo $?
+2
+```
+
+条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板 +
+实测 719 字节样例）见 [`docs/card-template.md`](docs/card-template.md)。
+
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
@@ -706,6 +767,8 @@ bash scripts/setup-bot-identity.sh <profile> <worktree>` 并 exit 1。钩子能�
 **有认账问题**、`2` 表示参数或环境错误；详见上面「合并认账稽核」一节。
 `commit-audit` 同理：`1` 表示**有身份问题**、`2` 表示参数或环境错误；详见上面
 「提交身份稽核」一节。
+`body-audit` 另有一套：`0` 无超限 / `1` **发现**超限卡 / `2` 数据源或参数错误
+（注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
 
 ## 口径
 
