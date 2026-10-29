@@ -28,7 +28,8 @@
 - 1：发现问题（``author 不在白名单`` / ``committer 不是本 bot`` /
   ``committer 与 author 不一致`` / ``身份表里没有该身份``）
 - 2：参数或环境错误（``commits.CommitAuditError`` → stderr ``错误: …``、stdout 空；
-  含卡号形态非法、仓库不是工作树、身份表缺失 / 格式错、看板库不可读或卡不存在、
+  含卡号形态非法、仓库不是工作树、身份表缺失 / 格式错、看板库不可读或没有该卡的
+  建卡事件（判据② 的 assignee 取建卡时，不取 ``tasks.assignee``）、
   ``--rev`` 解析不成提交、找不到主分支、``PATH`` 里没有 ``git``、git 输出不是
   UTF-8、stdout 编码表示不了中文）
 """
@@ -249,7 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--card",
         required=True,
         metavar="CARD",
-        help="卡号（必填；判据② 的白名单要读该卡的 assignee）",
+        help="卡号（必填；判据② 的白名单要读该卡建卡时的 assignee）",
     )
     commit_cmd.add_argument(
         "--rev",

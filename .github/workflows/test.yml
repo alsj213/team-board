@@ -157,17 +157,22 @@ jobs:
           python-version: "3.12"
       - name: Fetch all branches
         run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-      # 只在卡分支上判：main 上的合并提交由 merge-accountability 判（判据①）。
-      # 判的 rev：push 用 origin/main（此时分支是 main，会走下面「跳过」分支），
-      # PR 用 github.event.pull_request.head.sha（不是 refs/pull/N/merge 合成提交）。
+      # 只在卡分支上判；main 上的合并提交由 merge-accountability 判（判据①）。
+      # PR 的 checkout 是 detached HEAD，git branch --show-current 为空 → 分支名取 github.head_ref。
+      # runner 上没有看板库 → 由 scripts/make-audit-board.py 用 .team-board/cards.tsv 造临时库传 --db；
+      # 卡不在表里就 rc2（fail closed），不许跳过。
       - name: Run commit identity audit
         env:
           PYTHONPATH: src
+          HEAD_REF: ${{ github.head_ref }}
           AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
         run: |
-          CARD="$(git branch --show-current | sed -n 's|^wt/\(t_[0-9a-f]\{8\}\)$|\1|p')"
+          BRANCH="${HEAD_REF:-$(git branch --show-current)}"
+          CARD="$(printf '%s' "$BRANCH" | sed -n 's|^wt/\(t_[0-9a-f]\{8\}\)$|\1|p')"
           if [ -z "$CARD" ]; then
-            echo "当前分支不是 wt/<卡号>，跳过（判据①③由 merge-accountability 承担）"
+            echo "不是 wt/<卡号> 分支（${BRANCH:-detached HEAD}），跳过（判据①由 merge-accountability 承担）"
             exit 0
           fi
-          python -m team_board.cli commit-audit --repo . --card "$CARD" --rev "$AUDIT_REV"
+          python scripts/make-audit-board.py --cards .team-board/cards.tsv --card "$CARD" --out /tmp/commit-audit-board.db
+          python -m team_board.cli commit-audit --repo . --card "$CARD" --rev "$AUDIT_REV" --db /tmp/commit-audit-board.db
+

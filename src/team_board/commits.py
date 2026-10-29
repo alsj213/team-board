@@ -18,8 +18,12 @@
 每个提交按 author / committer 的**邮箱 localpart**（@ 之前那段）判：
 
 1. 判据② ``author 不在白名单``：``email_localpart(author_email)`` 必须落在
-   ``{卡 assignee, engineer, qa}`` 里（assignee 从看板库 ``tasks.assignee`` 读，
-   只读 ``mode=ro``）。
+   ``{建卡时 assignee, engineer, qa}`` 里（建卡时 assignee 读看板库
+   ``task_events`` 里 ``kind='created'`` 的 payload，只读 ``mode=ro``）。
+   为什么不用 ``tasks.assignee``：``kanban_request_review`` 会把卡改派给 reviewer，
+   于是白名单会从 ``{engineer, qa}`` 静默放宽成 ``{pm, engineer, qa}`` —— 同一批
+   提交验收前判红、验收后判绿，判据② 就成了时间相关的。取不到建卡事件一律
+   ``CommitAuditError``（fail closed，不回退 ``tasks.assignee``）。
 2. 判据③ ``committer 不是本 bot``：``email_localpart(committer_email)`` 必须在
    ``bots.tsv`` 的 profile 集合里；
    ``committer 与 author 不一致``：两者 localpart 必须相同。两条可同时出现。
@@ -36,6 +40,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -61,6 +66,9 @@ _LOG_FIELDS = 6
 
 #: 身份表默认位置（相对被稽核仓库根）
 BOTS_FILE = Path(".team-board") / "bots.tsv"
+
+#: 看板库里「建卡」事件的 kind（判据② 的 assignee 来源）
+CREATED_EVENT_KIND = "created"
 
 KIND_AUTHOR_NOT_ALLOWED = "author 不在白名单"
 KIND_COMMITTER_NOT_BOT = "committer 不是本 bot"
@@ -317,21 +325,20 @@ def _parse_log(text: str) -> tuple[CommitInfo, ...]:
     return tuple(commits)
 
 
-def card_assignee(db_path: str | Path, card: str) -> str:
-    """从看板库**只读**取该卡 assignee（``mode=ro``，不改库）。
+def _open_board_ro(db_path: str | Path, what: str) -> tuple[sqlite3.Connection, str]:
+    """以 ``mode=ro`` 打开看板库，返回 ``(连接, 原始路径字符串)``。
 
-    库不存在 / 不是 SQLite / 没有 ``tasks`` 表 / 卡不存在 / assignee 为空
-    → ``CommitAuditError``。判据② 的白名单依赖它，缺了就等于静默放宽，所以不放过。
+    路径为空 / 不存在 / 转不成 URI 或 sqlite 拒绝打开 → ``CommitAuditError``。
+    空库不会被顺手创建出来（``mode=ro`` 不建文件）。
     """
 
     raw_path = os.fspath(db_path)
     if not raw_path.strip():
-        raise CommitAuditError("看板库路径为空，无法做判据②（author 白名单需要该卡 assignee）")
+        raise CommitAuditError(f"看板库路径为空，无法做判据②（{what}）")
     path = Path(raw_path)
     if not path.exists():
         raise CommitAuditError(
-            "看板库不可读，无法做判据②（author 白名单需要该卡 assignee）："
-            f"数据源不存在: {raw_path}"
+            f"看板库不可读，无法做判据②（{what}）：数据源不存在: {raw_path}"
         )
     try:
         conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
@@ -339,8 +346,24 @@ def card_assignee(db_path: str | Path, card: str) -> str:
         # sqlite3.Error 之外还会抛 ValueError（路径转不成 URI）。两种都属「库不可用」，
         # 一律 rc2 —— 判据② 缺 assignee 就等于静默放宽白名单。
         raise CommitAuditError(
-            f"看板库不可读，无法做判据②（author 白名单需要该卡 assignee）：{exc}"
+            f"看板库不可读，无法做判据②（{what}）：{exc}"
         ) from exc
+    return conn, raw_path
+
+
+def card_assignee(db_path: str | Path, card: str) -> str:
+    """从看板库**只读**取该卡当前 assignee（``tasks.assignee``，``mode=ro``，不改库）。
+
+    库不存在 / 不是 SQLite / 没有 ``tasks`` 表 / 卡不存在 / assignee 为空
+    → ``CommitAuditError``。
+
+    注意：**判据② 不用这个函数**（``tasks.assignee`` 会被 ``kanban_request_review``
+    改派成 reviewer），判据② 用 :func:`card_creation_assignee`。这里保留给「当前
+    派给谁」这种语义（判据① 的同类读取在 :mod:`team_board.merges` 里，未动）。
+    """
+
+    what = "author 白名单需要该卡 assignee"
+    conn, raw_path = _open_board_ro(db_path, what)
     try:
         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (card,)).fetchone()
     except sqlite3.Error as exc:
@@ -356,6 +379,57 @@ def card_assignee(db_path: str | Path, card: str) -> str:
     assignee = row[0]
     if not isinstance(assignee, str) or not assignee.strip():
         raise CommitAuditError(f"卡 {card} 的 assignee 为空，无法做判据②（author 白名单）")
+    return assignee.strip()
+
+
+def card_creation_assignee(db_path: str | Path, card: str) -> str:
+    """从看板库**只读**取该卡**建卡时**的 assignee（判据② 的唯一来源）。
+
+    取 ``task_events`` 里该卡第一条 ``kind='created'`` 事件的 ``payload``，
+    解析成 JSON 后读 ``assignee``。这样判据② 与「验收时卡被改派给谁」无关：
+    同一批提交在验收前、验收后得到同一个结论。
+
+    下列一律 ``CommitAuditError``（rc2，**fail closed**：不回退到 ``tasks.assignee``、
+    不静默放过）：库不可读 / 不是 SQLite / 没有 ``task_events`` 表 / 没有 ``created``
+    事件 / payload 不是合法 JSON 或没有 ``assignee`` 键 / assignee 不是非空字符串。
+    """
+
+    what = "author 白名单需要该卡的建卡 assignee"
+    conn, raw_path = _open_board_ro(db_path, what)
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?"
+            " ORDER BY rowid LIMIT 1",
+            (card, CREATED_EVENT_KIND),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise CommitAuditError(
+            f"看板库 {raw_path} 读不了 task_events 的建卡事件，无法做判据②：{exc}"
+        ) from exc
+    finally:
+        conn.close()
+    if row is None:
+        raise CommitAuditError(
+            f"看板库 {raw_path} 里没有卡 {card} 的建卡（created）事件，无法做判据②"
+            "（不静默跳过，也不回退 tasks.assignee）"
+        )
+    payload = row[0]
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise CommitAuditError(
+            f"卡 {card} 的建卡事件 payload 不是合法 JSON，无法做判据②：{exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise CommitAuditError(
+            f"卡 {card} 的建卡事件 payload 不是 JSON 对象，无法做判据②（拿不到 assignee）"
+        )
+    assignee = data.get("assignee")
+    if not isinstance(assignee, str) or not assignee.strip():
+        raise CommitAuditError(
+            f"卡 {card} 的建卡事件 payload 里没有非空 assignee，无法做判据②"
+            "（不静默跳过，也不回退 tasks.assignee）"
+        )
     return assignee.strip()
 
 
@@ -438,7 +512,9 @@ def audit_commits(
     """稽核 ``origin/<main_branch>..<rev>`` 区间内每个非合并提交的 author / committer。
 
     参数/环境级错误一律抛 :class:`CommitAuditError`（CLI 转 rc2），检查顺序：
-    卡号形态 → 仓库 → 身份表 → 看板库 assignee → 区间终点 → 区间起点。
+    卡号形态 → 仓库 → 身份表 → 建卡 assignee → 区间终点 → 区间起点。
+    判据② 的 assignee 取**建卡时**的（:func:`card_creation_assignee`），不取
+    ``tasks.assignee``，免得验收时卡被改派给 reviewer 就把白名单放宽。
     """
 
     if not isinstance(card, str) or CARD_RE.fullmatch(card) is None:
@@ -447,7 +523,9 @@ def audit_commits(
     root = _resolve_repo(repo)
     bots = load_bots(Path(bots_path) if bots_path is not None else root / BOTS_FILE)
     profiles = frozenset(bot.profile for bot in bots)
-    assignee = card_assignee(Path(db_path) if db_path is not None else Path(DEFAULT_DB), card)
+    assignee = card_creation_assignee(
+        Path(db_path) if db_path is not None else Path(DEFAULT_DB), card
+    )
 
     rev_sha = _resolve_commit(root, rev, "区间终点")
     base_sha, _base_label = _resolve_base(root, main_branch)
@@ -486,7 +564,7 @@ def render_report(report: CommitReport) -> str:
     lines = [
         "提交身份稽核（author 白名单 + committer 是本 bot）",
         f"仓库: {report.repo}",
-        f"卡: {report.card} assignee={report.assignee}",
+        f"卡: {report.card} assignee={report.assignee}（建卡时）",
         f"区间: origin/{report.main_branch}..{report.rev}",
         f"提交（{len(report.commits)} 条）:",
     ]

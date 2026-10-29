@@ -1,16 +1,18 @@
 """commit-audit 的集成测试：纯逻辑（身份表解析 / 逐提交判定 / 渲染）与 CLI 用例。
 
 覆盖：``email_localpart``、``load_bots`` 的正常与六类坏输入、判据② 红/绿（含
-assignee 白名单、恒允许的 engineer / qa）、判据③ 红/绿（committer 不是本 bot、
-committer 与 author 不一致、两条同时出现）、合并提交不参与、空区间 rc0、
-``origin/<main>`` 回退到 ``refs/heads/<main>``、看板库只读取 assignee（含五类坏库）、
-CLI 的 rc0 / rc1 / rc2 边界与 stdout 编码失败。
+assignee 白名单、恒允许的 engineer / qa、**assignee 取建卡事件而非 ``tasks.assignee``**）、
+判据③ 红/绿（committer 不是本 bot、committer 与 author 不一致、两条同时出现）、
+合并提交不参与、空区间 rc0、``origin/<main>`` 回退到 ``refs/heads/<main>``、
+看板库只读取 assignee（含五类坏库、六类坏建卡事件）、CLI 的 rc0 / rc1 / rc2 边界与
+stdout 编码失败。
 
 真 git 仓库都在 ``tmp_path`` 里造，不碰主仓，也不依赖本机的 git 身份配置。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -114,15 +116,33 @@ def head(repo: Path) -> str:
     return git(repo, "rev-parse", "HEAD").strip()
 
 
-def make_board(path: Path, cards: dict[str, str | None]) -> Path:
-    """造一张最小看板库（只有 tasks 表），返回路径。"""
+def make_board(
+    path: Path,
+    cards: dict[str, str | None],
+    *,
+    creation: dict[str, str | None] | None = None,
+) -> Path:
+    """造一张最小看板库（``tasks`` + ``task_events`` 两张表），返回路径。
 
+    ``cards`` → ``tasks``（当前 assignee）；``creation`` → ``task_events`` 里的
+    建卡事件（建卡时 assignee），缺省与 ``cards`` 相同。判据② 读的是后者。
+    """
+
+    creation = cards if creation is None else creation
     conn = sqlite3.connect(path)
     try:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT)")
         conn.executemany(
             "INSERT INTO tasks (id, assignee) VALUES (?, ?)",
             list(cards.items()),
+        )
+        conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT)")
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+            [
+                (card, json.dumps({"assignee": assignee}, ensure_ascii=False))
+                for card, assignee in creation.items()
+            ],
         )
         conn.commit()
     finally:
@@ -148,7 +168,7 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def board(tmp_path: Path) -> Path:
-    """看板库：本卡 assignee=engineer，另一张卡 assignee=pm。"""
+    """看板库：本卡 assignee=engineer，另一张卡 assignee=pm（建卡事件与之一致）。"""
 
     return make_board(
         tmp_path / "board.db",
@@ -332,6 +352,138 @@ def test_card_assignee_without_tasks_table(tmp_path: Path) -> None:
 
     with pytest.raises(commits.CommitAuditError, match=r"读不了 tasks\.assignee"):
         commits.card_assignee(path, CARD)
+
+
+# ------------------------------------------------- card_creation_assignee（建卡时）
+
+
+def make_events_board(path: Path, events: list[tuple[str, str]]) -> Path:
+    """造只看建卡事件的库（``tasks`` 空表 + 指定的 ``task_events`` 行）。"""
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT)")
+        conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT)")
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+            events,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_card_creation_assignee_reads_created_event(tmp_path: Path) -> None:
+    """读 ``task_events`` 里 created 事件的 ``payload.assignee``（只读，不改库）。"""
+
+    board = make_board(tmp_path / "board.db", {CARD: "pm"}, creation={CARD: "engineer"})
+    before = board.read_bytes()
+
+    assert commits.card_creation_assignee(board, CARD) == "engineer"
+    assert board.read_bytes() == before
+
+
+def test_card_creation_assignee_missing_event(tmp_path: Path) -> None:
+    """没有该卡的 created 事件 → CommitAuditError（不回退 tasks.assignee）。"""
+
+    board = make_board(tmp_path / "board.db", {CARD: "engineer"}, creation={})
+
+    with pytest.raises(commits.CommitAuditError, match="没有卡 t_51f5fad0 的建卡"):
+        commits.card_creation_assignee(board, CARD)
+
+
+def test_card_creation_assignee_without_task_events_table(tmp_path: Path) -> None:
+    """库是合法 SQLite 但没有 task_events 表 → CommitAuditError。"""
+
+    path = tmp_path / "board.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT)")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(commits.CommitAuditError, match=r"读不了 task_events"):
+        commits.card_creation_assignee(path, CARD)
+
+
+@pytest.mark.parametrize(
+    ("payload", "needle"),
+    [
+        ("not json", "不是合法 JSON"),
+        ("[]", "不是 JSON 对象"),
+        ("{}", "没有非空 assignee"),
+        ('{"assignee": ""}', "没有非空 assignee"),
+        ('{"assignee": null}', "没有非空 assignee"),
+        ('{"assignee": 3}', "没有非空 assignee"),
+    ],
+)
+def test_card_creation_assignee_rejects_bad_payload(
+    tmp_path: Path, payload: str, needle: str
+) -> None:
+    """payload 坏 → CommitAuditError（fail closed，不许静默放过）。"""
+
+    board = make_events_board(tmp_path / "board.db", [(CARD, payload)])
+
+    with pytest.raises(commits.CommitAuditError, match=needle):
+        commits.card_creation_assignee(board, CARD)
+
+
+def test_card_creation_assignee_missing_db(tmp_path: Path) -> None:
+    """库不存在 → CommitAuditError，且不会把文件创建出来。"""
+
+    path = tmp_path / "nope.db"
+
+    with pytest.raises(commits.CommitAuditError, match="数据源不存在"):
+        commits.card_creation_assignee(path, CARD)
+    assert not path.exists()
+
+
+def test_card_creation_assignee_not_sqlite(tmp_path: Path) -> None:
+    """不是 SQLite 库 → CommitAuditError。"""
+
+    path = tmp_path / "board.db"
+    path.write_text("not a database\n", encoding="utf-8")
+
+    with pytest.raises(commits.CommitAuditError, match=r"读不了|不可读"):
+        commits.card_creation_assignee(path, CARD)
+
+
+def test_audit_is_time_independent_of_tasks_assignee(repo: Path, tmp_path: Path) -> None:
+    """卡验收后被改派成 pm（``tasks.assignee=pm``），建卡时是 engineer：
+
+    author=pm 必须判红（白名单仍是 ``{engineer, qa}``），卡行写「建卡时」。
+    拿 ``tasks.assignee`` 当来源的实现会在这里变绿 —— 这条就是防回退用例。
+    """
+
+    board = make_board(tmp_path / "board.db", {CARD: "pm"}, creation={CARD: "engineer"})
+    commit_as(repo, "feat: pm 越权提交", author=PM)
+
+    report = audit(repo, board)
+
+    assert report.assignee == "engineer"
+    assert [p.kind for p in report.problems] == [commits.KIND_AUTHOR_NOT_ALLOWED]
+    text = commits.render_report(report)
+    assert f"卡: {CARD} assignee=engineer（建卡时）" in text
+    assert "允许={engineer, qa}" in text
+
+
+def test_audit_green_even_if_card_reassigned_to_pm(repo: Path, tmp_path: Path) -> None:
+    """同一批 engineer 提交：不管 ``tasks.assignee`` 是 engineer 还是 pm，都判绿。
+
+    判据② 只跟「建卡时 assignee」有关，验收前后的结论必须一致。
+    """
+
+    commit_as(repo, "feat: engineer 提交", author=ENGINEER)
+    as_engineer = make_board(
+        tmp_path / "a.db", {CARD: "engineer"}, creation={CARD: "engineer"}
+    )
+    reassigned = make_board(tmp_path / "b.db", {CARD: "pm"}, creation={CARD: "engineer"})
+
+    first = audit(repo, as_engineer)
+    second = audit(repo, reassigned)
+
+    assert first.ok and second.ok
+    assert first.assignee == second.assignee == "engineer"
 
 
 # ------------------------------------------------------- 判据②③：绿（单条提交）
@@ -558,7 +710,7 @@ def test_render_report_structure(repo: Path, board: Path) -> None:
 
     assert lines[0] == "提交身份稽核（author 白名单 + committer 是本 bot）"
     assert lines[1] == f"仓库: {repo.resolve()}"
-    assert lines[2] == f"卡: {CARD} assignee=engineer"
+    assert lines[2] == f"卡: {CARD} assignee=engineer（建卡时）"
     assert lines[3] == "区间: origin/main..HEAD"
     assert lines[4] == "提交（1 条）:"
     assert lines[5] == f'  {sha[:7]} author=engineer committer=engineer "feat: 干净提交"'
@@ -700,6 +852,26 @@ def test_cli_rc2_when_repo_is_not_git(
         shutil.rmtree(plain, ignore_errors=True)
 
 
+def test_cli_rc2_without_creation_event(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """看板库里没有该卡的建卡事件 → rc2（不许回退 ``tasks.assignee`` 静默放过）。
+
+    ``tasks`` 里有这行、``task_events`` 里没有 created 事件 —— 拿 ``tasks.assignee``
+    当来源的实现会在这里 rc0，正是判据② 时间无关性的 CLI 侧防线。
+    """
+
+    board = make_board(tmp_path / "board.db", {CARD: "engineer"}, creation={})
+    commit_as(repo, "feat: 干净提交", author=ENGINEER)
+
+    rc, out, err = run(["--repo", str(repo), "--card", CARD, "--db", str(board)], capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "建卡" in err
+
+
 def test_cli_rc2_when_bots_file_malformed(
     repo: Path, board: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -770,3 +942,79 @@ def test_ascii_stdout_returns_two(repo: Path, board: Path) -> None:
     assert proc.returncode == 2
     assert proc.stdout == b""
     assert proc.stderr.decode("utf-8", "replace").startswith("错误: ")
+
+
+# ------------------------------------------- scripts/make-audit-board.py（CI 临时库）
+
+
+def _make_audit_board(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """跑 ``scripts/make-audit-board.py``（真子进程，与 CI 同一条命令）。"""
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "make-audit-board.py"
+    return subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_make_audit_board_writes_both_tables(repo: Path, tmp_path: Path) -> None:
+    """造出的库两张表都在：判据② 读得到建卡 assignee，``commit-audit`` 直接能跑。"""
+
+    cards = tmp_path / "cards.tsv"
+    cards.write_text(
+        "# 注释行\n\n" f"{CARD}\tengineer\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "board.db"
+
+    proc = _make_audit_board(
+        ["--cards", str(cards), "--card", CARD, "--out", str(out)]
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert commits.card_creation_assignee(out, CARD) == "engineer"
+    assert "assignee=engineer" in proc.stdout
+
+    commit_as(repo, "feat: engineer 提交", author=ENGINEER)
+    report = commits.audit_commits(repo, card=CARD, db_path=out)
+    assert report.ok
+    assert report.assignee == "engineer"
+
+
+def test_make_audit_board_fails_closed_on_unknown_card(tmp_path: Path) -> None:
+    """卡不在镜像表里 → rc2（不跳过、不写空 assignee）。"""
+
+    cards = tmp_path / "cards.tsv"
+    cards.write_text(f"{CARD_PM}\tpm\n", encoding="utf-8")
+    out = tmp_path / "board.db"
+
+    proc = _make_audit_board(
+        ["--cards", str(cards), "--card", CARD, "--out", str(out)]
+    )
+
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert proc.stderr.startswith("错误: ")
+    assert "不在身份镜像表" in proc.stderr
+    assert not out.exists()
+
+
+def test_make_audit_board_rejects_missing_table(tmp_path: Path) -> None:
+    """镜像表不存在 → rc2。"""
+
+    proc = _make_audit_board(
+        [
+            "--cards",
+            str(tmp_path / "nope.tsv"),
+            "--card",
+            CARD,
+            "--out",
+            str(tmp_path / "board.db"),
+        ]
+    )
+
+    assert proc.returncode == 2
+    assert "身份镜像表不存在" in proc.stderr
+

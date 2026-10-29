@@ -296,14 +296,18 @@ trailer 区），任一条有问题即 rc1。
 committer 必须是本 bot 且与 author 是同一个身份。只读 git 与看板库（`mode=ro`），
 不改分支、不碰工作区。
 
+判据①②③ 的完整口径、边界（页面级身份区分做不到）与「每 bot 提交身份怎么配」也写在
+[`docs/merge-accountability.md`](docs/merge-accountability.md)。
+
 ```
 team-board commit-audit --card t_[0-9a-f]{8} [--repo PATH] [--rev REV]
                         [--main-branch NAME] [--db PATH] [--bots PATH]
 ```
 
-- `--card CARD` —— **必填**。判据② 的白名单要读该卡的 `assignee`（看板库只读），
-  卡号形态不是 `t_` + 8 位小写十六进制（空串、大写、缺前缀、裸 8 位）→ rc2；
-  看板库里没有这张卡 / `assignee` 为空 → rc2（不静默放宽白名单）。
+- `--card CARD` —— **必填**。判据② 的白名单要读该卡**建卡时**的 `assignee`（看板库
+  `task_events` 里 `kind='created'` 事件的 payload，只读），卡号形态不是 `t_` + 8 位
+  小写十六进制（空串、大写、缺前缀、裸 8 位）→ rc2；看板库里没有这张卡的建卡事件 /
+  payload 里没有非空 `assignee` → rc2（不静默放宽白名单，也不回退 `tasks.assignee`）。
 - `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）；不是工作树 → rc2。
 - `--rev REV` —— 区间终点（默认 `HEAD`）；解析不成提交（含空串）→ rc2。
 - `--main-branch NAME` —— 区间起点取 `origin/<NAME>`，**不存在则退回
@@ -314,7 +318,10 @@ team-board commit-audit --card t_[0-9a-f]{8} [--repo PATH] [--rev REV]
 判定口径（只看区间内的**非合并提交**，`git log --no-merges`）：
 
 - **判据② author 白名单**：`author` 邮箱的 localpart（@ 之前那段）必须落在
-  `{该卡 assignee, engineer, qa}` 里，否则问题 `author 不在白名单`。
+  `{该卡**建卡时** assignee, engineer, qa}` 里，否则问题 `author 不在白名单`。
+  建卡时 assignee 取自看板库 `task_events` 里 `kind='created'` 事件的
+  `payload.assignee` —— **不用 `tasks.assignee`**：`kanban_request_review` 会把卡
+  改派给 reviewer，拿它当白名单会让同一批提交「验收前判红、验收后判绿」。
 - **判据③ committer 是本 bot**：`committer` 邮箱的 localpart 必须登记在
   `bots.tsv` 的 profile 集合里（否则 `committer 不是本 bot`），且必须与 author
   的 localpart 相同（否则 `committer 与 author 不一致`，两条可同时出现）。
