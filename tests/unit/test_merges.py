@@ -1084,3 +1084,71 @@ class TestFirstParentOnly:
         assert [record.sha for record in report.history] == [shas["pr"]]
         assert shas["sync"] not in {record.sha for record in report.history}
         assert report.ok
+
+    def test_card_branch_tip_rev_still_judges_sync_merge(self, tmp_path: Path) -> None:
+        """⑤ ``--rev`` 给卡分支尖端（CI ``pull_request`` 现状）时，同步合并照旧被判。
+
+        锁定现状，防「承诺大于实现」：``--first-parent`` 是**沿被审 rev 的链**取数，
+        不是给同步合并开豁免。rev = 卡分支尖端 → 该分支自己的同步合并就在链上，
+        缺三字段即 rc1（这就是 CI ``pull_request`` 事件 ``--rev = head.sha`` 的行为）。
+        """
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, GOOD_PR_MSG)
+        assert len(_real_git(repo, "rev-list", "--parents", "-n", "1", shas["sync"]).split()) == 3
+
+        report = audit(repo=repo, baseline=shas["baseline"], rev=shas["sync"])
+
+        assert [record.sha for record in report.records] == [shas["sync"]]
+        assert [problem.sha for problem in report.problems] == [shas["sync"]] * 3
+        assert {problem.kind for problem in report.problems} == {KIND_MISSING}
+        assert not report.ok
+
+    def test_card_side_baseline_history_only_follows_its_first_parent(
+        self, tmp_path: Path
+    ) -> None:
+        """⑥ ``--baseline`` 给卡分支侧提交时，历史段只沿 baseline 的 first-parent 链。
+
+        拓扑：``b0`` → 卡分支 ``side``；main 上另合一张 PR（``m1``，无 trailer）；
+        卡分支把 main 同步回来（``sync``）；最后把卡分支合进 main（``pr``，三字段齐）。
+        ``--baseline <sync> --rev <pr>``：判定段仍是 ``pr`` 一条、rc0（视角收窄不等于
+        放宽）；历史段不再回显 second-parent 侧的 main PR 合并 ``m1``（修前 2 条 → 1 条）。
+        """
+
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        _real_git(repo, "init", "-q", "-b", "main")
+        _commit(repo, "README.md", "base\n", "chore: 基线")
+        _real_git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "side.txt", "side\n", "feat: 卡分支提交")
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(repo, "checkout", "-q", "-b", "other")
+        _commit(repo, "other.txt", "other\n", "feat: 另一张卡")
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(
+            repo,
+            "merge",
+            "-q",
+            "--no-ff",
+            "other",
+            "-m",
+            "Merge pull request #7 from alsj213/wt/t_aaaa1111",
+        )
+        main_pr = _real_git(repo, "rev-parse", "HEAD").strip()
+        _real_git(repo, "checkout", "-q", "side")
+        _real_git(repo, "merge", "-q", "--no-ff", "main", "-m", SYNC_MSG)
+        sync = _real_git(repo, "rev-parse", "HEAD").strip()
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(repo, "merge", "-q", "--no-ff", "side", "-m", GOOD_PR_MSG)
+        pr = _real_git(repo, "rev-parse", "HEAD").strip()
+
+        # 修前取数（无 --first-parent）：历史段把 main 侧 PR 合并也数进来
+        unfiltered = _real_git(repo, "log", "--merges", "--format=%h", sync)
+        assert sorted(unfiltered.split()) == sorted([sync[:7], main_pr[:7]])
+
+        report = audit(repo=repo, baseline=sync, rev=pr)
+
+        assert [record.sha for record in report.records] == [pr]
+        assert [record.sha for record in report.history] == [sync]
+        assert main_pr not in {record.sha for record in report.history}
+        assert report.ok

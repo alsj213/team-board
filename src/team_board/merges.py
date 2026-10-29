@@ -47,9 +47,14 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
    记成 ``card=None`` 的记录，不许静默丢条目。
 9. **判定对象 = first-parent 链上的合并提交**（两段取数都带 ``--first-parent``）。
    真正的认账事件只有一种：**把卡分支合进 main** 的那个合并提交 —— 它在 main 的
-   first-parent 链上。分支侧 ``git merge origin/main`` 产生的同步合并（把 main
-   并回卡分支）落在 second-parent 链上，它**既不合任何 PR，也本来就不该有**
-   ``merge-card`` / ``merge-pr``：**既不判、也不计入** records / problems / 历史段。
+   first-parent 链上。**在被审 ``rev`` 落在 main 线上时**，分支侧 ``git merge
+   origin/main`` 产生的同步合并（把 main 并回卡分支）落在 second-parent 链上，
+   它既不合任何 PR、也本来就不该有 ``merge-card`` / ``merge-pr``，于是既不进
+   records / problems，也不进历史段。
+   但**这不等于「同步合并一律免判」**：判什么只取决于**被审 ``rev`` 的 first-parent
+   链**，不取决于某条提交是不是同步合并。``--rev`` 给的是**卡分支尖端**时，该分支
+   自己的同步合并正落在它自己的 first-parent 链上，照旧被判（缺三字段即 rc1）——
+   这正是 CI ``pull_request`` 事件（``--rev`` = ``head.sha``）的现状。
    不加 ``--all-merges`` 之类的反向开关 —— 判定对象是口径，不是可选项。
 10. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
     merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
@@ -696,8 +701,11 @@ def audit(
 
     判定段（区间内、**first-parent 链上**）走 :func:`record_from_commit`，逐条出 ``Problem``；
     历史段（``<baseline>`` 及更早，同样只取 first-parent 链）只走
-    :func:`legacy_record` 回显，**不判定**。second-parent 侧的同步合并（把 main
-    并回卡分支）两段都不进。
+    :func:`legacy_record` 回显，**不判定**。两段都只沿**被审 ``rev`` / ``baseline``
+    自己的 first-parent 链**取数：``rev`` 落在 main 线上时，分支侧「把 main 同步回
+    卡分支」的内部合并落在 second-parent 侧、两段都不进；``rev`` 给的是卡分支尖端
+    时，该分支自己的同步合并就在它自己的 first-parent 链上，照旧**被判**（这不是
+    豁免口径，CI ``pull_request`` 事件即如此）。
 
     参数/环境级错误一律抛 :class:`MergeAuditError`（CLI 转 rc2），检查顺序：
     仓库 → ``baseline``/``baseline_file`` 互斥 → ``only_card`` 形态 →
@@ -745,10 +753,12 @@ def audit(
 
     judged: list[MergeRecord] = []
     problems: list[Problem] = []
-    # --first-parent：只判「把分支合进 main」的合并提交。分支侧 ``git merge
-    # origin/main`` 产生的同步合并落在 second-parent 链上，它没有合任何 PR、
-    # 本来就不该有 merge-card/merge-pr，判它必假红（t_d22c6399）。同一条参数
-    # 也用在下面的历史段，否则历史段仍在数同步合并。
+    # --first-parent：只沿被审 rev（以及历史段的 baseline）自己的 first-parent 链取数。
+    # 被审 rev 在 main 线上时，分支侧 ``git merge origin/main`` 产生的同步合并落在
+    # second-parent 侧，它没有合任何 PR、本来就不该有 merge-card/merge-pr，判它必
+    # 假红（t_d22c6399）。反过来，rev 给卡分支尖端时，该分支自己的同步合并在自己的
+    # first-parent 链上，仍会被判 —— 判的是「链」，不是「这条提交是不是同步合并」。
+    # 同一条参数也用在下面的历史段，否则历史段仍在数同步合并。
     judged_text = _git_ok(
         root,
         "log",
