@@ -157,22 +157,17 @@ jobs:
           python-version: "3.12"
       - name: Fetch all branches
         run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-      # 只在卡分支上判；main 上的合并提交由 merge-accountability 判（判据①）。
-      # PR 的 checkout 是 detached HEAD，git branch --show-current 为空 → 分支名取 github.head_ref。
-      # runner 上没有看板库 → 由 scripts/make-audit-board.py 用 .team-board/cards.tsv 造临时库传 --db；
-      # 卡不在表里就 rc2（fail closed），不许跳过。
+      # 判定逻辑全在 scripts/ci-commit-identity.sh，这里只做四件事：
+      # checkout / setup-python / fetch / 调脚本。脚本自己从 `git show origin/main:` 读镜像表
+      # （PR 分支里改 .team-board/cards.tsv 不参与判定），卡不在表里就回落到默认白名单
+      # {engineer, qa}，不再 fail closed 把别的卡的 PR 锁死。
+      # PR 的 checkout 是 detached HEAD → 分支名取 github.head_ref；push 到 main 时为空，退回
+      # `git branch --show-current`（= main，非卡分支 → 脚本 skip rc0）。
       - name: Run commit identity audit
         env:
-          PYTHONPATH: src
           HEAD_REF: ${{ github.head_ref }}
           AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
         run: |
           BRANCH="${HEAD_REF:-$(git branch --show-current)}"
-          CARD="$(printf '%s' "$BRANCH" | sed -n 's|^wt/\(t_[0-9a-f]\{8\}\)$|\1|p')"
-          if [ -z "$CARD" ]; then
-            echo "不是 wt/<卡号> 分支（${BRANCH:-detached HEAD}），跳过（判据①由 merge-accountability 承担）"
-            exit 0
-          fi
-          python scripts/make-audit-board.py --cards .team-board/cards.tsv --card "$CARD" --out /tmp/commit-audit-board.db
-          python -m team_board.cli commit-audit --repo . --card "$CARD" --rev "$AUDIT_REV" --db /tmp/commit-audit-board.db
+          bash scripts/ci-commit-identity.sh "$PWD" "$BRANCH" "$AUDIT_REV"
 

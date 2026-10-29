@@ -1,4 +1,5 @@
 # 卡 → 建卡时 assignee（CI 专用镜像，判据② 的数据源）
+# 本表只在 main 上维护（CI 用 git show origin/main: 读它）；PR 分支里改本表不生效；新卡由 ops 追加一行。
 # 用途：scripts/make-audit-board.py 用本表在 CI runner 上造临时看板库，传给
 #       python -m team_board.cli commit-audit --db；runner 上没有真看板库。
 # 取值口径：必须等于看板库 task_events 里该卡 kind='created' 事件的 payload.assignee

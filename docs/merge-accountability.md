@@ -69,11 +69,31 @@ PYTHONPATH=src python -m team_board.cli commit-audit --repo . --card t_xxxxxxxx 
 清掉也不影响事后稽核）。所以**判定权威在 `commit-audit` + CI job
 `commit-identity`**，钩子只做早警。
 
-CI 侧：job `commit-identity` 在 PR 上用 `github.event.pull_request.head.sha`
-（不是 `refs/pull/N/merge` 合成提交）当 `--rev`，分支名取 `github.head_ref`
-（PR 的 checkout 是 detached HEAD，`git branch --show-current` 是空的），看板库由
-`scripts/make-audit-board.py` 用 `.team-board/cards.tsv`（`card<TAB>建卡时 assignee`
-镜像）在 runner 上现造。卡不在 `cards.tsv` 里 → 该步骤 rc2，**不许跳过**。
+CI 侧：判定逻辑全部在 `scripts/ci-commit-identity.sh`（job `commit-identity` 只做
+checkout / setup-python / fetch / 调脚本四步），契约
+`bash scripts/ci-commit-identity.sh <repo-path> <branch> <rev>`，退出码 0 / 1 / 2 与
+`commit-audit` 同义。脚本在两处与直接跑 `commit-audit` 不同：
+
+1. **镜像只认 main**：临时看板库的 `card<TAB>建卡时 assignee` 表来自
+   `git show origin/main:.team-board/cards.tsv`（取不到就当空表），**工作树里
+   `.team-board/cards.tsv` 不参与判定** —— 否则 PR 可以在自己被审的树里改这张表，
+   等于自己放宽判据②（自证通道）。
+2. **未知卡回落默认白名单**：`<branch>` 是 `wt/<卡号>` 而该卡不在 main 的镜像表里时，
+   脚本往副本追加一行 `$卡号<TAB>engineer` 并打印
+   `卡 <卡号> 不在 main 的镜像表 → author 白名单取默认 {engineer, qa}`，白名单因此
+   回落到 `{engineer, qa}`。**不 fail closed**：否则每张新卡都要先改同一个文件才能
+   开 PR，并行 PR 必然冲突，且「补一行」发生在被审的 PR 自己身上。
+   `{engineer, qa}` 是最严的安全默认（pm / hatch / chief 写代码本来就违规）。
+`scripts/make-audit-board.py` 自己的 fail closed（表里行坏、卡既不在表里也没被追加）
+保持原样，脚本只是透传它的 rc2。
+
+`<repo-path>` 指向别的 worktree 时，`make-audit-board.py` / `team_board.cli` /
+`bots.tsv` 仍取脚本所在的这棵树（与 `branch-audit` job「audit must run this build」
+同口径）；`--repo` 才是被稽核的仓库。
+
+CI 侧另两点不变：`--rev` 用 `github.event.pull_request.head.sha`（不是
+`refs/pull/N/merge` 合成提交），分支名取 `github.head_ref`
+（PR 的 checkout 是 detached HEAD，`git branch --show-current` 是空的）。
 
 ## 甲层 · 机器可判、可拦
 
