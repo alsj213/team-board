@@ -7,7 +7,7 @@
 
 ``branch-audit`` 子命令自己的退出码：
 - 0：无偏差
-- 1：发现偏差（提交归属 / checkout 偏移）
+- 1：发现偏差（提交归属 / checkout 偏移 / 分支结构）
 - 2：参数或环境错误（``branches.AuditError`` → stderr ``错误: …``、stdout 空、
   不冒 traceback；argparse 级坏参数照旧 rc2）。环境错误包含：``PATH`` 里没有
   ``git``、豁免表不是 UTF-8 文本、git 输出不是 UTF-8（``i18n.logOutputEncoding``
@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_cmd = subparsers.add_parser(
         "branch-audit",
-        help="稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 / 2 参数或环境错误）",
+        help="稽核卡分支提交归属、checkout 偏移与分支结构（0 无偏差 / 1 有偏差 / 2 参数或环境错误）",
     )
     audit_cmd.add_argument(
         "--repo",

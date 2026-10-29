@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 故意造偏差的演示：全部在 mktemp -d 里造仓，绝不碰真仓库。
-# 依次跑：场景 A（跨卡提交）/ 场景 A'（未声明卡号）/ 场景 B（checkout 偏移）/ 绿色基线
+# 依次跑：场景 A（跨卡提交）/ 场景 A'（未声明卡号）/ 场景 B（checkout 偏移）/
+# 场景 C（一卡两分支）/ 场景 D（从别的卡分支拉出）/ 绿色基线
 # 每条都比对退出码与关键文案，任一不符则脚本自己 rc1。
 set -u
 
@@ -79,7 +80,7 @@ check() {  # check <场景名> <期望rc> <实际rc> <输出文件> <必须包�
     fi
   done
   if [ "$ok" = 1 ]; then
-    echo "  ✓ $name（rc=$got）"
+    echo "  ✓ $name（rc=$got，符合预期）"
   else
     echo "  ✗ $name 不通过"
     FAILS=$((FAILS + 1))
@@ -136,6 +137,37 @@ cat "$TMP/b.out"
 check "场景 B" 1 "$RC" "$TMP/b.out" "$B" "wt/t_aaaaaaaa" "（应为 main）" \
   "wrongdir 当前在 wt/t_bbbbbbbb"
 
+# ------------------------------------------------ 场景 C：一卡两分支（C-1）
+echo
+echo "== 场景 C：卡 t_aaaaaaaa 有第二条分支 wt/t_aaaaaaaa-fix =="
+C="$TMP/c/repo"
+new_repo "$C"
+g "$C" checkout -q -b wt/t_aaaaaaaa
+commit_file "$C" a.txt "feat(t_aaaaaaaa): 本卡的活"
+g "$C" checkout -q main
+g "$C" checkout -q -b wt/t_aaaaaaaa-fix
+commit_file "$C" a2.txt "feat(t_aaaaaaaa): 同卡第二条分支的活"
+g "$C" checkout -q main
+run_audit "$TMP/c.out" "$C"; RC=$?
+cat "$TMP/c.out"
+check "场景 C" 1 "$RC" "$TMP/c.out" "卡 t_aaaaaaaa 有第二条分支 wt/t_aaaaaaaa-fix" \
+  "分支结构偏差（1 处）" "（提交归属 0 处 / checkout 0 处 / 分支结构 1 处）"
+
+# ------------------------------------------- 场景 D：从别的卡分支拉出（C-2）
+echo
+echo "== 场景 D：从 wt/t_bbbbbbbb 拉出 wt/t_aaaaaaaa（fork 点不在 main） =="
+D="$TMP/d/repo"
+new_repo "$D"
+g "$D" checkout -q -b wt/t_bbbbbbbb
+commit_file "$D" b.txt "feat(t_bbbbbbbb): B 卡的活"
+g "$D" checkout -q -b wt/t_aaaaaaaa   # 从别的卡分支拉出来
+commit_file "$D" a.txt "feat(t_aaaaaaaa): A 卡的活"
+g "$D" checkout -q main
+run_audit "$TMP/d.out" "$D"; RC=$?
+cat "$TMP/d.out"
+check "场景 D" 1 "$RC" "$TMP/d.out" "（它属于卡 t_bbbbbbbb 的分支）" \
+  "分支结构偏差（1 处）"
+
 # ------------------------------------------------ 绿色基线
 echo
 echo "== 绿色基线：main 干净 + 卡分支干净 + 卡 worktree 目录名=卡号 =="
@@ -169,7 +201,7 @@ fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then
-  echo "演示结论：4 个场景全部符合预期"
+  echo "演示结论：6 个场景全部符合预期"
   exit 0
 fi
 echo "演示结论：$FAILS 个场景不符合预期"
