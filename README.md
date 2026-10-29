@@ -243,19 +243,21 @@ bash scripts/demo-branch-audit.sh
 
 ## 合并认账稽核（merge-audit）
 
-事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`Merge-By`）+
-依据哪张卡（`Merge-Card`）+ 合并提交/PR 号（`Merge-PR`）。只读 git，不改分支、
-不碰工作区。三字段写在合并提交 message **末尾的 trailer 块**（每行一条）：
+事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`merged-by`）+
+依据哪张卡（`merge-card`）+ 合并提交/PR 号（`merge-pr`）。只读 git，不改分支、
+不碰工作区。三字段写在合并提交 message **末尾的 trailer 块**（每行一条，键名
+大小写敏感、**恒小写**；旧的 `Merge-By` / `Merge-Card` / `Merge-PR` 一律不再
+接受，也不做大小写兼容别名）：
 
 ```
-Merge-By: <profile>/run<NNN>       # 例 pm/run137
-Merge-Card: t_[0-9a-f]{8}          # 例 t_ad5e7ff6
-Merge-PR: #<正整数>                 # 例 #1
+merged-by: <profile>/run<NNN>       # 例 pm/run137
+merge-card: t_[0-9a-f]{8}          # 例 t_ad5e7ff6
+merge-pr: #<正整数>                 # 例 #1
 ```
 
 ```
 team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
-                       [--rev REV] [--card CARD] [--require]
+                       [--rev REV] [--card CARD] [--db PATH] [--require]
 ```
 
 - `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
@@ -267,7 +269,10 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
 - `--rev REV` —— 区间终点（默认 `HEAD`）；解析不成提交（含空串）→ rc2。
 - `--card CARD` —— 只列这张卡的合并记录（**同时过滤判定段与历史段**）；形态不是
   `t_` + 8 位小写十六进制（空串、大写、多字符、缺前缀）→ rc2。它只过滤记录
-  清单，**不隐藏已判出的问题**。
+  清单，**不隐藏已判出的问题**。给了它就**同时跑判据①**（见下）。
+- `--db PATH` —— 判据① 读 `tasks.assignee` 用的看板库，**只读**
+  （`mode=ro`，不建表、不写），默认
+  `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。只在给了 `--card` 时用。
 - `--require` —— 要求 `--card` 指定的卡有认账合并，**必须与 `--card` 同用**
   （单给 → rc2）：区间内有该卡零问题的合并 → 通过；只有基线之前的合并命中 →
   rc1 `缺认账字段（历史，基线前）`；两段都没命中 → rc1 `缺认账字段`。
@@ -275,7 +280,22 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
 区间内的每条合并提交都走 trailer 解析（缺字段 / 格式非法 / 重复字段 / 字段未落在
 trailer 区），任一条有问题即 rc1。
 
-**历史段口径**：基线之前的合并只回显 PR 号 / 卡号 / sha，`Merge-By` **无法判定**
+**判据①（`merged-by` == 该卡 assignee）**：给了 `--card` 时，`merged-by` 值里
+`/` 之前的 profile 必须**严格等于**该卡在看板库里的 `tasks.assignee`（只读
+`--db` 指定库的 `SELECT assignee FROM tasks WHERE id = ?`）。不符 → 一条问题
+`merged-by 与卡 assignee 不符`（`detail` 写 `merged-by=<原值> assignee=<卡 assignee>`）
+→ rc1，输出里多一行证据（格式固定）：
+
+```
+判据①（merged-by == 卡 assignee）：卡 t_ad5e7ff6 assignee=pm，merged-by=pm/run137 → PASS
+```
+
+不符时该行写 `→ FAIL`；没给 `--card` 时整段不打印。历史段（基线之前）的合并
+没有 `merged-by` 值，**不参与**判据①，照样只回显 `by=无法判定`。库不存在 / 不是
+合法 SQLite / 没有 `tasks` 表 / 卡不存在 / 卡没有 assignee 一律 rc2（**不静默
+跳过判据**）。
+
+**历史段口径**：基线之前的合并只回显 PR 号 / 卡号 / sha，`merged-by` **无法判定**
 （那些提交里没有该字段，也不做历史回填）—— 输出固定写 `by=无法判定`；GitHub
 默认标题认不出卡号的（例如 setup PR 的 `wt/ci-setup`）也保留，卡号位置写 `-`，
 不静默丢条目。
@@ -284,10 +304,11 @@ trailer 区），任一条有问题即 rc1。
 
 - `0` —— 无问题（`--require` 时该卡有零问题的认账合并）。
 - `1` —— 有认账问题（缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区 /
-  `--require` 未满足）。
+  `merged-by 与卡 assignee 不符` / `--require` 未满足）。
 - `2` —— 参数或环境错误：仓库路径不存在或不是 git 工作树、基线文件缺失或非法、
-  基线或 `--rev` 解析不成提交、卡号形态非法、`--require` 没带 `--card`、`PATH`
-  里没有 `git`、git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
+  基线或 `--rev` 解析不成提交、卡号形态非法、`--require` 没带 `--card`、看板库
+  不可读或不是合法 SQLite、库里没有 `--card` 指定的卡、`PATH` 里没有 `git`、
+  git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
   `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
 
 ## 通用参数

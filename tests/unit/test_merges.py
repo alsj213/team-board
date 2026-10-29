@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 import pytest
 
 from team_board.merges import (
     KIND_BAD_FORMAT,
     KIND_DUPLICATE,
+    KIND_MERGED_BY_MISMATCH,
     KIND_MISMATCH,
     KIND_MISSING,
     KIND_NOT_MERGE,
@@ -20,6 +24,8 @@ from team_board.merges import (
     MergeReport,
     Problem,
     build_message,
+    card_assignee,
+    check_merged_by,
     check_message,
     legacy_record,
     parse_trailers,
@@ -34,9 +40,9 @@ BY = "pm/run137"
 GOOD = (
     "Merge PR #15（t_c9f5866a）\n"
     "\n"
-    "Merge-By: pm/run137\n"
-    "Merge-Card: t_c9f5866a\n"
-    "Merge-PR: #15\n"
+    "merged-by: pm/run137\n"
+    "merge-card: t_c9f5866a\n"
+    "merge-pr: #15\n"
 )
 
 
@@ -48,53 +54,53 @@ class TestParseTrailers:
     def test_full_trailer_block_is_parsed_without_problems(self):
         values, problems = parse_trailers(GOOD)
         assert values == {
-            "Merge-By": "pm/run137",
-            "Merge-Card": "t_c9f5866a",
-            "Merge-PR": "#15",
+            "merged-by": "pm/run137",
+            "merge-card": "t_c9f5866a",
+            "merge-pr": "#15",
         }
         assert problems == ()
 
     def test_blank_lines_after_block_are_skipped(self):
         values, problems = parse_trailers(GOOD + "\n\n")
-        assert values["Merge-PR"] == "#15"
+        assert values["merge-pr"] == "#15"
         assert problems == ()
 
     def test_other_trailer_keys_are_ignored_silently(self):
         message = GOOD + "Signed-off-by: someone <s@example.com>\n"
         values, problems = parse_trailers(message)
         assert "Signed-off-by" not in values
-        assert values["Merge-By"] == "pm/run137"
+        assert values["merged-by"] == "pm/run137"
         assert problems == ()
 
     def test_duplicate_key_reports_once_and_keeps_last_value(self):
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
-            "Merge-By: pm/run138\n"
-            "Merge-PR: #15\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
+            "merged-by: pm/run138\n"
+            "merge-pr: #15\n"
         )
         values, problems = parse_trailers(message)
         assert kinds(problems) == [KIND_DUPLICATE]
-        assert "Merge-By" in problems[0].detail
+        assert "merged-by" in problems[0].detail
         assert "2" in problems[0].detail
-        assert values["Merge-By"] == "pm/run138"
+        assert values["merged-by"] == "pm/run138"
         assert problems[0].sha == ""
 
     def test_key_in_body_is_reported_as_not_in_trailer_zone(self):
         message = (
             "Merge PR #15（t_c9f5866a）\n"
-            "Merge-Card: t_c9f5866a\n"
+            "merge-card: t_c9f5866a\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-PR: #15\n"
+            "merged-by: pm/run137\n"
+            "merge-pr: #15\n"
         )
         values, problems = parse_trailers(message)
         assert kinds(problems) == [KIND_NOT_TRAILER]
-        assert "Merge-Card" in problems[0].detail
+        assert "merge-card" in problems[0].detail
         # 块外出现的键不算块内取值
-        assert "Merge-Card" not in values
+        assert "merge-card" not in values
 
     def test_empty_message_yields_nothing(self):
         values, problems = parse_trailers("")
@@ -105,7 +111,7 @@ class TestParseTrailers:
         message = GOOD.replace("\n", "\r\n")
         values, problems = parse_trailers(message)
         assert problems == ()
-        assert values["Merge-PR"] == "#15"
+        assert values["merge-pr"] == "#15"
 
 
 class TestRecordFromCommit:
@@ -126,12 +132,12 @@ class TestRecordFromCommit:
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
         )
         record, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
         assert kinds(problems) == [KIND_MISSING]
-        assert "Merge-PR" in problems[0].detail
+        assert "merge-pr" in problems[0].detail
         assert problems[0].sha == SHA
         assert record.pr is None
         assert record.by == "pm/run137"
@@ -139,14 +145,14 @@ class TestRecordFromCommit:
     def test_key_only_in_body_is_not_in_trailer_zone_instead_of_missing(self):
         message = (
             "Merge PR #15（t_c9f5866a）\n"
-            "Merge-Card: t_c9f5866a\n"
+            "merge-card: t_c9f5866a\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-PR: #15\n"
+            "merged-by: pm/run137\n"
+            "merge-pr: #15\n"
         )
         _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
         assert kinds(problems) == [KIND_NOT_TRAILER]
-        assert "Merge-Card" in problems[0].detail
+        assert "merge-card" in problems[0].detail
         assert KIND_MISSING not in kinds(problems)
 
     def test_single_parent_is_reported_as_not_a_merge_commit(self):
@@ -165,9 +171,9 @@ class TestRecordFromCommit:
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
-            "Merge-PR: #0\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
+            "merge-pr: #0\n"
         )
         _, problems = record_from_commit(SHA, "Merge PR #15", ("a",), message)
         assert kinds(problems) == [KIND_NOT_MERGE, KIND_BAD_FORMAT]
@@ -182,26 +188,26 @@ class TestFormatValidation:
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            f"Merge-By: {value}\n"
-            "Merge-Card: t_c9f5866a\n"
-            "Merge-PR: #15\n"
+            f"merged-by: {value}\n"
+            "merge-card: t_c9f5866a\n"
+            "merge-pr: #15\n"
         )
         _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
         assert kinds(problems) == [KIND_BAD_FORMAT]
-        assert "Merge-By" in problems[0].detail
+        assert "merged-by" in problems[0].detail
         assert value in problems[0].detail
 
     def test_illegal_merge_card_value(self):
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_ZZZZZZZZ\n"
-            "Merge-PR: #15\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_ZZZZZZZZ\n"
+            "merge-pr: #15\n"
         )
         _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
         assert kinds(problems) == [KIND_BAD_FORMAT]
-        assert "Merge-Card" in problems[0].detail
+        assert "merge-card" in problems[0].detail
         assert "t_ZZZZZZZZ" in problems[0].detail
 
     @pytest.mark.parametrize("value", ["0", "-1", "#", "#abc", ""])
@@ -209,21 +215,21 @@ class TestFormatValidation:
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
-            f"Merge-PR: {value}\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
+            f"merge-pr: {value}\n"
         )
         _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
         assert kinds(problems) == [KIND_BAD_FORMAT]
-        assert "Merge-PR" in problems[0].detail
+        assert "merge-pr" in problems[0].detail
 
     def test_huge_pr_number_is_accepted(self):
         message = (
             "Merge PR 1793160000000（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
-            "Merge-PR: #1793160000000\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
+            "merge-pr: #1793160000000\n"
         )
         record, problems = record_from_commit(SHA, "Merge PR 1793160000000", ("p1", "p2"), message)
         assert problems == ()
@@ -274,7 +280,7 @@ class TestCheckMessage:
     def test_mismatching_card_parameter(self):
         problems = check_message(build_message(card=CARD, by=BY, pr=15), card="t_0000aaaa")
         assert kinds(problems) == [KIND_MISMATCH]
-        assert "Merge-Card" in problems[0].detail
+        assert "merge-card" in problems[0].detail
         assert problems[0].sha == ""
 
     def test_mismatching_by_and_pr_parameters(self):
@@ -291,16 +297,16 @@ class TestBuildMessage:
         assert build_message(card=CARD, by=BY, pr=15) == (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "Merge-By: pm/run137\n"
-            "Merge-Card: t_c9f5866a\n"
-            "Merge-PR: #15\n"
+            "merged-by: pm/run137\n"
+            "merge-card: t_c9f5866a\n"
+            "merge-pr: #15\n"
         )
 
     def test_output_has_exactly_three_segments(self):
         message = build_message(card=CARD, by=BY, pr=15, subject="Merge PR #15")
         assert message.split("\n\n") == [
             "Merge PR #15",
-            "Merge-By: pm/run137\nMerge-Card: t_c9f5866a\nMerge-PR: #15\n",
+            "merged-by: pm/run137\nmerge-card: t_c9f5866a\nmerge-pr: #15\n",
         ]
 
     @pytest.mark.parametrize("card", ["t_ZZZZZZZZ", "t_c9f5866", "", "c9f5866a"])
@@ -358,11 +364,11 @@ class TestRenderReport:
         assert "退出码" not in text
 
     def test_one_problem_report_ends_with_count(self):
-        problem = Problem(KIND_MISSING, SHA, "Merge-PR 缺失")
+        problem = Problem(KIND_MISSING, SHA, "merge-pr 缺失")
         text = render_report(self._report((), (problem,), ()))
         assert "判定（0 条）:" in text
         assert "问题（1 处）:" in text
-        assert f"a1b2c3d {KIND_MISSING}：Merge-PR 缺失" in text
+        assert f"a1b2c3d {KIND_MISSING}：merge-pr 缺失" in text
         assert text.split("\n")[-1] == "结论：发现 1 个问题"
         assert "退出码" not in text
 
@@ -375,19 +381,19 @@ class TestRenderReport:
 DUP_MESSAGE = (
     "Merge PR #15（t_c9f5866a）\n"
     "\n"
-    "Merge-By: pm/run1\n"
-    "Merge-Card: t_c9f5866a\n"
-    "Merge-PR: #15\n"
-    "Merge-By: pm/run2\n"
+    "merged-by: pm/run1\n"
+    "merge-card: t_c9f5866a\n"
+    "merge-pr: #15\n"
+    "merged-by: pm/run2\n"
 )
 
 #: 键写在正文里、末尾块里没有（结构类问题：字段未落在 trailer 区）
 MISPLACED_MESSAGE = (
-    "Merge-Card: t_c9f5866a\n"
+    "merge-card: t_c9f5866a\n"
     "正文第二行\n"
     "\n"
-    "Merge-By: pm/run1\n"
-    "Merge-PR: #15\n"
+    "merged-by: pm/run1\n"
+    "merge-pr: #15\n"
 )
 
 STRUCTURAL_CASES = pytest.mark.parametrize(
@@ -512,3 +518,240 @@ class TestLegacyRecordZeroPr:
         assert record.parents == ()
         assert record.card == "t_c9f5866a"
         assert record.source == "legacy"
+
+
+# ------------------------------------------ 大小写：旧的三个大写键一律不认
+
+
+class TestOldUppercaseKeysRejected:
+    """改名后 ``Merge-By`` / ``Merge-Card`` / ``Merge-PR`` 不再接受（也不做兼容别名）。"""
+
+    UPPER = (
+        "Merge PR #15（t_c9f5866a）\n"
+        "\n"
+        "Merge-By: pm/run137\n"
+        "Merge-Card: t_c9f5866a\n"
+        "Merge-PR: #15\n"
+    )
+
+    def test_trailer_block_yields_no_values_and_no_structural_problem(self):
+        # 大写键不属于 TRAILER_KEYS → 当无关键忽略，解析层不报结构问题
+        values, problems = parse_trailers(self.UPPER)
+        assert values == {}
+        assert problems == ()
+
+    def test_record_reports_all_three_lowercase_keys_missing(self):
+        record, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), self.UPPER)
+        assert kinds(problems) == [KIND_MISSING, KIND_MISSING, KIND_MISSING]
+        assert [problem.detail for problem in problems] == [
+            "merged-by 缺失",
+            "merge-card 缺失",
+            "merge-pr 缺失",
+        ]
+        assert record.by is None
+        assert record.card is None
+        assert record.pr is None
+        assert record.source == "trailer"
+
+    def test_build_message_emits_lowercase_only(self):
+        message = build_message(card=CARD, by=BY, pr=15)
+        assert "merged-by: pm/run137" in message
+        assert "merge-card: t_c9f5866a" in message
+        assert "merge-pr: #15" in message
+        for upper in ("Merge-By", "Merge-Card", "Merge-PR"):
+            assert upper not in message
+
+
+# --------------------------------------------------- 判据①：merged-by == assignee
+
+
+def make_record(
+    by: str | None, *, source: str = "trailer", card: str | None = CARD
+) -> MergeRecord:
+    """造一条记录（``by`` 为 ``None`` 表示该字段缺失 / 格式非法）。"""
+
+    return MergeRecord(
+        sha=SHA,
+        subject="Merge PR #15",
+        parents=("p1", "p2") if source == "trailer" else (),
+        by=by,
+        card=card,
+        pr="#15",
+        source=source,
+    )
+
+
+class TestCheckMergedBy:
+    def test_matching_profile_passes(self):
+        assert check_merged_by(make_record("pm/run137"), "pm") == ()
+
+    def test_mismatching_profile_reports_exact_detail(self):
+        problems = check_merged_by(make_record("engineer/run9"), "pm")
+        assert kinds(problems) == [KIND_MERGED_BY_MISMATCH]
+        assert problems[0].detail == "merged-by=engineer/run9 assignee=pm"
+        assert problems[0].sha == SHA
+
+    @pytest.mark.parametrize("by", ["pm2/run1", "p/run1", "pm-x/run1", "ops/run137"])
+    def test_profile_compared_exactly_not_by_prefix_or_substring(self, by):
+        assert kinds(check_merged_by(make_record(by), "pm")) == [KIND_MERGED_BY_MISMATCH]
+
+    def test_legacy_record_is_not_judged(self):
+        legacy = legacy_record(SHA, "Merge pull request #9 from alsj213/wt/t_c9f5866a")
+        assert legacy is not None
+        assert check_merged_by(legacy, "pm") == ()
+
+    def test_missing_by_is_not_double_reported(self):
+        # 值缺失 / 格式非法已由「缺字段 / 格式非法」报过，判据① 不再添一条
+        assert check_merged_by(make_record(None), "pm") == ()
+
+
+#: 看板库 tasks 表（判据① 只读 assignee）
+_BOARD_SCHEMA = """
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    assignee TEXT,
+    status TEXT,
+    created_at INTEGER,
+    started_at INTEGER,
+    completed_at INTEGER
+);
+"""
+
+
+def make_board(path: Path, cards: dict[str, str | None]) -> Path:
+    """造一个只有 ``tasks`` 表的看板库，返回路径。"""
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_BOARD_SCHEMA)
+        for card, assignee in cards.items():
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status) VALUES (?, ?, ?, ?)",
+                (card, card, assignee, "done"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+class TestCardAssignee:
+    def test_reads_assignee_from_board(self, tmp_path: Path):
+        board = make_board(tmp_path / "board.db", {CARD: "pm"})
+        assert card_assignee(board, CARD) == "pm"
+
+    def test_accepts_str_path(self, tmp_path: Path):
+        board = make_board(tmp_path / "board.db", {CARD: "engineer"})
+        assert card_assignee(str(board), CARD) == "engineer"
+
+    def test_board_file_bytes_are_unchanged(self, tmp_path: Path):
+        # 只读打开：调用前后库文件逐字节相同（不建表、不写）
+        board = make_board(tmp_path / "board.db", {CARD: "pm"})
+        before = board.read_bytes()
+        card_assignee(board, CARD)
+        assert board.read_bytes() == before
+
+    def test_missing_card_raises_with_card_id(self, tmp_path: Path):
+        board = make_board(tmp_path / "board.db", {CARD: "pm"})
+        with pytest.raises(MergeAuditError) as excinfo:
+            card_assignee(board, "t_99999999")
+        assert "t_99999999" in str(excinfo.value)
+
+    def test_missing_db_raises(self, tmp_path: Path):
+        with pytest.raises(MergeAuditError) as excinfo:
+            card_assignee(tmp_path / "nonexistent.db", CARD)
+        assert "看板库不可读" in str(excinfo.value)
+
+    def test_file_that_is_not_sqlite_raises(self, tmp_path: Path):
+        bogus = tmp_path / "bogus.db"
+        bogus.write_bytes(b"not a sqlite database\n")
+        with pytest.raises(MergeAuditError) as excinfo:
+            card_assignee(bogus, CARD)
+        assert "看板库不可读" in str(excinfo.value)
+
+    def test_db_without_tasks_table_raises(self, tmp_path: Path):
+        empty = tmp_path / "empty.db"
+        sqlite3.connect(str(empty)).close()
+        with pytest.raises(MergeAuditError) as excinfo:
+            card_assignee(empty, CARD)
+        assert "tasks 表失败" in str(excinfo.value)
+
+    def test_null_assignee_raises_instead_of_passing(self, tmp_path: Path):
+        board = make_board(tmp_path / "board.db", {CARD: None})
+        with pytest.raises(MergeAuditError) as excinfo:
+            card_assignee(board, CARD)
+        assert "assignee 为空" in str(excinfo.value)
+
+    @pytest.mark.parametrize("card", ["", "t_ZZZZZZZZ", "t_c9f5866", "c9f5866a"])
+    def test_illegal_card_raises(self, tmp_path: Path, card: str):
+        board = make_board(tmp_path / "board.db", {CARD: "pm"})
+        with pytest.raises(MergeAuditError):
+            card_assignee(board, card)
+
+
+# ------------------------------------------------- 渲染：判据① 段（格式固定）
+
+
+def report_with(
+    records: tuple[MergeRecord, ...] = (),
+    problems: tuple[Problem, ...] = (),
+    history: tuple[MergeRecord, ...] = (),
+    *,
+    card: str | None = None,
+    assignee: str | None = None,
+) -> MergeReport:
+    return MergeReport(
+        repo="/repo/team-board",
+        baseline="origin/main",
+        rev="HEAD",
+        records=records,
+        problems=problems,
+        history=history,
+        card=card,
+        assignee=assignee,
+    )
+
+
+class TestRenderJudgementOne:
+    def test_section_is_absent_without_card(self):
+        record, _ = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), GOOD)
+        text = render_report(report_with((record,)))
+        assert "判据①" not in text
+        assert "assignee" not in text
+
+    def test_pass_line_format(self):
+        record, _ = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), GOOD)
+        text = render_report(report_with((record,), card=CARD, assignee="pm"))
+        assert (
+            f"判据①（merged-by == 卡 assignee）：卡 {CARD} assignee=pm，"
+            "merged-by=pm/run137 → PASS"
+        ) in text
+
+    def test_fail_line_format(self):
+        record, _ = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), GOOD)
+        problem = Problem(KIND_MERGED_BY_MISMATCH, SHA, "merged-by=pm/run137 assignee=engineer")
+        text = render_report(
+            report_with((record,), (problem,), card=CARD, assignee="engineer")
+        )
+        assert (
+            f"判据①（merged-by == 卡 assignee）：卡 {CARD} assignee=engineer，"
+            "merged-by=pm/run137 → FAIL"
+        ) in text
+
+    def test_line_says_not_applicable_when_no_trailer_record(self):
+        legacy = legacy_record(SHA, "Merge pull request #9 from alsj213/wt/t_c9f5866a")
+        assert legacy is not None
+        text = render_report(report_with((), (), (legacy,), card=CARD, assignee="pm"))
+        assert f"判据①（merged-by == 卡 assignee）：卡 {CARD} assignee=pm，" in text
+        assert "区间内无该卡的 trailer 记录 → 不适用" in text
+
+    def test_line_says_not_applicable_when_by_missing(self):
+        message = "Merge PR #15（t_c9f5866a）\n\nmerge-card: t_c9f5866a\nmerge-pr: #15\n"
+        record, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
+        text = render_report(
+            report_with((record,), problems, card=CARD, assignee="pm")
+        )
+        assert "merged-by=- → 不适用" in text
+        assert "缺字段：merged-by 缺失" in text
+
