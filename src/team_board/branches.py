@@ -49,6 +49,11 @@
   （孤立历史）或落在别的卡分支上同样判红。后者点名的卡号只来自「fork 点是
   别的卡分支 ref 的祖先」这一条判据 —— 分支上自己的前置提交（跨卡提交）由
   规则 A + 豁免表管，C-2 不拿它们做归因。
+  取父提交后还要**沿 first-parent 跳过 merge 提交**：卡分支上先
+  ``git merge --no-ff main`` 再落第一个卡提交时，第一个卡提交的父提交正是那个
+  merge 提交（它不在 main 上），跳过它才拿得到真正的 fork 点，否则假红。
+  归因（``forked_from_cards``）的来源是**全仓卡分支**（不只本次稽核的 refs），
+  因此全量模式与 ``--branch`` 模式给出的文案一致 —— CI 恒走 ``--branch`` 那条。
 
 已知限制（本版本明确不做）：
 
@@ -607,6 +612,29 @@ def _is_ancestor(repo: str | Path, ancestor: str, descendant: str) -> bool:
     raise AuditError(f"判断祖先关系失败（{ancestor} → {descendant}）: {tail}")
 
 
+def _parent_count(repo: str | Path, sha: str) -> int:
+    """``sha`` 的父提交数：0 = 根提交，1 = 普通提交，≥2 = merge 提交。
+
+    ``git rev-list --parents -n 1 <sha>`` 输出「sha 父1 父2 …」，减一即父提交数。
+    解析不出 sha 列（输出为空等）一律 ``AuditError`` —— 不许当 0，否则会把
+    「读不到」伪装成「根提交」，把环境错误降级成业务红。
+    """
+
+    raw = _must_git(
+        repo,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        sha,
+        what=f"读取父提交数失败（{sha}）",
+    )
+    tokens = raw.split()
+    if not tokens:
+        raise AuditError(f"读取父提交数失败（{sha}）: rev-list 没有输出")
+    return len(tokens) - 1
+
+
 def _fork_findings(
     repo: str | Path,
     *,
@@ -614,15 +642,18 @@ def _fork_findings(
     base_ref: str,
     refs: list[tuple[str, str]],
 ) -> tuple[ForkPointFinding, ...]:
-    """规则 C-2：卡分支第一个申报本卡号的提交，其父提交必须落在主分支上。
+    """规则 C-2：卡分支第一个申报本卡号的提交，其 fork 点必须落在主分支上。
 
-    ``refs`` 就是规则 A 正在稽核的 ``[(card, ref), ...]``，因此本规则受
-    ``--branch`` 影响。
+    ``refs`` 就是规则 A 正在稽核的 ``[(card, ref), ...]``，因此本规则的**稽核
+    范围**受 ``--branch`` 影响；但 ``forked_from_cards`` 的归因源是全仓卡分支
+    （见 ``_all_branch_names``），两种模式文案一致。
 
-    取 fork 点的两步（其余全沿用旧逻辑）：先在 ``<base>..<ref>`` 的自有提交
+    取 fork 点的三步（其余全沿用旧逻辑）：先在 ``<base>..<ref>`` 的自有提交
     （``--no-merges``、时间正序）里找**第一个申报本卡号的提交**；找不到即跳过
     该 ref（这些提交已被规则 A 判「未声明卡号 / 跨卡提交」）。再取该提交的
-    父提交当 fork 点。
+    父提交，然后**沿 first-parent 跳过 merge 提交**（卡分支先
+    ``git merge --no-ff main`` 再落卡提交时，父提交正是不在 main 上的那个
+    merge 提交），跳过后的提交才是 fork 点。
     """
 
     main_refs = [
@@ -679,6 +710,29 @@ def _fork_findings(
             tail = detail[-1] if detail else f"退出码 {parent.returncode}"
             raise AuditError(f"读取 fork 点失败（{first}^）: {tail}")
 
+        if fork_point is not None:
+            # 沿 first-parent 跳过 merge 提交：卡分支先 `git merge --no-ff main`
+            # 再落第一个卡提交时，父提交是那个 merge 提交（不在 main 上），
+            # 不跳过就会把「从 main 拉出来的分支」判成假红。first-parent 走的是
+            # 分支自己的历史，第二个父（被合进来的 main）不算。
+            cand = fork_point
+            for _ in range(64):
+                if _parent_count(repo, cand) <= 1:
+                    break
+                cand = _must_git(
+                    repo,
+                    "rev-parse",
+                    "--quiet",
+                    "--verify",
+                    f"{cand}^1",
+                    what=f"读取 fork 点失败（{cand}^1）",
+                ).strip()
+            else:
+                raise AuditError(
+                    f"读取 fork 点失败（{first}^）: 连续 64 层都是 merge 提交"
+                )
+            fork_point = cand or None
+
         if fork_point is not None and any(
             _is_ancestor(repo, fork_point, main_ref) for main_ref in main_refs
         ):
@@ -687,12 +741,19 @@ def _fork_findings(
         claimed: set[str] = set()
         if fork_point is not None:
             # 只按「fork 点是别的卡分支 ref 的祖先」归因；分支自己的前置提交
-            # （跨卡提交）由规则 A + 豁免表管，不算进 forked_from_cards
+            # （跨卡提交）由规则 A + 豁免表管，不算进 forked_from_cards。
+            # 归因源必须是**全仓卡分支**（C-1 的那份枚举）：只扫本次稽核的 refs
+            # 时 `--branch` 模式下只有 1 条，claimed 恒空，同一事实会给出两种文案。
+            card_refs = [
+                (match.group(1), other_ref)
+                for name, other_refs in _all_branch_names(repo).items()
+                if (match := BRANCH_RE.match(name))
+                for other_ref in other_refs
+            ]
             claimed = {
                 other_card
-                for other_card, other_ref in refs
-                if other_card != card
-                and _is_ancestor(repo, fork_point, other_ref)
+                for other_card, other_ref in card_refs
+                if other_card != card and _is_ancestor(repo, fork_point, other_ref)
             }
         findings.append(
             ForkPointFinding(
