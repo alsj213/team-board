@@ -21,6 +21,16 @@
 - 2：参数或环境错误（``merges.MergeAuditError`` → stderr ``错误: …``、stdout 空；
   含仓库不是工作树、基线文件不存在 / 非 UTF-8 / 空 / 多行、``PATH`` 里没有
   ``git``、git 输出不是 UTF-8、stdout 编码表示不了中文）
+
+``commit-audit`` 子命令沿用同一组数字但语义是「提交身份问题」：
+- 0：区间内每个提交的 author 都在白名单里、committer 都是本 bot 且与 author 一致
+  （区间为空也算通过：输出一行 ``区间内无提交``）
+- 1：发现问题（``author 不在白名单`` / ``committer 不是本 bot`` /
+  ``committer 与 author 不一致`` / ``身份表里没有该身份``）
+- 2：参数或环境错误（``commits.CommitAuditError`` → stderr ``错误: …``、stdout 空；
+  含卡号形态非法、仓库不是工作树、身份表缺失 / 格式错、看板库不可读或卡不存在、
+  ``--rev`` 解析不成提交、找不到主分支、``PATH`` 里没有 ``git``、git 输出不是
+  UTF-8、stdout 编码表示不了中文）
 """
 
 from __future__ import annotations
@@ -31,7 +41,7 @@ import sys
 import time
 from datetime import date, datetime
 
-from . import branches, commands, db, merges, web
+from . import branches, commands, commits, db, merges, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -103,7 +113,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**七个**子命令。
+    """建 CLI 前端：prog=team-board，共**八个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -113,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
     - ``merge-audit``：稽核合并提交的认账三字段（0 无问题 / 1 有问题 / 2 参数或
       环境错误），吃 ``--repo`` / ``--baseline`` / ``--baseline-file`` / ``--rev`` /
       ``--card`` / ``--require``；
+    - ``commit-audit``：稽核区间内提交的 author 白名单与 committer 身份（0 无问题 /
+      1 有问题 / 2 参数或环境错误），吃 ``--repo`` / ``--card`` / ``--rev`` /
+      ``--main-branch`` / ``--db`` / ``--bots``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -220,6 +233,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--require",
         action="store_true",
         help="要求 --card 指定的卡有认账合并（必须与 --card 同用）",
+    )
+
+    commit_cmd = subparsers.add_parser(
+        "commit-audit",
+        help="稽核提交身份（author 白名单 + committer 是本 bot；0 无问题 / 1 有问题 / 2 参数或环境错误）",
+    )
+    commit_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要稽核的 git 仓库路径（默认当前目录）",
+    )
+    commit_cmd.add_argument(
+        "--card",
+        required=True,
+        metavar="CARD",
+        help="卡号（必填；判据② 的白名单要读该卡的 assignee）",
+    )
+    commit_cmd.add_argument(
+        "--rev",
+        default="HEAD",
+        metavar="REV",
+        help="区间终点（默认 HEAD）",
+    )
+    commit_cmd.add_argument(
+        "--main-branch",
+        default="main",
+        metavar="NAME",
+        help="主分支名（区间起点 origin/<NAME>，不存在则退回 refs/heads/<NAME>；默认 main）",
+    )
+    commit_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    commit_cmd.add_argument(
+        "--bots",
+        default=None,
+        metavar="PATH",
+        help="bot 身份表路径（默认 <repo>/.team-board/bots.tsv）",
     )
 
     serve = subparsers.add_parser(
@@ -383,6 +437,42 @@ def _run_merge_audit(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _run_commit_audit(args: argparse.Namespace) -> int:
+    """``commit-audit`` 子命令：CommitAuditError → stderr ``错误: …`` + rc2，不冒 traceback。
+
+    报告整块生成后再一次性写出：stdout 编码表示不了中文（如
+    ``PYTHONIOENCODING=ascii``）属于环境级错误 → rc2、stdout 空、stderr
+    ``错误: …``，不许退化成 rc1 + traceback（rc1 是「发现问题」的专用码）。
+    """
+
+    try:
+        report = commits.audit_commits(
+            args.repo,
+            card=args.card,
+            rev=args.rev,
+            main_branch=args.main_branch,
+            db_path=args.db,
+            bots_path=args.bots,
+        )
+    except commits.CommitAuditError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    text = commits.render_report(report)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # TextIOWrapper 先整体编码再写出：编码失败时 stdout 里一个字节都没落
+        _write_stderr_error(
+            "当前 stdout 编码 "
+            f"{getattr(sys.stdout, 'encoding', None)!r} 无法表示稽核报告里的中文，"
+            "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
+        )
+        return 2
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -392,6 +482,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "merge-audit":
         return _run_merge_audit(args)
+
+    if args.command == "commit-audit":
+        return _run_commit_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)

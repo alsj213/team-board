@@ -142,3 +142,32 @@ jobs:
       # 只扫 src：pytest 断言的 B101 是噪声
       - name: Run bandit
         run: python -m bandit -r src -q --severity-level all --confidence-level all
+
+  commit-identity:
+    name: commit-identity (author 白名单 + committer 是本 bot)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch all branches
+        run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      # 只在卡分支上判：main 上的合并提交由 merge-accountability 判（判据①）。
+      # 判的 rev：push 用 origin/main（此时分支是 main，会走下面「跳过」分支），
+      # PR 用 github.event.pull_request.head.sha（不是 refs/pull/N/merge 合成提交）。
+      - name: Run commit identity audit
+        env:
+          PYTHONPATH: src
+          AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
+        run: |
+          CARD="$(git branch --show-current | sed -n 's|^wt/\(t_[0-9a-f]\{8\}\)$|\1|p')"
+          if [ -z "$CARD" ]; then
+            echo "当前分支不是 wt/<卡号>，跳过（判据①③由 merge-accountability 承担）"
+            exit 0
+          fi
+          python -m team_board.cli commit-audit --repo . --card "$CARD" --rev "$AUDIT_REV"

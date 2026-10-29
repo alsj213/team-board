@@ -22,9 +22,9 @@ team-board member engineer
 team-board export
 ```
 
-共七个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` / `serve`
+共八个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` / `commit-audit` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，
-`merge-audit` 见「合并认账稽核」一节）。
+`merge-audit` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -290,10 +290,86 @@ trailer 区），任一条有问题即 rc1。
   里没有 `git`、git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
   `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
 
+## 提交身份稽核（commit-audit）
+
+事后稽核卡分支上**每条提交的提交者身份**（判据②③）：author 必须是本卡允许的执行者，
+committer 必须是本 bot 且与 author 是同一个身份。只读 git 与看板库（`mode=ro`），
+不改分支、不碰工作区。
+
+```
+team-board commit-audit --card t_[0-9a-f]{8} [--repo PATH] [--rev REV]
+                        [--main-branch NAME] [--db PATH] [--bots PATH]
+```
+
+- `--card CARD` —— **必填**。判据② 的白名单要读该卡的 `assignee`（看板库只读），
+  卡号形态不是 `t_` + 8 位小写十六进制（空串、大写、缺前缀、裸 8 位）→ rc2；
+  看板库里没有这张卡 / `assignee` 为空 → rc2（不静默放宽白名单）。
+- `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）；不是工作树 → rc2。
+- `--rev REV` —— 区间终点（默认 `HEAD`）；解析不成提交（含空串）→ rc2。
+- `--main-branch NAME` —— 区间起点取 `origin/<NAME>`，**不存在则退回
+  `refs/heads/<NAME>`**（本地没 fetch 过也能跑）；两者都没有 → rc2。
+- `--db PATH` —— 看板库，默认 `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
+- `--bots PATH` —— bot 身份表，默认 `<repo>/.team-board/bots.tsv`。
+
+判定口径（只看区间内的**非合并提交**，`git log --no-merges`）：
+
+- **判据② author 白名单**：`author` 邮箱的 localpart（@ 之前那段）必须落在
+  `{该卡 assignee, engineer, qa}` 里，否则问题 `author 不在白名单`。
+- **判据③ committer 是本 bot**：`committer` 邮箱的 localpart 必须登记在
+  `bots.tsv` 的 profile 集合里（否则 `committer 不是本 bot`），且必须与 author
+  的 localpart 相同（否则 `committer 与 author 不一致`，两条可同时出现）。
+- **身份表里没有该身份**：author 的 localpart 不在 `bots.tsv` 里 —— 这条提交的作者
+  没有登记过的 bot 身份，单独点名，免得只看到「committer 不是本 bot」而以为作者没问题。
+- 区间为空 → 输出一行 `区间内无提交`、rc0。
+
+为什么判定权在 `commit-audit` + CI 而不在钩子：`--no-verify`、提交消息里先写
+`Co-authored-by`、`core.hooksPath` 被重装，三种都能让钩子失效；钩子只做早警。
+
+退出码：
+
+- `0` —— 无问题（区间为空也算）。
+- `1` —— 有问题（上面四类问题任一）。
+- `2` —— 参数或环境错误（卡号形态非法、仓库不是工作树、身份表缺失 / 不是 UTF-8 /
+  某行不是三列 / profile 重复、看板库不可读或卡不存在、`--rev` 解析不成提交、
+  找不到主分支、`PATH` 里没有 `git`、git 输出不是 UTF-8、stdout 编码表示不了中文）；
+  stderr 以 `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
+
+### 每 bot 提交身份怎么配
+
+身份表 `.team-board/bots.tsv` 是唯一身份源（`profile<TAB>name<TAB>email`，`#` 开头
+的注释行与空行忽略）：
+
+```
+pm	pm	pm@team-board.local
+engineer	engineer	engineer@team-board.local
+...
+```
+
+注意 GitHub 页面**恒显示 `alsj213`**（单账号），这张表只解决「提交元数据里能区分」，
+不解决页面显示 —— 别指望它让网页出现六个头像。
+
+每个 bot 在自己的 worktree 里跑一次（幂等，重复跑不报错）：
+
+```
+bash scripts/setup-bot-identity.sh engineer /home/liu/project/tb-wt/<卡号>
+```
+
+脚本做四件事：从 `<worktree>/.team-board/bots.tsv` 查 profile（查不到 → stderr
+提示 + exit 2）、给主仓开 `extensions.worktreeConfig true`、写本 worktree 的
+`--worktree user.name/user.email`（只影响这个 worktree，不动主仓、不动别的卡）、
+打印写入后的 `user.email`。
+
+之后每次 `git commit` 都会被 `.githooks/pre-commit` 早警：`user.email` 的 localpart
+不在表里、或 `git var GIT_COMMITTER_IDENT` 里的邮箱与它不一致（`git -c user.email=…
+commit` 就是这么暴露的）→ 打印 `[pre-commit] committer 不是本 bot：<实际>；先跑
+bash scripts/setup-bot-identity.sh <profile> <worktree>` 并 exit 1。钩子能被执行
+`--no-verify` / 重装 `core.hooksPath` 绕过，所以它只是早警，判定以 `commit-audit`
+与 CI job `commit-identity` 为准。
+
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
-`branch-audit` / `merge-audit` 各有自己的参数）：
+`branch-audit` / `merge-audit` / `commit-audit` 各有自己的参数）：
 
 - `--db PATH` —— 看板库路径，默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
@@ -323,6 +399,8 @@ trailer 区），任一条有问题即 rc1。
 `branch-audit` 沿用同一组数字但语义不同：`1` 表示**发现偏差**（不是数据源错误），
 `2` 表示参数或环境错误；详见上面「分支稽核」一节。`merge-audit` 同理：`1` 表示
 **有认账问题**、`2` 表示参数或环境错误；详见上面「合并认账稽核」一节。
+`commit-audit` 同理：`1` 表示**有身份问题**、`2` 表示参数或环境错误；详见上面
+「提交身份稽核」一节。
 
 ## 口径
 
