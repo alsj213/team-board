@@ -79,7 +79,9 @@ def test_scenario_a_foreign_card_is_red(
     assert "t_aaaaaaaa" in out  # 分支卡号
     assert "t_bbbbbbbb" in out  # 对方卡号
     assert "跨卡提交" in out
-    assert out.rstrip().endswith("（提交归属 1 处 / checkout 0 处）")
+    assert out.rstrip().endswith(
+        "（提交归属 1 处 / checkout 0 处 / 分支结构 0 处）"
+    )
 
 
 def test_scenario_a_foreign_card_from_path_evidence(

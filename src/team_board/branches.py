@@ -1,4 +1,4 @@
-"""分支稽核：卡分支上的提交归属（规则 A）与 checkout 偏移（规则 B）。
+"""分支稽核：提交归属（规则 A）、checkout 偏移（规则 B）与一卡一分支（规则 C）。
 
 只依赖标准库与 ``git`` 可执行文件，不引入任何新依赖。
 
@@ -19,7 +19,7 @@
 
 豁免只能按「分支卡号 + 对方卡号（或未声明）+ 提交 sha」逐条登记，命中时从
 ``findings`` 移到 ``suppressed`` 并在输出里逐条回显理由，绝不静默吞掉。
-豁免对规则 B 不生效。
+豁免对规则 B、规则 C 不生效。
 
 规则 B —— checkout 偏移
 ------------------------
@@ -27,6 +27,38 @@
   ``refs/heads/<main_branch>``；
 - 其它 worktree：detached HEAD 一律判红；分支为 ``wt/t_<X>`` 时目录名必须
   精确等于 ``t_<X>``；分支为 ``<main_branch>`` 通过；其它分支判红。
+
+规则 C —— 一卡一分支
+--------------------
+两类判红，**豁免表对规则 C 不生效**：
+
+- ``一卡多分支``（C-1）：全仓枚举 ``refs/heads`` 与 ``refs/remotes/origin``
+  （只看 ``origin`` 一个远端，其它 remote 忽略），去掉前缀后**同名分支的本地与
+  origin 两份合并成一条**；分支名里出现卡号、但分支名**不精确等于**
+  ``wt/<卡号>``（``wt/<卡号>-fix``、``<卡号>``、``x/<卡号>``、``wt/<卡号>/y``
+  都算）即判红。分支名里提取不到卡号的（``main``、``pm/ci-check``、
+  ``wt/ci-setup``、``HEAD``）一律跳过。``evidence/<单段名>``（R11 证据分支
+  命名空间，只许一段）不参与 C-1 —— 它不占卡分支命名空间。
+  C-1 是**全仓枚举，与 ``--branch`` 无关**。
+- ``fork 点不在 main``（C-2）：只对规则 A 正在稽核的那批卡分支 ref 生效（因此
+  **受 ``--branch`` 影响**）。在 ``<base>..<ref>`` 的自有提交（``--no-merges``、
+  ``--first-parent``、时间正序）里取**第一个申报本卡号的提交**（取不到该 ref
+  即跳过，这些提交由规则 A 判「未声明卡号 / 跨卡提交」），该提交的父提交
+  （fork 点）必须落在本地 ``<main_branch>`` 或 ``origin/<main_branch>`` 任一上
+  （本地 ``main`` 可能落后 ``origin/main``，只看本地会造假红）；没有父提交
+  （孤立历史）或落在别的卡分支上同样判红。后者点名的卡号只来自「fork 点是
+  别的卡分支 ref 的祖先」这一条判据 —— 分支上自己的前置提交（跨卡提交）由
+  规则 A + 豁免表管，C-2 不拿它们做归因。
+
+已知限制（本版本明确不做）：
+
+- 豁免表对规则 C 不生效；「分支上先落一条跨卡提交、再落本卡提交」仍按
+  「本卡第一个提交的父提交不在 main 上」判红，只是不再把前置提交的卡号算进
+  归因；
+- 浅克隆（``--depth`` 边界）下 ``merge-base --is-ancestor`` 会假红，CI 用
+  ``fetch-depth: 0`` 不受影响；
+- ``证据分支（N 条…）:`` 单列段与 ``--branch evidence/<名>`` 直接 rc0 归
+  ``t_3e2a3582``，本模块只做「不判红」这一半。
 
 退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``，
 含 ``PATH`` 里没有 ``git``、豁免表不是 UTF-8、**git 输出不是 UTF-8**）。
@@ -49,11 +81,16 @@ CARD_RE = re.compile(r"(?<![0-9a-zA-Z_])t_[0-9a-f]{8}(?![0-9a-f])")
 #: 卡分支名：``wt/`` + 卡号，整体精确匹配
 BRANCH_RE = re.compile(r"^wt/(t_[0-9a-f]{8})$")
 
+#: R11 证据分支命名空间：``evidence/`` + **单段**名
+_EVIDENCE_RE = re.compile(r"^evidence/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 #: allowlist 里的 sha 字段：7–40 位小写十六进制
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 KIND_NO_CARD = "未声明卡号"
 KIND_FOREIGN = "跨卡提交"
+KIND_MULTI_BRANCH = "一卡多分支"
+KIND_FORK_POINT = "fork 点不在 main"
 
 _RS = "\x1e"
 _US = "\x1f"
@@ -94,6 +131,27 @@ class CheckoutDrift:
 
 
 @dataclass(frozen=True)
+class BranchSetFinding:
+    """规则 C-1：一个卡号出现了第二条分支。"""
+
+    card: str
+    branch: str
+    refs: tuple[str, ...]
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ForkPointFinding:
+    """规则 C-2：卡分支的 fork 点不在 main 上。"""
+
+    card: str
+    branch: str
+    first_commit: str
+    fork_point: str | None
+    forked_from_cards: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class AllowEntry:
     """一条按提交登记的豁免。"""
 
@@ -114,12 +172,14 @@ class Report:
     drifts: tuple[CheckoutDrift, ...]
     suppressed: tuple[tuple[AllowEntry, Finding], ...]
     notes: tuple[str, ...] = field(default=())
+    multi: tuple[BranchSetFinding, ...] = field(default=())
+    forks: tuple[ForkPointFinding, ...] = field(default=())
 
     @property
     def ok(self) -> bool:
-        """没有任何提交归属偏差与 checkout 偏移。"""
+        """没有任何提交归属偏差、checkout 偏移与分支结构偏差。"""
 
-        return not self.findings and not self.drifts
+        return not (self.findings or self.drifts or self.multi or self.forks)
 
 
 def _git(repo: str | Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -457,6 +517,195 @@ def _checkout_drifts(
     return drifts
 
 
+def _strip_ref_prefix(ref: str) -> str:
+    """``refs/heads/x`` / ``refs/remotes/origin/x`` → ``x``（其它原样返回）。"""
+
+    for prefix in ("refs/heads/", "refs/remotes/origin/"):
+        if ref.startswith(prefix):
+            return ref[len(prefix) :]
+    return ref
+
+
+def _all_branch_names(repo: str | Path) -> dict[str, tuple[str, ...]]:
+    """全仓分支名 → 该名字下的完整 ref（本地 + ``origin``，排序去重）。
+
+    只看 ``origin`` 一个远端，其它 remote 忽略。
+    """
+
+    raw = _must_git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads",
+        "refs/remotes/origin",
+        what="枚举全部分支失败",
+    )
+    found: dict[str, set[str]] = {}
+    for line in raw.splitlines():
+        ref = line.strip()
+        if not ref:
+            continue
+        name = _strip_ref_prefix(ref)
+        if not name:
+            continue
+        found.setdefault(name, set()).add(ref)
+    return {name: tuple(sorted(refs)) for name, refs in found.items()}
+
+
+def _is_evidence_branch(name: str) -> bool:
+    """R11 证据分支命名空间：``evidence/<单段名>``（只许一段）。"""
+
+    return _EVIDENCE_RE.match(name) is not None
+
+
+def _branch_set_findings(
+    names: dict[str, tuple[str, ...]],
+) -> tuple[BranchSetFinding, ...]:
+    """规则 C-1：分支名申报了卡号、却不在 ``wt/<卡号>`` 上。
+
+    ``names``：分支名（已去掉 ``refs/heads/`` 或 ``refs/remotes/origin/``
+    前缀）→ 该名字下的全部完整 ref（本地 + origin，已去重）。本地与 origin
+    同名分支在这里已经是同一条，因此不会因两边都在而重复判红。
+    """
+
+    findings: list[BranchSetFinding] = []
+    for branch in sorted(names):
+        if _is_evidence_branch(branch):
+            # R11 ②：证据分支不占卡分支命名空间，不参与 C-1
+            continue
+        refs = tuple(sorted(set(names[branch])))
+        for card in sorted(_cards_in(branch)):
+            if branch == f"wt/{card}":
+                continue
+            findings.append(
+                BranchSetFinding(
+                    card=card,
+                    branch=branch,
+                    refs=refs,
+                    evidence=(
+                        f"分支名 {branch} 不在 wt/{card}"
+                        f"（卡分支只能叫 wt/{card}）"
+                    ),
+                )
+            )
+    return tuple(sorted(findings, key=lambda item: (item.card, item.branch)))
+
+
+def _is_ancestor(repo: str | Path, ancestor: str, descendant: str) -> bool:
+    """``ancestor`` 是否为 ``descendant`` 的祖先。
+
+    rc0 → 是，rc1 → 否；其它 rc 是环境级错误（不许当绿、也不许当红）。
+    """
+
+    proc = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    tail = detail[-1] if detail else f"退出码 {proc.returncode}"
+    raise AuditError(f"判断祖先关系失败（{ancestor} → {descendant}）: {tail}")
+
+
+def _fork_findings(
+    repo: str | Path,
+    *,
+    main_branch: str,
+    base_ref: str,
+    refs: list[tuple[str, str]],
+) -> tuple[ForkPointFinding, ...]:
+    """规则 C-2：卡分支第一个申报本卡号的提交，其父提交必须落在主分支上。
+
+    ``refs`` 就是规则 A 正在稽核的 ``[(card, ref), ...]``，因此本规则受
+    ``--branch`` 影响。
+
+    取 fork 点的两步（其余全沿用旧逻辑）：先在 ``<base>..<ref>`` 的自有提交
+    （``--no-merges``、时间正序）里找**第一个申报本卡号的提交**；找不到即跳过
+    该 ref（这些提交已被规则 A 判「未声明卡号 / 跨卡提交」）。再取该提交的
+    父提交当 fork 点。
+    """
+
+    main_refs = [
+        ref
+        for ref in (
+            f"refs/heads/{main_branch}",
+            f"refs/remotes/origin/{main_branch}",
+        )
+        if _ref_exists(repo, ref)
+    ]
+
+    findings: list[ForkPointFinding] = []
+    seen: set[tuple[str, str]] = set()
+    for card, ref in refs:
+        own = _parse_commits(
+            _must_git(
+                repo,
+                "log",
+                "--no-merges",
+                "--first-parent",
+                "--reverse",
+                f"--format={_RS}%H{_US}%s",
+                f"{base_ref}..{ref}",
+                what=f"读取提交序列失败（{ref}）",
+            )
+        )
+        if not own:
+            # 该分支没有自有的提交（已并入主分支），不算 fork 点偏差
+            continue
+        index = next(
+            (
+                position
+                for position, commit in enumerate(own)
+                if card in _cards_in(commit.subject)
+            ),
+            None,
+        )
+        if index is None:
+            # 这些提交已被规则 A 判「未声明卡号 / 跨卡提交」，C-2 不重复报
+            continue
+        first = own[index].sha
+        if (card, first) in seen:
+            # 本地与 origin 同名分支会解析出同一个首个提交，只留一条
+            continue
+        seen.add((card, first))
+
+        fork_point: str | None = None
+        parent = _git(repo, "rev-parse", "--quiet", "--verify", f"{first}^")
+        if parent.returncode == 0:
+            fork_point = parent.stdout.strip() or None
+        elif parent.returncode != 1:
+            # rc1 = 没有父提交（孤立历史）；rc≥2 是环境级错误，不许伪装成业务红
+            detail = (parent.stderr or parent.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else f"退出码 {parent.returncode}"
+            raise AuditError(f"读取 fork 点失败（{first}^）: {tail}")
+
+        if fork_point is not None and any(
+            _is_ancestor(repo, fork_point, main_ref) for main_ref in main_refs
+        ):
+            continue
+
+        claimed: set[str] = set()
+        if fork_point is not None:
+            # 只按「fork 点是别的卡分支 ref 的祖先」归因；分支自己的前置提交
+            # （跨卡提交）由规则 A + 豁免表管，不算进 forked_from_cards
+            claimed = {
+                other_card
+                for other_card, other_ref in refs
+                if other_card != card
+                and _is_ancestor(repo, fork_point, other_ref)
+            }
+        findings.append(
+            ForkPointFinding(
+                card=card,
+                branch=_strip_ref_prefix(ref),
+                first_commit=first,
+                fork_point=fork_point,
+                forked_from_cards=tuple(sorted(claimed)),
+            )
+        )
+    return tuple(sorted(findings, key=lambda item: (item.card, item.first_commit)))
+
+
 def audit(
     repo: str | Path = ".",
     *,
@@ -464,7 +713,7 @@ def audit(
     only_branch: str | None = None,
     allow_file: str | Path | None = None,
 ) -> Report:
-    """稽核 ``repo``：规则 A（提交归属）+ 规则 B（checkout 偏移）。
+    """稽核 ``repo``：规则 A（提交归属）+ 规则 B（checkout 偏移）+ 规则 C（一卡一分支）。
 
     参数 / 环境问题抛 ``AuditError``（CLI 转 rc2）。
     """
@@ -599,6 +848,10 @@ def audit(
                 findings.append(finding)
 
     drifts = _checkout_drifts(top, main_branch)
+    multi = _branch_set_findings(_all_branch_names(top))
+    forks = _fork_findings(
+        top, main_branch=main_branch, base_ref=base_ref, refs=refs
+    )
 
     return Report(
         repo=str(top),
@@ -608,6 +861,8 @@ def audit(
         drifts=tuple(drifts),
         suppressed=tuple(suppressed),
         notes=tuple(notes),
+        multi=multi,
+        forks=forks,
     )
 
 
@@ -615,7 +870,7 @@ def render_report(report: Report) -> str:
     """把 ``Report`` 渲染成人类可读文本（结尾一行「结论：…」，不含退出码行）。"""
 
     lines: list[str] = [
-        "分支稽核（卡分支提交归属 + checkout 偏移）",
+        "分支稽核（提交归属 + checkout 偏移 + 分支结构）",
         f"仓库: {report.repo}",
         f"主分支: {report.main_branch}",
         "检查的卡分支: "
@@ -651,6 +906,40 @@ def render_report(report: Report) -> str:
             f"（应为 {drift.expected}）"
         )
 
+    lines.append(f"分支结构偏差（{len(report.multi) + len(report.forks)} 处）:")
+    if not report.multi and not report.forks:
+        lines.append("  （无）")
+    index = 0
+    for item in report.multi:
+        index += 1
+        lines.append(
+            f"  {index}. 卡 {item.card} 有第二条分支 {item.branch}"
+            f"（卡分支只能叫 wt/{item.card}）；证据：{item.evidence}"
+        )
+    for fork in report.forks:
+        index += 1
+        short = fork.first_commit[:7]
+        if fork.fork_point is None:
+            lines.append(
+                f"  {index}. 分支 {fork.branch} 的第一个提交 {short} "
+                f"没有父提交（孤立历史）；证据：fork 点不在 main 上"
+            )
+            continue
+        fork_short = fork.fork_point[:7]
+        if fork.forked_from_cards:
+            cards = "、".join(fork.forked_from_cards)
+            lines.append(
+                f"  {index}. 分支 {fork.branch} 的第一个提交 {short} "
+                f"挂在 {fork_short} 上，{fork_short} 不在 main 上"
+                f"（它属于卡 {cards} 的分支）"
+            )
+        else:
+            lines.append(
+                f"  {index}. 分支 {fork.branch} 的第一个提交 {short} "
+                f"挂在 {fork_short} 上，{fork_short} 不在 main 上"
+                f"（不属于任何卡分支）"
+            )
+
     lines.append(f"豁免（{len(report.suppressed)} 条）:")
     if not report.suppressed:
         lines.append("  （无）")
@@ -661,13 +950,15 @@ def render_report(report: Report) -> str:
             f"{finding.commit.short}（对方卡 {foreign}）：{entry.reason}"
         )
 
-    total = len(report.findings) + len(report.drifts)
+    structure = len(report.multi) + len(report.forks)
+    total = len(report.findings) + len(report.drifts) + structure
     if total == 0:
         lines.append("结论：无偏差")
     else:
         lines.append(
             f"结论：发现 {total} 处偏差"
             f"（提交归属 {len(report.findings)} 处 / "
-            f"checkout {len(report.drifts)} 处）"
+            f"checkout {len(report.drifts)} 处 / "
+            f"分支结构 {structure} 处）"
         )
     return "\n".join(lines)

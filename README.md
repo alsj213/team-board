@@ -190,7 +190,7 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 退出码：
 
 - `0` —— 无偏差（打印人类可读结论，结尾 `结论：无偏差`）。
-- `1` —— 发现偏差（结尾 `结论：发现 N 处偏差（提交归属 M 处 / checkout K 处）`）。
+- `1` —— 发现偏差（结尾 `结论：发现 N 处偏差（提交归属 M 处 / checkout K 处 / 分支结构 J 处）`）。
 - `2` —— 参数或环境错误：仓库路径不存在 / 不是 git 工作树、主分支不存在、
   `--branch` 指定的 ref 不存在（含裸卡号解析不到 `wt/t_xxx`）、豁免表某行格式
   非法、豁免表不是 UTF-8 文本、`PATH` 里没有 `git`、**git 输出不是 UTF-8**
