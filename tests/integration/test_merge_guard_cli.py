@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1374,6 +1375,149 @@ def test_documented_command_runs_to_preflight_and_merge(
         assert "分支存在 | PASS | " in out
         assert "预检 | PASS | " in out
         assert merge_call(stub) in stub.gh_calls()
+
+
+# ------------------------- 12b. README 里的样例行同样必须可跑（文档守卫的另一半）
+#
+# 只在 docs/merge-policy.md 上做守卫是不够的：PR #30 把 ``--card`` / ``--by`` /
+# ``--subject`` / ``--body-file`` 变成合并模式必填之后，README 那条「源分支不存在」
+# 的样例照抄已经拿不到文档写的报错（先撞「缺少 --card」），而 808 条全绿照不到。
+# 这里把 README.md 的每条样例行连同它下面那行 ``# stderr: …`` 一起抠出来真跑：
+# 期望文案一律取 README 原文，**不在测试里再抄一遍**（两边一起改就永远绿）。
+
+README = Path(__file__).resolve().parents[2] / "README.md"
+
+#: README 里的样例行前缀（``python3`` / ``python`` 两种写法都认）；不带 ``$ `` 的用法模板不算
+_README_CMD_RE = re.compile(r"^\$ python3? -m team_board\.merge_guard(?:\s|$)")
+#: 样例行下面那行期望 stderr
+_README_STDERR_RE = re.compile(r"^# stderr: (?P<text>.+)$")
+
+
+def _readme_guard_commands() -> list[tuple[list[str], str, str]]:
+    """把 README 每条样例行配成 ``(argv, 文档期望的 stderr, 样例前那段说明文字)``。
+
+    反斜杠续行拼回一条命令；样例下面必须紧跟 ``# stderr: …``（不跟 = 样例行没法判，
+    按文档 bug 处理）。``argv`` 已去掉 ``python3 -m team_board.merge_guard`` 前缀。
+    """
+
+    pairs: list[tuple[list[str], str, str]] = []
+    lines = README.read_text(encoding="utf-8").splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if _README_CMD_RE.match(line) is None:
+            index += 1
+            continue
+        start = index
+        command = line[1:].strip()  # 去掉开头的 "$ "
+        while command.endswith("\\"):
+            index += 1
+            command = f"{command[:-1].strip()} {lines[index].strip()}"
+        argv = shlex.split(command)
+        assert argv[:3] == ["python3", "-m", "team_board.merge_guard"], line
+        prefix: list[str] = []
+        back = start - 1
+        while back >= 0 and len(prefix) < 3:  # 只收样例上方那一段说明（跨过围栏与空行）
+            text = lines[back].strip()
+            if text and not text.startswith("```"):
+                prefix.insert(0, text)
+            back -= 1
+        index += 1
+        match = _README_STDERR_RE.match(lines[index]) if index < len(lines) else None
+        assert match is not None, f"README 的样例行下面没有 `# stderr: …`：{line}"
+        pairs.append((argv[3:], match.group("text"), " ".join(prefix)))
+        index += 1
+    return pairs
+
+
+def test_readme_samples_are_all_guarded() -> None:
+    """README 的 4 条样例行（1 条合并模式 + 3 条 ``--verify-only``）一条不漏地被抠出来。"""
+
+    pairs = _readme_guard_commands()
+
+    assert len(pairs) == 4  # README 增删样例都必须跟着改这里，否则守卫悄悄瞎掉
+    occurrences = [
+        line
+        for line in README.read_text(encoding="utf-8").splitlines()
+        if "-m team_board.merge_guard" in line
+    ]
+    # 多出来的那一处是不带 "$ " 的用法模板（[--verify-only] 那行）
+    assert len(occurrences) == len(pairs) + 1
+
+
+def test_readme_merge_mode_sample_carries_accounting_flags() -> None:
+    """README 那条合并模式样例必须保持「合并模式 + 认账四参数」形态，不许降级成 ``--verify-only``，
+    并且样例前面写清了 body 先由 ``merge-record --body-out`` 生成。"""
+
+    merge_mode = [
+        (argv, prefix)
+        for argv, _text, prefix in _readme_guard_commands()
+        if "--verify-only" not in argv
+    ]
+
+    assert len(merge_mode) == 1
+    argv, prefix = merge_mode[0]
+    assert "--branch" in argv
+    assert "wt/t_never_existed_zzz" in argv
+    assert "--method" in argv and "merge" in argv
+    assert "--delete-branch" in argv
+    for flag in ("--card", "--by", "--subject", "--body-file"):
+        assert flag in argv, (flag, argv)
+    assert "merge-record" in prefix, prefix
+    assert "--body-out" in prefix, prefix
+
+
+def _fill_readme(argv: list[str], stub: Stub) -> list[str]:
+    """把 README 样例里的占位符换成合法值；留下任何 ``<…>`` 都算文档 bug。"""
+
+    mapping = {
+        "<卡号>": MERGE_CARD,
+        "<profile>": "pm",
+        "<NNN>": "200",
+        "<subject>": MERGE_SUBJECT,
+        "<body文件>": str(stub.body_file),
+    }
+    filled: list[str] = []
+    for arg in argv:
+        for token, value in mapping.items():
+            arg = arg.replace(token, value)
+        assert re.search(r"<[^<>]*>", arg) is None, f"README 样例行里有没填的占位符：{arg}"
+        filled.append(arg)
+    return filled
+
+
+def test_readme_samples_run_and_match_documented_stderr(
+    stub: Stub, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """照抄 README 每条样例行 → rc2、stdout 0 字节、stderr 与 README 的 ``# stderr:`` 逐字相同。
+
+    这条就是 README「合并前源分支不存在」样例的守卫：文档写的报错一旦被参数校验挡在
+    前面（PR #30 的 P2），这里立刻红。
+    """
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "2")  # 合并前的「源分支存在」闸门报不存在
+
+    pairs = _readme_guard_commands()
+    assert pairs
+    for index, (argv, documented, _prefix) in enumerate(pairs):
+        # 每条样例都是新进程视角：换一份「第几次 git 调用」计数
+        stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"readme-git-{index}.count"))
+        filled = [
+            *_fill_readme(argv, stub),
+            "--repo",
+            str(stub.repo),
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+        ]
+        rc, out, err = run(filled, capsys)
+
+        assert rc == 2, (filled, out, err)
+        assert out == ""  # stdout 0 字节
+        assert err.strip() == documented.strip(), (filled, err, documented)
+        if "--verify-only" not in argv:
+            assert stub.gh_calls() == []  # 合并模式：一个 gh 调用都没发
 
 
 # ---------------- 15. stdout 断管 / 关闭：rc 必须是本次运行的真实结论

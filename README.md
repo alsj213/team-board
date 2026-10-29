@@ -471,10 +471,13 @@ head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
 结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
 ```
 
-合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）：
+合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）。合并模式必填认账四参数，
+`--body-file` 指的 body 先由 `team-board merge-record --card <卡号> --by <profile>/run<NNN> --pr 9 --body-out <body文件>` 生成
+（body 文件缺失 / 缺 trailer / 与 `--card`·`--by`·`--pr` 不一致同样 rc2，见上一节）：
 
 ```
-$ python3 -m team_board.merge_guard --pr 9 --branch wt/t_never_existed_zzz --method merge --delete-branch
+$ python3 -m team_board.merge_guard --pr 9 --branch wt/t_never_existed_zzz --method merge --delete-branch \
+    --card <卡号> --by <profile>/run<NNN> --subject <subject> --body-file <body文件>
 # stderr: 错误: 源分支 wt/t_never_existed_zzz 不在 origin 远端（rc=2）：(无输出)；合并前源分支必须先存在，拒绝合并
 ```
 
