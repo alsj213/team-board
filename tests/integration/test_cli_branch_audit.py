@@ -184,6 +184,199 @@ def test_scenario_b_other_branch_worktree_is_red(
     assert "pm/ci-check" in out
 
 
+# ------------------------------------------------- 场景 C：一卡两分支（C-1）
+# 规则 C-1「一卡多分支」：分支名申报了卡号却不精确等于 wt/<卡号> 即判红；
+# C-1 是全仓枚举、与 --branch 无关，本地与 origin 同名只算一条。
+
+
+def test_scenario_c_same_card_two_branches_is_red(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卡 t_aaaaaaaa 同时有 wt/t_aaaaaaaa 与 wt/t_aaaaaaaa-fix → rc1 并点名第二条。"""
+
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa-fix")
+    commit_file(repo, "a2.txt", "feat(t_aaaaaaaa): 同卡第二条分支的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 1
+    assert err == ""
+    assert "卡 t_aaaaaaaa 有第二条分支 wt/t_aaaaaaaa-fix" in out
+    assert "分支结构偏差（1 处）" in out
+    assert "（提交归属 0 处 / checkout 0 处 / 分支结构 1 处）" in out
+
+
+def test_scenario_c_prime_local_and_origin_same_name_count_as_one(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """本地与 origin **同名**分支只算一条（防全仓假红）：真造 origin ref，不用桩。"""
+
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+    sha = git(repo, "rev-parse", "wt/t_aaaaaaaa").strip()
+    # 真造远端引用（同名、同一个 sha），不是 mock/桩函数
+    git(repo, "update-ref", "refs/remotes/origin/wt/t_aaaaaaaa", sha)
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "分支结构偏差（0 处）" in out
+    assert "结论：无偏差" in out
+
+    # 反向：违规分支两边都在时也只算一条（一条 = 一处，不是两处）
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa-fix")
+    commit_file(repo, "a2.txt", "feat(t_aaaaaaaa): 同卡第二条分支的活")
+    git(repo, "checkout", "-q", "main")
+    fix_sha = git(repo, "rev-parse", "wt/t_aaaaaaaa-fix").strip()
+    git(repo, "update-ref", "refs/remotes/origin/wt/t_aaaaaaaa-fix", fix_sha)
+
+    rc_same, out_same, _ = run(["--repo", str(repo)], capsys)
+
+    assert rc_same == 1
+    assert out_same.count("卡 t_aaaaaaaa 有第二条分支 wt/t_aaaaaaaa-fix") == 1
+    assert "分支结构偏差（1 处）" in out_same
+
+
+def test_scenario_c_double_prime_branch_mode_still_scans_whole_repo(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--branch` 模式下 C-1 仍全仓扫描 —— PR 上 CI 只传 `--branch` 的关键路径。"""
+
+    # 违规分支：同卡第二条分支
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa-fix")
+    commit_file(repo, "a2.txt", "feat(t_aaaaaaaa): 同卡第二条分支的活")
+    git(repo, "checkout", "-q", "main")
+    # 合规分支：自身一条问题都没有
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo), "--branch", "wt/t_bbbbbbbb"], capsys)
+
+    # 被稽核的 wt/t_bbbbbbbb 自身无问题，但全仓里的 wt/t_aaaaaaaa-fix 必须照样拦住
+    assert rc == 1, out
+    assert err == ""
+    assert "检查的卡分支: t_bbbbbbbb" in out
+    assert "wt/t_aaaaaaaa-fix" in out
+    assert "卡 t_aaaaaaaa 有第二条分支 wt/t_aaaaaaaa-fix" in out
+    assert "（提交归属 0 处 / checkout 0 处 / 分支结构 1 处）" in out
+
+
+# --------------------------------------- 场景 D：从别的卡分支拉出新分支（C-2）
+# 规则 C-2「fork 点不在 main」：卡分支第一个申报本卡号的提交，其父提交必须落在
+# 本地 main 或 origin/main 上；落在别的卡分支上则点名对方卡号。
+
+
+def test_scenario_d_forked_from_other_card_branch_is_red(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """从 wt/t_bbbbbbbb 拉出 wt/t_aaaaaaaa → rc1，且点名 t_bbbbbbbb 的分支。"""
+
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): B 卡的活")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")  # 从别的卡分支拉出来
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): A 卡的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)  # 全量模式
+
+    assert rc == 1
+    assert err == ""
+    assert "（它属于卡 t_bbbbbbbb 的分支）" in out
+    assert "分支结构偏差（1 处）" in out
+    # 规则 A 也会把 B 卡的提交判成跨卡提交：双报是允许的，不许为消双报改规则 A
+    assert "跨卡提交" in out
+
+
+def test_scenario_d_prime_rebuilt_on_main_is_green(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """把 D 的 wt/t_aaaaaaaa 重建到 main 之上 → 分支结构偏差 0 处、rc0。"""
+
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): B 卡的活")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): A 卡的活")
+    git(repo, "checkout", "-q", "main")
+    rc_before, out_before, _ = run(["--repo", str(repo)], capsys)
+    assert rc_before == 1
+    assert "分支结构偏差（1 处）" in out_before
+
+    # 重建到 main 之上（checkout -B 后重新提交）
+    git(repo, "checkout", "-q", "-B", "wt/t_aaaaaaaa", "main")
+    commit_file(repo, "a2.txt", "feat(t_aaaaaaaa): A 卡的活（重建在 main 之上）")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "分支结构偏差（0 处）" in out
+    assert "结论：无偏差" in out
+
+
+# ------------------------------------------- 场景 E：祖先判定机器化（不靠人眼）
+# 贴的就是老板要的那条命令：`git merge-base --is-ancestor main wt/t_aaaaaaaa`
+# 的 rc 由机器给出，不靠人读报告。注意祖先关系只是必要条件 —— fork 在别的卡分支
+# 上时 main 仍是它的祖先（传递性），所以 C-2 的判据是「fork 点」而不是「main 是不是
+# 祖先」；本用例把这两件事都钉住。
+
+
+def test_scenario_e_ancestry_check_is_machine_decided(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``git merge-base --is-ancestor main wt/t_aaaaaaaa``：在 main 上 rc=0，孤立历史 rc=1。"""
+
+    def is_ancestor(ancestor: str, branch: str) -> int:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, branch],
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+            check=False,
+        )
+        return proc.returncode
+
+    # 从 main 拉出的卡分支：main 是它的祖先 → rc=0（机器判定，不靠人眼）
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+    sha = git(repo, "rev-parse", "main").strip()
+    git(repo, "update-ref", "refs/remotes/origin/main", sha)
+
+    assert is_ancestor("main", "wt/t_aaaaaaaa") == 0
+    assert is_ancestor("origin/main", "wt/t_aaaaaaaa") == 0
+    rc, out, err = run(["--repo", str(repo)], capsys)
+    assert rc == 0, out
+    assert err == ""
+    assert "分支结构偏差（0 处）" in out
+
+    # 孤立历史（没有父提交）：main 不是它的祖先 → rc=1，稽核同轮判红
+    git(repo, "checkout", "-q", "--orphan", "wt/t_dddddddd")
+    git(repo, "rm", "-q", "-rf", "--cached", ".")
+    for leftover in ("README.md", "a.txt"):
+        path = repo / leftover
+        if path.exists():
+            path.unlink()
+    commit_file(repo, "orphan.txt", "feat(t_dddddddd): 孤立历史")
+    git(repo, "checkout", "-q", "main")
+
+    assert is_ancestor("main", "wt/t_dddddddd") == 1
+    rc_bad, out_bad, _ = run(["--repo", str(repo)], capsys)
+    assert rc_bad == 1, out_bad
+    assert "没有父提交（孤立历史）" in out_bad
+    assert "分支结构偏差（1 处）" in out_bad
+
+
 # ------------------------------------------------------------ 绿色基线
 
 
