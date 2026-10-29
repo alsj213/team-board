@@ -322,7 +322,9 @@ trailer 区），任一条有问题即 rc1。
   恒为**绝对路径**。生成模式下 `--branch` 与 `--body-out` **必填**（缺任一项 → rc2、
   stdout 空、stderr 一行 `错误: …`），`--branch` 形态非法（空串 / 含空白 / 带 `refs/`
   前缀）同样是 rc2。`--repo`（默认 `.`）只用来拼命令里的 `cd` / `PYTHONPATH` /
-  `--repo` 三处。
+  `--repo` 三处。打印行里 `--branch` 与这三处**都过 `shlex.quote`**：仓库路径含空格、
+  分支名含 `;` / `$` / `|`（`git check-ref-format` 认的合法名）时照抄仍是**一条**命令；
+  `--subject` 含换行 → rc2（否则打印行会被切成半条命令）。
 - **预检**：`team-board merge-record --check-file /tmp/t_xxx-merge-body.txt` —— 合并
   **前**校验一份 body 文件的三字段（可选 `--card/--by/--pr` 做一致性校验）；通过
   rc0（`通过：三字段齐（merged-by/merge-card/merge-pr）`），有问题 rc1（每处一行

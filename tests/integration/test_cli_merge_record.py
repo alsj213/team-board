@@ -7,7 +7,9 @@
 内容与 stdout 的 body 段逐字节一致（末尾恰好一个换行）、``--subject`` 覆盖标题且经
 ``shlex.quote`` 后能逐字还原、``--body-out`` 相对路径打印成绝对路径、``--branch`` /
 ``--body-out`` 缺任一项 rc2、``--branch`` 形态非法（空串 / 含空白 / ``refs/`` 前缀）
-rc2、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 / 字段与参数不一致 rc1、rc2 一组
+rc2、``--subject`` 含换行 rc2、打印行的 **shell 安全性**（``--branch`` 含 ``;`` / ``$``
+时经 ``bash -c`` 仍恰好一条命令；``--repo`` 含空格时 ``cd`` / ``PYTHONPATH`` / ``--repo``
+三处都加引号）、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 / 字段与参数不一致 rc1、rc2 一组
 （``--pr`` 取值域含 0 / 负 / 空串 / 13 位毫秒 / 天文数字 / 超上限 / ``+1`` / ``1_0``，
 ``--by`` 与 ``--card`` 形态，生成模式缺参数，``--check-file`` 不存在 / 是目录 /
 空文件 / 非 UTF-8 / 与 ``--body-out`` 同给，``--body-out`` 父目录不存在）、stdout
@@ -21,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -104,6 +107,51 @@ def flag_value(argv: list[str], flag: str) -> str:
     """取 ``--flag VALUE`` 的 VALUE。"""
 
     return argv[argv.index(flag) + 1]
+
+
+def shim_python3(tmp_path: Path) -> Path:
+    """造一个只会把 argv 打出来的 ``python3`` 替身，放在 ``PATH`` 最前面。
+
+    「替换进 shell 后是不是仍然只有一条命令」必须真让 shell 跑，光 ``shlex.split``
+    只证明参数能切开；本工具打印的那行以 ``cd … && PYTHONPATH=… python3 -m …`` 开头，
+    把 ``python3`` 换成替身就能在不联网、不碰 git/gh 的前提下看 shell 到底发出了几次调用。
+    """
+
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "python3"
+    shim.write_text(
+        "#!/bin/sh\n"
+        "printf 'CALL\\n'\n"
+        'for arg in "$@"; do printf \'ARG %s\\n\' "$arg"; done\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim_dir
+
+
+def run_line_in_bash(line: str, shim_dir: Path) -> tuple[int, list[str], str, str]:
+    """把打印行原样交给 ``bash -c`` 跑（``python3`` = 替身），返回 ``(rc, argv, out, err)``。
+
+    判据是**严格**的：替身的 stdout 只许是「一条 ``CALL`` + 每行 ``ARG …``」。注入成功时
+    shell 会额外跑 ``echo …``，多出来的输出落在这里 ⇒ 断言直接炸；命令被拆断则替身收到的
+    argv 少一截、``--branch`` 不再逐字还原。
+    """
+
+    bash = shutil.which("bash")
+    assert bash is not None, "本机 PATH 里没有 bash，做不了真 shell 校验"
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([str(shim_dir), env.get("PATH", "")])
+
+    proc = subprocess.run(
+        [bash, "-c", line], capture_output=True, text=True, env=env, check=False
+    )
+
+    lines = proc.stdout.splitlines()
+    assert lines[:1] == ["CALL"], (proc.returncode, proc.stdout, proc.stderr)
+    for extra in lines[1:]:
+        assert extra.startswith("ARG "), (proc.stdout, proc.stderr)
+    return proc.returncode, [ln[4:] for ln in lines[1:]], proc.stdout, proc.stderr
 
 
 @pytest.fixture()
@@ -264,6 +312,95 @@ def test_relative_body_out_prints_absolute_path(
     assert f"# body 文件：{body}（已写入）" in out
 
 
+# ------------------------------------------------- 生成模式：打印行的 shell 安全性
+
+#: ``git check-ref-format "refs/heads/wt/t_x;echo\$IFS'INJ'"`` 认的合法分支名（P2-1 的触发值）
+INJECT_BRANCH = "wt/t_x;echo$IFS'INJ'"
+
+
+def test_branch_with_shell_metachars_stays_one_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--branch`` 含 ``;`` ``$`` 时打印行仍**恰好一条命令**，``--branch`` 逐字还原。
+
+    不加引号时（修复前）shell 会把它切成 ``… --branch wt/t_x`` + ``echo $IFS'INJ' …``
+    两条命令，stdout 出现 ``INJ``，且整行退出码被后一条的 rc0 覆盖 —— 合并失败却拿到 rc0。
+    """
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", INJECT_BRANCH,
+            "--repo", str(tmp_path),
+            "--body-out", str(tmp_path / "merge-body.txt"),
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    line = printed_command(out)
+    assert "\n" not in line  # 一条命令 = 一行
+    tokens = shlex.split(line)
+    # 全行只有「cd … && …」那一个分隔符；注入的 ';' / '$' 必须被吃进引号、不能成为独立 token
+    assert tokens.count("&&") == 1, tokens
+    for operator in (";", "|", "||", "&", ">", ">>", "(", ")"):
+        assert operator not in tokens, tokens
+    argv = printed_argv(out)
+    assert flag_value(argv, "--branch") == INJECT_BRANCH
+
+    # 真交给 bash 跑：注入成立时 shell 会多跑一条 echo，替身 stdout 立刻多出非 ARG 行
+    rc_bash, got, stdout, stderr = run_line_in_bash(line, shim_python3(tmp_path))
+    assert rc_bash == 0, (stdout, stderr)
+    assert got == ["-m", "team_board.merge_guard", *argv], (stdout, stderr)
+
+
+def test_repo_with_space_is_quoted_and_roundtrips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--repo`` 路径含空格时 ``cd`` / ``PYTHONPATH`` / ``--repo`` 三处都加引号且逐字还原。
+
+    不加引号时（修复前）照抄即 ``bash: cd: too many arguments`` / ``rc=1``
+    （``/mnt/c/Users/…`` 一类路径是日常形态）。
+    """
+
+    repo = tmp_path / "probe with space"
+    repo.mkdir()
+    real = os.path.realpath(str(repo))
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", str(repo),
+            "--body-out", str(tmp_path / "merge-body.txt"),
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    line = printed_command(out)
+    assert line.startswith(
+        f"cd {shlex.quote(real)} && PYTHONPATH={shlex.quote(real + '/src')} "
+    ), line
+    tokens = shlex.split(line)
+    assert tokens.count("&&") == 1, tokens
+    # PYTHONPATH 的整条路径是一个 token（含空格也不能被拆开），且逐字还原
+    assert f"PYTHONPATH={real}/src" in tokens, tokens
+    argv = printed_argv(out)
+    assert flag_value(argv, "--repo") == real
+    assert flag_value(argv, "--body-file") == os.path.realpath(
+        str(tmp_path / "merge-body.txt")
+    )
+
+    rc_bash, got, stdout, stderr = run_line_in_bash(line, shim_python3(tmp_path))
+    assert rc_bash == 0, (stdout, stderr)  # cd 的引号没写对时这里会是 rc 非 0
+    assert got == ["-m", "team_board.merge_guard", *argv], (stdout, stderr)
+
+
 # ------------------------------------------------------------- 生成模式：rc2
 
 
@@ -282,6 +419,40 @@ def test_without_branch_is_rc2(
     assert out == ""
     assert err.startswith("错误: ")
     assert "--branch" in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("subject", ["第一行\n第二行", "带\r回车", "\n"])
+def test_rc2_subject_with_newline(
+    subject: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--subject`` 含换行 → rc2（复用 ``merge_guard.check_subject``），且不写 body 文件。
+
+    含换行的标题经 ``shlex.quote`` 后仍是**带字面换行**的引号串 —— 打印行会被切成两行，
+    照抄即半条命令。生成阶段就拒，省得先打出半条命令再让人去撞 merge_guard 的 rc2。
+    """
+
+    target = tmp_path / "never-written.txt"
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--subject", subject,
+            "--body-out", str(target),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "换行" in err or "不能为空" in err
     assert err.count("\n") == 1, repr(err)
     assert not target.exists()
 

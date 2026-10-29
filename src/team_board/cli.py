@@ -49,7 +49,9 @@
   含 ``--card`` / ``--by`` / ``--pr`` 形态非法、``--branch`` 形态非法（空串 / 含空白 /
   带 ``refs/`` 前缀，校验复用 :func:`team_board.merge_guard.check_branch_shape`，不复制
   正则）、生成模式缺必需参数（``--card`` / ``--by`` / ``--pr`` / ``--branch`` /
-  ``--body-out`` 缺任一项）、``--check-file`` 与 ``--body-out`` 同给、``--body-out``
+  ``--body-out`` 缺任一项）、``--subject`` 空 / 纯空白 / 含换行（校验复用
+  :func:`team_board.merge_guard.check_subject`，不复制判据）、``--check-file`` 与
+  ``--body-out`` 同给、``--body-out``
   父目录不存在、body 文件不存在 / 是目录 / 无权限 / 非 UTF-8 / 空、stdout 编码表示
   不了中文）
 """
@@ -349,7 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--subject",
         default=None,
         metavar="TEXT",
-        help="合并提交标题（默认 Merge PR #<pr>（<card>））",
+        help="合并提交标题（默认 Merge PR #<pr>（<card>））；空 / 纯空白 / 含换行 → rc2",
     )
     record_cmd.add_argument(
         "--branch",
@@ -726,8 +728,11 @@ def _record_generate(
     ``headRefOid`` 拼），手写进去只会让命令多一个必填项。本函数**不执行**任何 git/gh
     命令。
 
-    ``--subject`` / ``--body-file`` 用 :func:`shlex.quote` 包：标题里带 ``"`` / ``$`` /
-    反引号时，手写双引号会让照抄出来的命令被 shell 改写成另一个标题。``--body-file``
+    ``--subject`` / ``--branch`` / ``--body-file`` / ``--repo``（含 ``cd`` 与
+    ``PYTHONPATH`` 两处拼接）**全部**过 :func:`shlex.quote`：标题里带 ``"`` / ``$`` /
+    反引号时手写双引号会被 shell 改写，分支名带 ``;`` ``$`` ``|``（``git check-ref-format``
+    认的合法分支名）会被 shell 拆成两条命令、退出码被后一条 rc0 覆盖，仓库路径带空格
+    （``/mnt/c/Users/…`` 一类）会让 ``cd`` 报「too many arguments」。``--body-file``
     恒打印**绝对路径**：merge_guard 的 ``read_body_file`` 拒相对路径（进程 cwd 与
     ``--repo`` 两套 cwd 会解析成两个不同文件）。
     """
@@ -737,11 +742,13 @@ def _record_generate(
     body_path = os.path.realpath(body_out)
     repo_path = os.path.realpath(repo)
     _write_body_file(body_path, body)
+    repo_q = shlex.quote(repo_path)
     command = (
-        f"cd {repo_path} && PYTHONPATH={repo_path}/src python3 -m team_board.merge_guard"
-        f" --pr {pr} --branch {branch} --method merge --delete-branch"
+        f"cd {repo_q} && PYTHONPATH={shlex.quote(repo_path + '/src')}"
+        " python3 -m team_board.merge_guard"
+        f" --pr {pr} --branch {shlex.quote(branch)} --method merge --delete-branch"
         f" --card {card} --by {by} --subject {shlex.quote(title)}"
-        f" --body-file {shlex.quote(body_path)} --repo {repo_path}"
+        f" --body-file {shlex.quote(body_path)} --repo {repo_q}"
     )
     lines = [
         body.rstrip("\n"),
@@ -769,6 +776,23 @@ def _check_branch_for_command(branch: str) -> None:
 
     try:
         merge_guard.check_branch_shape(branch)
+    except merge_guard.MergeGuardError as exc:
+        raise merges.MergeAuditError(str(exc)) from exc
+
+
+def _check_subject_for_command(subject: str) -> None:
+    """生成模式的 ``--subject`` 形态校验：**复用** merge_guard 的 ``check_subject``。
+
+    只多一条约束：含换行（``\\n`` / ``\\r``）时打印出来的命令会被切成两行 —— 照抄前半
+    行是半条命令、照抄整段又会被 shell 当两条命令。``shlex.quote`` 只能保住参数字面，
+    保不住「一行」。merge_guard 自己的 ``check_subject`` 本来就拒换行（同一判据），
+    这里提前到生成阶段拒，省得先打印一条半条命令再让用户去撞 merge_guard 的 rc2。
+    """
+
+    from . import merge_guard
+
+    try:
+        merge_guard.check_subject(subject)
     except merge_guard.MergeGuardError as exc:
         raise merges.MergeAuditError(str(exc)) from exc
 
@@ -817,6 +841,8 @@ def _run_merge_record(args: argparse.Namespace) -> int:
                 "R6 要求 headRefName == wt/<卡号>）"
             )
         _check_branch_for_command(args.branch)
+        if args.subject is not None:
+            _check_subject_for_command(args.subject)
         if args.body_out is None:
             raise merges.MergeAuditError(
                 "生成合并命令必须给 --body-out（命令里的 --body-file 必须指向一个"

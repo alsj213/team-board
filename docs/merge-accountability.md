@@ -119,6 +119,9 @@ team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
    唯一入口，带齐 `--delete-branch` 与认账四参数；**只打印，不执行**）；`--check-file PATH`
    是另一模式：合并前预检一份 body 文件是否三字段齐
    （不合格 rc1，参数/文件级错误 rc2）。
+   打印行里 `--branch` / `--repo`（含 `cd` 与 `PYTHONPATH` 两处拼接）与 `--subject` /
+   `--body-file` 一样过 `shlex.quote`：仓库路径含空格、分支名含 `;` / `$` 时照抄仍是
+   **一条**命令；`--subject` 含换行 → rc2（否则打印行被切成半条）。
 2. 合并后：`team-board merge-audit --repo . --card t_xxx --require; echo "rc=$?"`
    rc0 时把回读到的三字段 + `gh pr view NN --json mergeCommit` 的 sha 贴卡。
 
