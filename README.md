@@ -324,7 +324,13 @@ trailer 区），任一条有问题即 rc1。
   前缀）同样是 rc2。`--repo`（默认 `.`）只用来拼命令里的 `cd` / `PYTHONPATH` /
   `--repo` 三处。打印行里 `--branch` 与这三处**都过 `shlex.quote`**：仓库路径含空格、
   分支名含 `;` / `$` / `|`（`git check-ref-format` 认的合法名）时照抄仍是**一条**命令；
-  `--subject` 含换行 → rc2（否则打印行会被切成半条命令）。
+  `--subject` 含换行 → rc2（否则打印行会被切成半条命令）。quote 之外还有三类
+  「保不住一行 / 一个 token」的取值，处理方式各不相同：`--subject` 以 `-` 开头
+  （`-h` / `--fix …`）时打印行改用 **`--subject=<值>`** 形式（`--opt=value` 的值不参与
+  选项解析，照抄才不会被 argparse 当成 flag）；`--body-out` / `--repo` 含换行 → rc2
+  （打印行会被截成两行、引号未闭合）；`--repo` 含 `:` → rc2（`PYTHONPATH=<repo>/src`
+  是冒号分隔的，单条路径里的冒号会被拆成两条，照抄即 rc1
+  「No module named team_board」，而 rc1 是「认账未达成」专用码）。
 - **预检**：`team-board merge-record --check-file /tmp/t_xxx-merge-body.txt` —— 合并
   **前**校验一份 body 文件的三字段（可选 `--card/--by/--pr` 做一致性校验）；通过
   rc0（`通过：三字段齐（merged-by/merge-card/merge-pr）`），有问题 rc1（每处一行
