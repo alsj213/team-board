@@ -1,10 +1,21 @@
 #!/bin/sh
 # pre-push：唯一判定源 = src/team_board/pushguard.py（`team-board push-guard`）。
 #
-# 本文件只是**薄壳**：拿工作树根 → 把 git 喂进来的 ref 行原样透传给 push-guard →
-# 照它的退出码放行 / 拦截。**不在 shell 里重写判定**：主分支保护（P-4）、主 checkout
-# 必须停 main（P-1）、主 checkout 不许推卡分支（P-2）、worktree 与卡分支一致（P-3）
-# 四条全在 pushguard.py 里，改规则只改那一个文件。
+# 本文件只是**薄壳**：拿工作树根 → 判「这次到底有没有 ref 要传」→ 把 ref 行原样喂给
+# push-guard → 照它的退出码放行 / 拦截，并把「判定红」「环境错误」「跑不起来」拆成
+# 三套文案。**不在 shell 里重写判定**：主分支保护（P-4）、主 checkout 必须停 main
+# （P-1）、主 checkout 不许推卡分支（P-2）、worktree 与卡分支一致（P-3）四条全在
+# pushguard.py 里，改规则只改那一个文件。
+#
+# 三条设计约束（返工 t_a875c1ed 定，别再退回旧写法）：
+#   1. **不落任何临时文件** —— 坏 TMPDIR、可预测文件名被预置符号链接、SIGINT 清理
+#      三个问题一起消失（旧版 `: >"$errfile"` 在 dash 下还是致命错误，钩子连一句
+#      人话都来不及打就 rc=2 退出）。
+#   2. **「有没有 ref」由本层自己判** —— stdin 先整块收进变量，空就直接放行；不看
+#      push-guard 的文案、不 grep 临时文件（旧版 errfile 落 /dev/null 时空 stdin 判据
+#      直接失效，零传输的 push 被误拦）。
+#   3. **钩子层退出码只有 0 / 1** —— 环境错误（push-guard rc2）也是 1，但**单独一套
+#      文案**，不打 worktree add / `--no-verify` 两行：误火时把绕过口子递给用户是错的。
 #
 # 起因：私有仓免费计划下开不了分支保护（`gh api repos/<owner>/<repo>/branches/main/protection`
 # → 403 Upgrade to GitHub Pro），护栏只能放在客户端。判定权仍在 CI 的
@@ -19,40 +30,72 @@ if [ -z "$root" ]; then
     exit 1
 fi
 
-# stderr 先落临时文件：只需在「push-guard 自己跑不起来」时改写成一句人话，
-# 其它情形原样回放（stdout 不接管，判定由 push-guard 自己写）。
-errfile="${TMPDIR:-/tmp}/pre-push-$$.err"
-if ! : >"$errfile" 2>/dev/null; then
-    errfile=/dev/null
-fi
-
-# stdin 原样透传：不 cat、不重定向、不 exec，push-guard 直接读 git 喂的那几行。
-PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m team_board.cli push-guard --repo "$root" 2>"$errfile"
-rc=$?
-
-if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ] || grep -q 'No module named' "$errfile" 2>/dev/null; then
-    [ "$errfile" = /dev/null ] || rm -f "$errfile"
+# fail-closed 前置检查：判定本体不在就不放行。放在调 python 之前而不是「跑完再看
+# stderr」，是为了不把 argparse 的 usage 原样泄给用户、也不靠猜文本。
+if ! command -v python3 >/dev/null 2>&1; then
     printf '[pre-push] 拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）\n' >&2
+    printf '[pre-push] 原因：PATH 里没有 python3\n' >&2
+    exit 1
+fi
+if [ ! -f "$root/src/team_board/cli.py" ]; then
+    printf '[pre-push] 拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）\n' >&2
+    printf '[pre-push] 原因：本 checkout 缺 src/team_board/cli.py\n' >&2
     exit 1
 fi
 
-# 空 stdin = 没有要更新的 ref（`git push` 在「已是最新」时仍会调用钩子，但一行都不喂）。
-# 此时没有任何 ref 会被传输，也就没有可拦的东西 —— 放行。判据用 push-guard 自己的
-# 那句固定文案（rc2 + `没有收到任何要推送的 ref`），不在 shell 里另算一遍「有没有 ref」；
-# 文案若被改，tests/integration/test_pre_push_hook.py 的用例 h 会当场红。
-if [ "$rc" -eq 2 ] && grep -q '没有收到任何要推送的 ref' "$errfile" 2>/dev/null; then
-    [ "$errfile" = /dev/null ] || rm -f "$errfile"
+# stdin 整块收下来：`git push` 在「已是最新」时仍会调钩子，但一行 ref 都不喂 ——
+# 没有 ref 要传就没有可拦的东西，直接放行且不打印。
+refs=$(cat)
+if [ -z "$refs" ]; then
     exit 0
 fi
 
-cat "$errfile" >&2
-[ "$errfile" = /dev/null ] || rm -f "$errfile"
+# 只接管 stderr（判定红 / 环境错误要分档），stdout 原样放给用户：
+# `2>&1 1>&3` 的顺序是关键 —— 先把 stderr 接到命令替换的管道，再把 stdout 还原到
+# 钩子自己的 stdout（fd3），push-guard 的「放行 N 条 ref」因此照常出现在用户眼前。
+exec 3>&1
+err=$(printf '%s\n' "$refs" | \
+    PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m team_board.cli push-guard --repo "$root" 2>&1 1>&3)
+rc=$?
+exec 3>&-
 
-if [ "$rc" -ne 0 ]; then
-    printf '[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/tb-wt/<卡号> -b wt/<卡号> origin/main\n' >&2
-    printf '[pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红\n' >&2
+if [ "$rc" -eq 0 ]; then
+    exit 0
+fi
+
+# 档一：环境错误（push-guard rc2）。不是「你推错了」—— 单独一套文案，不给绕过口子。
+if [ "$rc" -eq 2 ]; then
+    case "$err" in
+        *"invalid choice"*)
+            printf '[pre-push] 拒绝：本 checkout 的 src 里还没有 push-guard 子命令（版本偏斜），先 rebase 到含它的 main 再推（fail-closed）\n' >&2
+            ;;
+        *)
+            printf '[pre-push] 拒绝：push-guard 判定不了 —— 环境错误（rc=2），不是你的代码有问题（fail-closed）\n' >&2
+            printf '[pre-push] 常见原因：stdout 编码不是 UTF-8（PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）、--repo 指的不是工作树、主分支 ref 不存在\n' >&2
+            if [ -n "$err" ]; then
+                printf '%s\n' "$err" >&2
+            fi
+            ;;
+    esac
     exit 1
 fi
 
-exit 0
+# 解释器 / 导入级崩溃（不是判定红）：同样按环境错误处理，不给绕过口子。
+case "$err" in
+    *"Traceback (most recent call last)"*)
+        printf '[pre-push] 拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）\n' >&2
+        if [ -n "$err" ]; then
+            printf '%s\n' "$err" >&2
+        fi
+        exit 1
+        ;;
+esac
+
+# 档二：判定红（push-guard rc1）—— 原样回放它的「拒绝：…」行，再补两行做法。
+if [ -n "$err" ]; then
+    printf '%s\n' "$err" >&2
+fi
+printf '[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/project/tb-wt/<卡号> -b wt/<卡号> origin/main\n' >&2
+printf '[pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红\n' >&2
+exit 1

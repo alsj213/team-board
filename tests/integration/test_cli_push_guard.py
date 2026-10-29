@@ -127,7 +127,7 @@ def test_main_checkout_pushing_card_branch_is_blocked(repo: Path) -> None:
     assert rc == 1
     assert out == ""  # 拦截时 stdout 必须为空
     assert err.startswith("拒绝：主 checkout 不许推送卡分支 wt/t_aaaaaaaa；")
-    assert f"git -C {repo} worktree add /home/liu/tb-wt/t_aaaaaaaa" in err
+    assert f"git -C {repo} worktree add /home/liu/project/tb-wt/t_aaaaaaaa" in err
 
 
 def test_main_checkout_on_card_branch_then_back_to_main(

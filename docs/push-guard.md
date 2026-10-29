@@ -1,8 +1,11 @@
 # push-guard：把 checkout 偏移从「事后稽核」提前到「push 之前」
 
-`.githooks/pre-push` 只是**薄壳**：拿工作树根 → 把 git 喂进来的 ref 行原样透传给
-`team-board push-guard` → 照它的退出码放行 / 拦截。**唯一判定源是
+`.githooks/pre-push` 只是**薄壳**：拿工作树根 → 判「这次到底有没有 ref 要传」（stdin
+整块收进变量，空就直接放行）→ 把 ref 行喂给 `team-board push-guard` → 照它的退出码
+放行 / 拦截，并把「判定红 / 环境错误 / 跑不起来」拆成三套文案。**唯一判定源是
 `src/team_board/pushguard.py`**，shell 里不写第二份判断（也要这么改才不算跑偏）。
+钩子**不落任何临时文件**：坏 `TMPDIR`、可预测文件名被预置符号链接、`SIGINT` 清理
+三个问题一起消失（2026-10-30 返工 `t_a875c1ed` 定）。
 
 ```
 $ git push …            # 钩子被 git 调用
@@ -26,7 +29,7 @@ $ git push …            # 钩子被 git 调用
 | 编号 | 触发条件 | 文案模板 | 与 branch-audit 的关系 |
 | --- | --- | --- | --- |
 | **P-1** | 当前 checkout **是主 checkout**（`--git-common-dir` 的父目录）且 HEAD 不是 `<main-branch>`（detached 也算） | `拒绝：主 checkout <root> 停在 <actual>，必须停 main` | 规则 B「主 checkout 必须停在 `<main-branch>`」的同一条 |
-| **P-2** | 主 checkout 上推/收**卡分支** `wt/t_xxxxxxxx`（本侧或远端侧任一命中） | `拒绝：主 checkout 不许推送卡分支 wt/<卡号>；做法：git -C <root> worktree add /home/liu/tb-wt/<卡号> -b wt/<卡号> origin/main` | 规则 B「卡分支必须在 `t_<卡号>` 的 worktree 里」的前置 |
+| **P-2** | 主 checkout 上推/收**卡分支** `wt/t_xxxxxxxx`（本侧或远端侧任一命中） | `拒绝：主 checkout 不许推送卡分支 wt/<卡号>；做法：git -C <root> worktree add /home/liu/project/tb-wt/<卡号> -b wt/<卡号> origin/main` | 规则 B「卡分支必须在 `t_<卡号>` 的 worktree 里」的前置 |
 | **P-3a** | 非主 checkout、HEAD 是卡分支、**目录名 ≠ 卡号** | `拒绝：worktree <root> 的目录名 <name> 与所推卡分支 wt/<卡号> 不一致（应为 t_<卡号>）` | 规则 B「分支是 `wt/t_<X>` 时目录名必须精确是 `t_<X>`」的同一条 |
 | **P-3b** | 非主 checkout、HEAD detached | `拒绝：worktree <root> 处于 detached@<sha7>，无法归属到卡分支` | 规则 B「其它 worktree 的 detached HEAD 一律判红」 |
 | **P-3c** | 非主 checkout、HEAD 是卡分支 X，却推别的卡分支 Y | `拒绝：worktree 上的卡 <X> 不许推送别的卡分支 wt/<Y>` | 规则 C-1「一卡一分支」的前置 |
@@ -47,36 +50,41 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 - `2` —— 参数或环境错误（`--repo` 不存在 / 不是工作树、`--main-branch` 为空或该
   分支不存在、stdin 每行字段数 ≠ 4、stdin 为空、编码失败）；stderr 一行 `错误: …`。
 
-钩子层（`git push` 看到的那一层）：
+钩子层（`git push` 看到的那一层）—— **只有 `0` / `1` 两个码**，而且这条是**设计保证**
+（钩子不落临时文件、自己判 stdin），不是「按理说只有」：
 
-- `0` —— 放行（原样回放 push-guard 的 stdout / stderr）；也包括「**空 stdin**」：
-  `git push` 在「已是最新」（没有要更新的 ref）时仍会调用钩子，但一行都不喂，
-  push-guard 判 rc2 `没有收到任何要推送的 ref（stdin 为空）` —— 没有任何 ref 会被
-  传输，也就没有可拦的东西，钩子放行且**不打印**任何东西。判据是 push-guard 那句
-  固定文案（rc2 + 该串），不在 shell 里另算一遍「有没有 ref」；
-- `1` —— 拦截。三种来源都算：push-guard 自己判红（rc1）、push-guard 环境错误
-  （除空 stdin 外的 rc2，**仍拦**，不静默放行）、以及 **fail-closed**（见下）；
-- **fail-closed 两种情况**（钩子自己判，不经 push-guard）：`git rev-parse
-  --show-toplevel` 拿不到工作树根 → `[pre-push] 拒绝：拿不到工作树根（fail-closed）`；
-  `python3` 找不到 / 模块导入失败（rc 126/127 或 stderr 出现 `No module named`）→
-  `[pre-push] 拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）`。
-  两种都 `exit 1` —— **宁可推不上去，也不静默放行**。
+| 情形 | push-guard rc | 钩子 rc | 钩子说什么 |
+| --- | --- | --- | --- |
+| 放行 | 0 | 0 | 原样回放 push-guard 的 stdout |
+| **空 stdin** —— `git push` 在「已是最新」（没有要更新的 ref）时仍会调用钩子，但一行都不喂 | 不调用 | 0 | **不打印**。没有 ref 会被传输，也就没有可拦的东西。判据由钩子自己算（stdin 整块收进变量后为空），不依赖 push-guard 的文案、不 grep 临时文件 |
+| 判定红 | 1 | 1 | 回放 push-guard 的 `拒绝：…` 行 + 下面两行 `[pre-push] …` 提示 |
+| 环境错误（编码失败、`--repo` 不是工作树、主分支 ref 不存在…） | 2 | 1 | `[pre-push] 拒绝：push-guard 判定不了 —— 环境错误（rc=2），不是你的代码有问题（fail-closed）` + 常见原因 + push-guard 的原始诊断；**不打** `正确做法` / `免检通道` 两行（误火时给绕过口子是错的） |
+| 版本偏斜（本 checkout 的 `src` 里还没有 `push-guard` 子命令，argparse `invalid choice`） | 2 | 1 | `[pre-push] 拒绝：本 checkout 的 src 里还没有 push-guard 子命令（版本偏斜）…`；**不**把 argparse usage 泄给用户 |
+| **fail-closed**（钩子自己判，不经 push-guard） | — | 1 | `拒绝：拿不到工作树根（fail-closed）` / `拒绝：push-guard 跑不起来（fail-closed，见 .githooks/README.md）`（`python3` 不在 `PATH`、缺 `src/team_board/cli.py`、解释器/导入级崩溃都归这条） |
 
-拦截时钩子另补两行提示（无论哪种拦截理由）：
+判定红时钩子另补两行提示（**只有 rc=1 判定红才补**；环境错误与 fail-closed 不补）：
 
 ```
-[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/tb-wt/<卡号> -b wt/<卡号> origin/main
+[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/project/tb-wt/<卡号> -b wt/<卡号> origin/main
 [pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红
 ```
 
+worktree 落点统一写 `/home/liu/project/tb-wt/`（本机现存约定：26 个 worktree 里 20 个
+在这个前缀下），push-guard 的 P-2 文案与钩子提示用的是同一个前缀。
+
 ## 怎么装、怎么自查
 
-`core.hooksPath` 不进版本库，每个 clone 首次都要手动指一次（worktree 共享同一份
-`.git/config`，所以指一次主 checkout 就够）：
+`core.hooksPath` 不进版本库，每个 clone 首次都要手动指一次：
 
 ```
 git config core.hooksPath .githooks
 ```
+
+**「装一次」只解决「git 会不会调用」，不解决「调用的是哪一版钩子」**：`core.hooksPath`
+只记路径，钩子**内容跟着各自 checkout 的分支走**。合并后没 rebase 的 worktree 里
+`.githooks/pre-push` 还是旧版本（2026-10-30 实测：26 个 worktree 里 1 个新、25 个旧），
+P-1…P-4 与新文案不会因为主 checkout 指过一次就全生效 —— 要用新钩子，把那个 worktree
+`git rebase origin/main` 一下。
 
 装完自查：
 
@@ -124,24 +132,38 @@ $ git -C <bare> for-each-ref          # push 之后：仍然为空 = 一个字�
 5. **本卡不动 `.github/`**（避免升 R7 C 档）—— 因此**不新增 CI job**；P-1…P-4 的
    CI 侧口径仍只有现成的 `branch-audit` job。
 
-## 实测（本卡，2026-10-30）
+## 实测（返工 `t_a875c1ed`，2026-10-30）
 
-红（主 checkout 停在非 `main` 分支 + 推现存卡分支，远端为一次性裸仓）：
+钩子直接喂 ref 行（不碰 origin、不切主 checkout 的分支）。
 
-```
-$ git -C /home/liu/project/team-board -c core.hooksPath=/home/liu/tb-wt/t_27bc948e/.githooks push <临时裸仓> wt/t_06c7b458
-拒绝：主 checkout /home/liu/project/team-board 停在 tmp/pg-red，必须停 main
-拒绝：主 checkout 不许推送卡分支 wt/t_06c7b458；做法：git -C /home/liu/project/team-board worktree add /home/liu/tb-wt/t_06c7b458 -b wt/t_06c7b458 origin/main
-rc=1        # 裸仓 for-each-ref 为空：拦在传输之前
-```
-
-绿（独立 worktree `/home/liu/tb-wt/t_27bc948e`，目录名 = 卡号、HEAD = `wt/t_27bc948e`）：
+红（临时仓当主 checkout、HEAD 在 `main`，推卡分支）：
 
 ```
-$ git push <临时裸仓> wt/t_27bc948e
-push-guard: 放行 1 条 ref（checkout=/home/liu/tb-wt/t_27bc948e，HEAD=wt/t_27bc948e）
-rc=0        # 裸仓出现 refs/heads/wt/t_27bc948e
+$ printf 'refs/heads/wt/t_06c7b458 <sha> refs/heads/wt/t_06c7b458 <全零 sha>\n' | /bin/sh .githooks/pre-push
+拒绝：主 checkout 不许推送卡分支 wt/t_06c7b458；做法：git -C /tmp/pg-probe.EAWFZQ/repo worktree add /home/liu/project/tb-wt/t_06c7b458 -b wt/t_06c7b458 origin/main
+[pre-push] 正确做法：git -C <主 checkout> worktree add /home/liu/project/tb-wt/<卡号> -b wt/<卡号> origin/main
+[pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红
+rc=1
 ```
+
+绿（同一临时仓推普通分支 `feat-x`）：
+
+```
+$ printf 'refs/heads/feat-x <sha> refs/heads/feat-x <全零 sha>\n' | /bin/sh .githooks/pre-push
+push-guard: 放行 1 条 ref（checkout=/tmp/pg-probe.EAWFZQ/repo，HEAD=main）
+rc=0
+```
+
+环境层三例（改前 = `f1c8b44` 的钩子，改后 = 本次；都是钩子直接喂 stdin）：
+
+| 场景 | 改前 | 改后 |
+| --- | --- | --- |
+| 空 stdin × `TMPDIR=/nonexistent-xyz` × `/bin/sh`(dash) | `rc=2`，`cannot create /nonexistent-xyz/pre-push-*.err: Directory nonexistent`，**一句 `[pre-push]` 人话都没有** | `rc=0`，无输出（钩子不落临时文件） |
+| 空 stdin × `TMPDIR=/nonexistent-xyz` × `bash` | `rc=1`：零传输的 push 被误拦（`errfile` 退化 `/dev/null` 后 grep 判据失效） | `rc=0`，无输出 |
+| `PYTHONIOENCODING=ascii` × 一条**该放行**的 ref | `rc=1` + `正确做法` / `--no-verify` 两行（把 push-guard 的 rc2 当判定红） | `rc=1` + 「环境错误（rc=2）」档 + 原始诊断，**无** `--no-verify` |
+
+改前的三条 rc 是拿 `git show f1c8b44:.githooks/pre-push` 落成临时文件实跑的，不是转述；
+四条新断言钉在 `tests/integration/test_pre_push_hook.py` 用例 i–l。
 
 回归（规则 B 的事后稽核没被改坏，新旧代码同一时刻跑真仓，输出 diff 为空）：
 
