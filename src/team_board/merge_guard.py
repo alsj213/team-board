@@ -55,7 +55,13 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
 ```
 
 - `<base>` 取 ``gh pr view`` 的 ``baseRefName``；形态非法（空串 / 含空白字符 / 带
-  ``refs/`` 前缀）→ rc2，且**一个 git 调用都不发**（fetch 之前就拦）。
+  ``refs/`` 前缀）→ rc2，且**闸门自身不发任何 git 调用**（``fetch`` 之前就拦；此前已跑过
+  一次 ``ls-remote`` 存在性探针，那是合并前的源分支存在闸门，不是本闸门发的）。
+- **谁来做 rebase**（闸门只判「已 rebase 与否」，不做也不建议替你做）：rebase 必须在**这批
+  提交作者的 bot 身份 worktree 里**做（``bash scripts/setup-bot-identity.sh <profile>
+  <worktree>``，否则 committer 变成执行者、``commit-audit`` 判「committer 与 author 不一致」）；
+  或改用 ``git merge origin/main`` 把 main 并入分支 —— merge 提交被 ``git log --no-merges``
+  排除，不触 ``commit-identity`` 的 committer≡author 判据（判据③）。
 - ② 是必需的：预检到合并之间分支被推送时，判的必须是预检看到的那条 sha —— 与
   ``--match-head-commit`` 同一个理由。
 - ③ ``rc=0`` = 已 rebase → ``rebase | PASS``；``rc=1`` = 落后或分叉 → **拒绝**；其它 rc
@@ -975,7 +981,8 @@ def check_base_ref_shape(base: str) -> None:
     为什么也要在 ``fetch`` 之前拦：``base`` 会被拼成 refspec 的源侧
     （``+refs/heads/<base>:…``），畸形值要么 fetch 直接失败（rc2 但报错指向 git），
     要么更糟 —— 拼出一个本地存在、远端却不存在的 ref。位置在 :func:`rebase_gate`
-    第一步，畸形 ``baseRefName`` 一个 git 调用都不发。
+    第一步，畸形 ``baseRefName`` 闸门自身不发任何 git 调用（此前已跑过一次 ``ls-remote``
+    存在性探针，那是合并前的源分支存在闸门）。
     """
 
     if not base:
@@ -1509,7 +1516,8 @@ def rebase_gate(opts: Options, info: Preflight) -> str:
     """
 
     base = info.base_ref
-    # 畸形 baseRefName 在 fetch 之前拦：一个 git 调用都不发
+    # 畸形 baseRefName 在 fetch 之前拦：闸门自身不发任何 git 调用
+    # （此前已跑过一次 ls-remote 存在性探针，那是合并前的源分支存在闸门）
     check_base_ref_shape(base)
     base_text = base if opts.remote == "origin" else f"{opts.remote}/{base}"
 
@@ -1548,8 +1556,10 @@ def rebase_gate(opts: Options, info: Preflight) -> str:
     if kind == ANCESTOR_NO:
         raise MergeGuardError(
             f"分支 {opts.branch} 落后 {base_text}（{base_text} 不是 head 的祖先，"
-            f"git merge-base --is-ancestor rc=1）：合并前必须先 rebase 到 {base_text}，"
-            "拒绝合并"
+            f"git merge-base --is-ancestor rc=1）：合并前必须先 rebase 到 {base_text}"
+            "（在作者的 bot 身份 worktree 里做：bash scripts/setup-bot-identity.sh <profile>"
+            " <worktree>；或改用 git merge origin/main 把 main 并入分支 —— merge 提交被"
+            " git log --no-merges 排除，不触 commit-identity 判据③），拒绝合并"
         )
     if kind == ANCESTOR_ERROR:
         raise MergeGuardError(
