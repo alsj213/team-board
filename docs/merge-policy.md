@@ -65,12 +65,13 @@ git -C <你的 checkout> cat-file -p "$sha" | grep -c '^parent '
 | `1` | squash / rebase = **违规**，按 R1 同轮返工 |
 | `0` / 空 / `rc≠0` | **取值失败，不是结论**；先修命令（fetch 失败、SHA 为空），禁止据此判合规或违规 |
 
-⑥ **本条不管「合并是否完成」**：完成判据归 R12（合并 rc=0 + 源分支已删 + 三条输出贴卡）。本节只回答「用的是哪一种」，不与之争「唯一判据」。
+⑥ **本条不管「合并是否完成」**：完成判据归 R12（合并 rc=0 + 源分支已删 + 三条输出贴卡）。本节只回答「用的是哪一种」，不与之争「唯一判据」。（R12 若最终换了编号，本节 4 处交叉引用要同步核一次。）
 
 ## 二、为什么定 merge commit（依据，均已本机实跑）
 
-- **历史本来就是这一种**：main 上全部 9 个 PR 合并提交 parent 数都是 2
-  （`f2ee6648` / `abb57ae5` / `80fbd999` / `de2a7d41` / `75f7230b` / `4a91d5e4` / `94e94a97` / `3eadfb83` / `1212183c`，用 `git cat-file -p <sha> | grep -c '^parent '` 逐条核过）。
+- **历史本来就是这一种**：`git log --merges --format='%h' origin/main` 给出 **11 个 merge commit**
+  （`75f7230` `94e94a9` `1212183` `3eadfb8` `4a91d5e` `de2a7d4` `80fbd99` `abb57ae` `0b50ab6` `f2ee664` `69f8d9e`，
+  含最早两张 PR #2/#3 的 `69f8d9e`/`0b50ab6`），逐条 `git cat-file -p <sha> | grep -c '^parent '` → **11 条全是 2**。
   本条把既有事实**写死成规则**，不改方向。
 - **R6 ② 证据链指向具体提交**：卡上的 R3 证据（命令 + 退出码）对应 engineer 的逐条提交；squash 把它们压成一个，`git log` 与卡面 head 对不上，追溯只能猜 —— 正是本条要治的病。
 - **R6 ③ 用 head 判据**：`gh pr view <n> --json headRefName` 核对 `wt/<卡号>`；rebase-merge 改写 SHA 后 main 上找不到卡面记的 head，判定失效。
@@ -99,7 +100,8 @@ $ gh pr view <n> -R alsj213/team-board --json headRefName
    无 merge_guard（过渡期）：gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
 ⑧ 用的是哪一种（R13 ⑤，判本 PR 的合并提交）：
 $ sha=$(gh pr view <n> -R alsj213/team-board --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid'); echo "sha=$sha"
-$ git -C <checkout> fetch origin main -q; git -C <checkout> cat-file -p "$sha" | grep -c '^parent '
+$ git -C <checkout> cat-file -e "$sha" 2>/dev/null || git -C <checkout> fetch origin -q   # 本地没这个对象才 fetch；fetch 失败按 R10 ③
+$ git -C <checkout> cat-file -p "$sha" | grep -c '^parent '
 2 = merge commit（合规）/ 1 = squash 或 rebase（违规，返工）/ 0 或 rc≠0 = 取值失败，不是结论
 ⑨ 完成判据（R12）：源分支已删 `git ls-remote --exit-code --refs origin refs/heads/wt/<卡号>` → rc=2
 ```
