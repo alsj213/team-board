@@ -716,8 +716,9 @@ $ PYTHONPATH=src python3 -m team_board.cli body-audit; echo rc=$?
 rc=1
 ```
 
-（快照：2026-10-29 23:42 CST，`origin/main` 91052f4 的 worktree 上实跑。看板数据随时变，
-字节数与合计会跟着变，**命令不变**；`--all` 把已结卡也算进来，仍不含 `archived`。）
+（快照：2026-10-29 23:42 CST，`origin/main` 91052f4 的 worktree 上实跑，输出逐字照贴、
+未截断。看板数据随时变，字节数与合计会跟着变（本卡定稿时重跑已从 17 张变过一次），
+**命令与判定口径不变**；`--all` 把已结卡也算进来，仍不含 `archived`。）
 
 超限建卡被拦的实测（正文 3000 字节）：
 
