@@ -42,6 +42,17 @@
   stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--db`` 不存在、
   不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
 
+``push-guard`` 子命令（git pre-push 的判定本体，只读，不写任何东西）：
+- 0：放行（stdout 恰一行 ``push-guard: 放行 N 条 ref（checkout=…，HEAD=…）``）；
+  给 ``--check-install`` 时表示 pre-push 钩子已装好
+- 1：拦下（stdout 空，stderr 每处一行以 ``拒绝：`` 开头）；给 ``--check-install``
+  时表示钩子没装好（stderr 一行 ``未安装：<原因>；修复：git config core.hooksPath
+  .githooks``）
+- 2：参数或环境错误（``branches.AuditError`` / stdin 读失败 / stdout/stderr 编码
+  表示不了中文 → stderr 一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--repo``
+  不存在或不是工作树、``--main-branch`` 为空或该分支不存在、stdin 每行字段数 ≠ 4、
+  stdin 为空）
+
 ``merge-record`` 子命令（合并**前**那一半）：
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
 - 1：``--check-file`` 预检发现认账问题（每处一行 ``问题: <kind>：<detail>``）
@@ -76,7 +87,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-from . import bodylimit, branches, commands, commits, db, merges, web
+from . import bodylimit, branches, commands, commits, db, merges, pushguard, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -157,7 +168,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十个**子命令。
+    """建 CLI 前端：prog=team-board，共**十一个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -177,6 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
       命令模板，不执行任何 git/gh 命令；
     - ``body-audit``：稽核全板 ``tasks.body`` 的 UTF-8 字节分布与超限清单（0 无超限 /
       1 有超限 / 2 参数或环境错误），只吃 ``--db`` / ``--all``；
+    - ``push-guard``：git pre-push 的判定本体（0 放行 / 1 拦下 / 2 参数或环境
+      错误），吃 ``--repo`` / ``--main-branch`` / ``--check-install``；不带
+      ``--check-install`` 时从 stdin 读 pre-push 的 ref 行；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -412,6 +426,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="连 done 卡一起算（默认只算未结卡：status ∉ {done, archived}）",
     )
 
+    push_cmd = subparsers.add_parser(
+        "push-guard",
+        help=(
+            "pre-push 判定：主 checkout 不许切/推卡分支、worktree 必须与卡分支一致"
+            "（0 放行 / 1 拦下 / 2 参数或环境错误）"
+        ),
+    )
+    push_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要判定的 git 仓库路径（默认当前目录）",
+    )
+    push_cmd.add_argument(
+        "--main-branch",
+        default="main",
+        metavar="NAME",
+        help="主分支名（默认 main）",
+    )
+    push_cmd.add_argument(
+        "--check-install",
+        action="store_true",
+        help="只检查 pre-push 钩子是否已装好（不读 stdin）",
+    )
+
     serve = subparsers.add_parser(
         "serve", help="启动只读 Web 看板（默认 127.0.0.1:8787）"
     )
@@ -439,22 +478,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _write_stderr_error(message: str) -> None:
-    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。
+def _write_stderr_line(line: str) -> None:
+    """把**一行**文案（自动补换行）写到 stderr，在任何编码环境下都不崩。
 
-    用户可能跑在 ``LC_ALL=C PYTHONIOENCODING=ascii`` 下：这条消息里有中文，
-    直接 ``print(..., file=sys.stderr)`` 会 ``UnicodeEncodeError``（于是 rc1 +
-    traceback，跟「发现偏差」同码），或者被 Python 默认的 ``backslashreplace``
-    转成 ``\\u9519\\u8bef: …``（那就不是 ``错误: `` 了）。所以先问 stderr 的编码
-    能不能表示整行，能就正常写；不能就按 UTF-8 字节直写 ``stderr.buffer``。
+    先问 stderr 的编码能不能表示整行：能就正常写；不能（``PYTHONIOENCODING=ascii``
+    等）就按 UTF-8 字节直写 ``stderr.buffer``，避免 ``backslashreplace`` 把中文
+    转成 ``\\u9519\\u8bef`` 之类（那会让下游 grep 不到前缀）。
     """
 
-    line = f"错误: {message}\n"
+    text = f"{line}\n"
     encoding = getattr(sys.stderr, "encoding", None) or "utf-8"
     try:
-        line.encode(encoding)
+        text.encode(encoding)
     except UnicodeEncodeError:
-        data = line.encode("utf-8")
+        data = text.encode("utf-8")
         buffer = getattr(sys.stderr, "buffer", None)
         if buffer is not None:
             buffer.write(data)
@@ -462,8 +499,21 @@ def _write_stderr_error(message: str) -> None:
         else:  # pragma: no cover - 没有 buffer 的替身对象（极少见）
             sys.stderr.write(data.decode("utf-8", "backslashreplace"))
         return
-    sys.stderr.write(line)
+    sys.stderr.write(text)
     sys.stderr.flush()
+
+
+def _write_stderr_error(message: str) -> None:
+    """把 ``错误: …`` 写到 stderr，**在任何编码环境下都不崩**。
+
+    用户可能跑在 ``LC_ALL=C PYTHONIOENCODING=ascii`` 下：这条消息里有中文，
+    直接 ``print(..., file=sys.stderr)`` 会 ``UnicodeEncodeError``（于是 rc1 +
+    traceback，跟「发现偏差」同码），或者被 Python 默认的 ``backslashreplace``
+    转成 ``\\u9519\\u8bef: …``（那就不是 ``错误: `` 了）。编码兜底交给
+    :func:`_write_stderr_line`，前缀只在这里拼一次。
+    """
+
+    _write_stderr_line(f"错误: {message}")
 
 
 def _run_serve(args: argparse.Namespace) -> int:
@@ -971,6 +1021,80 @@ def _run_body_audit(args: argparse.Namespace) -> int:
     return 1 if summary.counts["over"] else 0
 
 
+def _push_guard_check_install(args: argparse.Namespace) -> int:
+    """``push-guard --check-install``：钩子装好 rc0 / 没装好 rc1 / 参数环境错 rc2。
+
+    判据（三个都要满足）：``core.hooksPath`` 恰好是 ``.githooks``、
+    ``<repo>/.githooks/pre-push`` 存在、且可执行。**不读 stdin**（同给 stdin 也
+    忽略，不退化 rc2）。
+    """
+
+    try:
+        pushguard.require_repo(args.repo)
+        root = Path(
+            branches._must_git(
+                args.repo, "rev-parse", "--show-toplevel", what="定位仓库失败"
+            ).strip()
+        ).resolve()
+    except branches.AuditError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    hook = root / ".githooks" / "pre-push"
+    proc = branches._git(root, "config", "--get", "core.hooksPath")
+    hooks_path = proc.stdout.strip() if proc.returncode == 0 else ""
+    if hooks_path != ".githooks":
+        reason = (
+            "core.hooksPath 未设置" if hooks_path == "" else f"core.hooksPath={hooks_path}"
+        )
+    elif not hook.exists():
+        reason = f"{hook} 不存在"
+    elif not os.access(hook, os.X_OK):
+        reason = f"{hook} 不可执行"
+    else:
+        if not _write_stdout(f"已安装：core.hooksPath=.githooks（{hook}）\n"):
+            return 2
+        return 0
+
+    _write_stderr_line(f"未安装：{reason}；修复：git config core.hooksPath .githooks")
+    return 1
+
+
+def _run_push_guard(args: argparse.Namespace) -> int:
+    """``push-guard`` 子命令：0 放行 / 1 拦下 / 2 参数或环境错误，不冒 traceback。
+
+    - 不带 ``--check-install``：从 **stdin** 读全部内容（git 把
+      ``<local_ref> <local_sha> <remote_ref> <remote_sha>`` 逐行喂给 pre-push
+      钩子），解析后交给 :func:`pushguard.judge`；
+    - 拦截时 stdout 必须为空（只往 stderr 写，每处一行以 ``拒绝：`` 开头），
+      放行时 stdout 恰一行。
+    """
+
+    if args.check_install:
+        return _push_guard_check_install(args)
+
+    try:
+        text = sys.stdin.read()
+        refs = pushguard.parse_pre_push_lines(text)
+        verdicts = pushguard.judge(args.repo, refs, main_branch=args.main_branch)
+    except branches.AuditError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    except (UnicodeDecodeError, OSError) as exc:
+        # stdin 不是 UTF-8（严格解码失败）/ 读 stdin 出错：都是环境问题 → rc2
+        _write_stderr_error(f"读取 stdin 失败: {exc}")
+        return 2
+
+    if any(verdict.blocked for verdict in verdicts):
+        for verdict in verdicts:
+            _write_stderr_line(verdict.message)
+        return 1
+
+    if not _write_stdout(verdicts[0].message + "\n"):
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -988,6 +1112,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "body-audit":
         return _run_body_audit(args)
+
+    if args.command == "push-guard":
+        return _run_push_guard(args)
 
     if args.command == "serve":
         return _run_serve(args)

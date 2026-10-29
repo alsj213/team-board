@@ -141,6 +141,16 @@ class CheckoutDrift:
 
 
 @dataclass(frozen=True)
+class WorktreeEntry:
+    """``git worktree list --porcelain`` 里的一段（规则 B 与 ``push-guard`` 共用）。"""
+
+    path: str
+    head: str
+    branch: str | None
+    detached: bool
+
+
+@dataclass(frozen=True)
 class BranchSetFinding:
     """规则 C-1：一个卡号出现了第二条分支。"""
 
@@ -472,26 +482,54 @@ def _allow_hit(entry: AllowEntry, finding: Finding) -> bool:
     )
 
 
-def _checkout_drifts(
-    repo: str | Path, main_branch: str
-) -> list[CheckoutDrift]:
-    """规则 B：解析 worktree 列表，产出 checkout 偏移。"""
+def load_worktrees(repo: str | Path) -> tuple[WorktreeEntry, ...]:
+    """解析 ``git worktree list --porcelain``（规则 B 与 ``push-guard`` 共用）。
+
+    分段规则照搬原 :func:`_checkout_drifts` 里的实现：空行分段、每段内
+    ``key value`` 按第一个空格切开；没有 ``worktree`` 字段的段跳过。
+    ``detached`` 与规则 B 同口径：段里有 ``detached`` 行，**或**没有 ``branch``
+    字段（非 detached 的 worktree 必有 branch）。
+    """
 
     raw = _must_git(
         repo, "worktree", "list", "--porcelain", what="读取 worktree 列表失败"
     )
-    worktrees: list[dict[str, str]] = []
+    blocks: list[dict[str, str]] = []
     current: dict[str, str] = {}
     for line in raw.splitlines():
         if not line.strip():
             if current:
-                worktrees.append(current)
+                blocks.append(current)
                 current = {}
             continue
         key, _, value = line.partition(" ")
         current[key] = value
     if current:
-        worktrees.append(current)
+        blocks.append(current)
+
+    entries: list[WorktreeEntry] = []
+    for block in blocks:
+        path_text = block.get("worktree")
+        if not path_text:
+            continue
+        branch_ref = block.get("branch")
+        entries.append(
+            WorktreeEntry(
+                path=path_text,
+                head=block.get("HEAD", ""),
+                branch=branch_ref,
+                detached=("detached" in block) or branch_ref is None,
+            )
+        )
+    return tuple(entries)
+
+
+def main_checkout_path(repo: str | Path) -> Path:
+    """主 checkout 的路径（``--git-common-dir`` 的父目录）。
+
+    逻辑照搬原 :func:`_checkout_drifts` 的实现：``--git-common-dir`` 可能是
+    相对路径（相对 ``repo``），先补成绝对再 ``resolve()`` 取父目录。
+    """
 
     common_dir = _must_git(
         repo,
@@ -502,18 +540,28 @@ def _checkout_drifts(
     common_path = Path(common_dir)
     if not common_path.is_absolute():
         common_path = Path(repo).resolve() / common_path
-    main_checkout = common_path.resolve().parent
+    return common_path.resolve().parent
+
+
+def _checkout_drifts(
+    repo: str | Path, main_branch: str
+) -> list[CheckoutDrift]:
+    """规则 B：解析 worktree 列表，产出 checkout 偏移。
+
+    解析交给 :func:`load_worktrees` / :func:`main_checkout_path`（``push-guard``
+    复用同一套），**判定与输出一字不改**。
+    """
+
+    worktrees = load_worktrees(repo)
+    main_checkout = main_checkout_path(repo)
 
     expected_main_ref = f"refs/heads/{main_branch}"
     drifts: list[CheckoutDrift] = []
     for entry in worktrees:
-        path_text = entry.get("worktree")
-        if not path_text:
-            continue
-        path = Path(path_text).resolve()
-        sha = entry.get("HEAD", "")
-        branch_ref = entry.get("branch")
-        detached = "detached" in entry or branch_ref is None
+        path = Path(entry.path).resolve()
+        sha = entry.head
+        branch_ref = entry.branch
+        detached = entry.detached
 
         if detached:
             actual = f"detached@{sha[:7]}"
@@ -530,7 +578,6 @@ def _checkout_drifts(
                 )
             actual = branch_ref.removeprefix("refs/heads/")
             card_match = BRANCH_RE.match(actual)
-            basename = path.name
             if path == main_checkout:
                 expected = main_branch
             elif card_match:
