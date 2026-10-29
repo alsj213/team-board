@@ -209,6 +209,7 @@ bash scripts/demo-branch-audit.sh
 本机没有这个 checkout（容器 / CI）时用 `TB_REAL_REPO=<别的 checkout>` 指定断言对象，
 都没有就**明确打 skip 提示**而不是假装断言通过。
 
+<<<<<<< HEAD
 ## 合并认账稽核（merge-audit）
 
 事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`Merge-By`）+
@@ -257,6 +258,69 @@ trailer 区），任一条有问题即 rc1。
   基线或 `--rev` 解析不成提交、卡号形态非法、`--require` 没带 `--card`、`PATH`
   里没有 `git`、git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
   `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
+
+## 合并后删源分支（merge_guard）
+
+合并闸门：**合并命令必须带 `--delete-branch`**，合并后必须机器确认远端源分支真的消失。
+入口和出口都靠退出码说话 —— 本工具**不提供不带删除的合并路径**：没有
+`--no-delete-branch` / `--keep-branch` 这种开关，也没有 `--admin` / `--auto` / `--force`
+这类绕过 PR 检查的口子。它是独立模块，不是 `team-board` 的子命令：
+
+```
+python3 -m team_board.merge_guard \
+  --pr <正整数> --branch <PR 的 head 分支名> \
+  --method {merge,squash,rebase} --delete-branch \
+  [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] [--verify-only]
+```
+
+- `--pr` / `--branch` / `--method` / `--delete-branch` 四项**必填**。`--method` 不给默认值
+  （合并方式由合并卡决定）；`--delete-branch` 缺了就直接 rc2，且**一个 gh 写操作都不发**，
+  stderr 固定一行
+  `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
+- `--pr` 取值 1–999999999（13 位毫秒这种误用一律 rc2）；`--timeout` / `--interval`
+  必须是 ≥1 的 ASCII 十进制整数（`0`、负数、`1_000`、空串、空串之外的空白都 rc2）。
+- `--repo` 默认 `.`，gh 与 git 都以它为工作目录（gh 由 git remote 自己认仓库）；
+  `--remote` 默认 `origin`。
+- `--branch` 等于该 PR 的 `baseRefName`，或等于 `main` / `master` → rc2（防删主分支）。
+- 合并前预检 `gh pr view <pr> --json number,state,headRefName,baseRefName`：`state`
+  必须是 `OPEN`、`headRefName` 必须与 `--branch` **逐字相等**，否则 rc2 并说清实际值。
+- 合并只用 `gh pr merge <pr> --<method> --delete-branch`；gh 返回非 0 → rc1，并把 gh 的
+  输出原文写出来，**不再跑删除验证、不报合并成功**。gh 自己的 stderr 警告（worktree 里
+  `failed to delete local branch`）不算失败 —— 判定只看**远端**。
+- 合并后的唯一判据是轮询
+  `git -C <repo> ls-remote --exit-code --refs <remote> refs/heads/<branch>`：`rc=0` =
+  分支仍在远端、`rc=2` = 没有这个 ref（已删）、其它 rc = 判不了（记一次继续轮询）。
+  轮询间隔 `--interval`，总等待不超过 `--timeout`。
+- `--verify-only`：不合并，只做「远端分支是否已删」的验证，**一次 gh 都不调**
+  （巡检 / 取红样例用）。
+
+退出码：
+
+- `0` —— 合并完成且已确认删除（`--verify-only` 时为「分支已删除」）。
+- `1` —— 未达成：合并失败、或合并成功但分支仍在、或无法判定。
+- `2` —— 参数或环境错误，含缺 `--delete-branch`。也包含：`--pr` / `--timeout` /
+  `--interval` 越界、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、PR 不是
+  `OPEN`、`PATH` 里没有 `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示不了中文，
+  以及**合并已发生但通信持续失败导致判不了**（这一种不算 1：判不了就是未通过，
+  rc2 一律 stderr 一行 `错误: …`、stdout 空、不冒 traceback）。
+
+输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
+`预检` / `合并` / `分支删除`，末行固定 `结论：` 前缀。下面这段是假 gh / 假 git 跑出来的
+端到端样例（真仓库只有路径那段不同）：
+
+```
+预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
+合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | (无输出)
+分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
+结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
+```
+
+分支还在时最后两行长这样（rc1，**不算合并成功**）：
+
+```
+分支删除 | FAIL | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
+结论：合并成功但源分支仍在远端（合并不算完成）
+```
 
 ## 通用参数
 
