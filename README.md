@@ -435,7 +435,10 @@ python3 -m team_board.merge_guard \
   非严格 UTF-8 / 空文件、body 内容不合认账三字段（缺字段 / 重复 / 格式非法 / 与参数
   不一致）、`--verify-only` 与这四个认账参数同给、`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
-  **合并前源分支在远端不存在**、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、
+  **合并前源分支在远端不存在**、**合并前 rebase 闸门拒绝**（`baseRefName` 形态非法 /
+  `git fetch` 取远端提交失败 / 远端 head 与预检的 `headRefOid` 不一致 / `base` 不是
+  `head` 的祖先 / 祖先关系判不了，见「合并前：rebase 闸门」）、`--branch` 是主分支或与 PR
+  的 `headRefName` 不一致、
   `headRefOid` 缺失或不是 40/64 位十六进制、gh 不支持 `--match-head-commit`、
   PR 不是 `OPEN`、`PATH` 里没有 `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示
   不了中文、收到 `SIGTERM` / `SIGINT` / `SIGHUP`（转成「无法判定」收尾），以及
@@ -464,17 +467,73 @@ stdout 失败」，`141` 是 SIGPIPE）。
 
 输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
 `分支存在` / `预检` / `合并` / `分支删除`（按执行顺序；预检后另有一行 `head sha | PASS |
-<sha>` 记下钉住的提交），末行固定 `结论：` 前缀。下面这段是假 gh / 假 git 跑出来的端到端
-样例（真仓库只有路径与 sha 那段不同）：
+<sha>` 记下钉住的提交，再往后是合并前的 `rebase | PASS | …` 闸门行，见下一小节），末行固定
+`结论：` 前缀。下面这段是假 gh / 假 git 跑出来的端到端样例（真仓库只有路径与 sha 那段不同）：
 
 ```
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
 预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
 head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/9/base refs/merge-guard/9/head | rc=0 | b3c1d2e 是 head 4f2a9c0 的祖先（已 rebase 到 main）
 合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 --subject Merge PR #9（t_bbeab29f） --body-file /tmp/t_bbeab29f-merge-body.txt | rc=0 | (无输出)
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
 ```
+
+### 合并前：rebase 闸门
+
+`merge_guard` 在**发起合并之前**还会用真实远端提交判定「PR 的 base（`origin/main`）是不是 head
+的祖先」—— 不是就 **rc2 拒绝合并、一个 `gh pr merge` 都不发**；已 rebase 才放行。判据三条命令
+（base 取 `gh pr view` 读到的 `baseRefName`，不写死 `main`；私有 ref 落在
+`refs/merge-guard/<pr>/{base,head}`）：
+
+```
+git -C <repo> fetch --no-tags --no-recurse-submodules --quiet <remote> \
+    '+refs/heads/<base>:refs/merge-guard/<pr>/base' \
+    '+refs/heads/<branch>:refs/merge-guard/<pr>/head'
+git -C <repo> rev-parse refs/merge-guard/<pr>/head      # 必须逐字等于预检的 headRefOid
+git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-guard/<pr>/head
+```
+
+分支落后 main 时（本机 2026-10-29 真跑：临时 bare origin + clone + 假 gh，分支 `wt/t_deadbeef`
+从 `main~1` 拉出；命令同上那行，只把 `--pr` / `--branch` / `--repo` / `--card` / `--by` /
+`--subject` / `--body-file` 换成 9 / wt/t_deadbeef / 克隆目录 / t_deadbeef / engineer/run232 /
+`Merge PR #9（t_deadbeef）` / body 文件；返工卡 `t_0a16dc4d` 用同一脚本重跑，下面两段是新代码
+的原文）：
+
+```
+# rc=2；stdout 0 字节；stderr 恰一行：
+错误: 分支 wt/t_deadbeef 落后 main（main 不是 head 的祖先，git merge-base --is-ancestor rc=1）：合并前必须先 rebase 到 main（在作者的 bot 身份 worktree 里做：bash scripts/setup-bot-identity.sh <profile> <worktree>；或改用 git merge origin/main 把 main 并入分支 —— merge 提交被 git log --no-merges 排除，不触 commit-identity 判据③），拒绝合并
+# $FAKE_LOG 里 gh 只被调过 1 次（那次 gh pr view）；gh pr merge 次数=0
+```
+
+`git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`）：
+
+```
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | bea0a7373d4c5e6d80340785735749113327ed27	refs/heads/wt/t_deadbeef
+预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
+head sha | PASS | bea0a7373d4c5e6d80340785735749113327ed27
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/9/base refs/merge-guard/9/head | rc=0 | 9f017ba 是 head bea0a73 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit bea0a7373d4c5e6d80340785735749113327ed27 --subject Merge PR #9（t_deadbeef） --body-file /tmp/rg-e2e-QJ07sd/body.txt | rc=0 | (无输出)
+分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
+结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
+```
+
+- 拒绝的四种原因**全部归 rc2**（「合并前状态不满足」，与「源分支远端不存在」「PR 不是 OPEN」同
+  档）：取远端提交失败（`git fetch` 非 0）/ 远端 head 与预检的 `headRefOid` 不一致（预检之后被
+  推送）/ `base` 不是 head 的祖先（落后或分叉）/ 祖先关系判不了（`merge-base` 非 0/1）。
+  畸形 `baseRefName`（空串 / 含空白 / 带 `refs/` 前缀）同样 rc2，且**闸门自身不发任何 git
+  调用**（`fetch` 之前就拦；此前已跑过一次 `ls-remote` 存在性探针，那是合并前的源分支存在
+  闸门，不是本闸门发的）。
+- **谁来做 rebase**：闸门只判「已 rebase 与否」，不做也不替你选执行者。要么在**这批提交作者的
+  bot 身份 worktree 里**做（先 `bash scripts/setup-bot-identity.sh <profile> <worktree>`，否则
+  committer 变成执行者、`commit-audit` 判「committer 与 author 不一致」）；要么改用
+  `git merge origin/main` 把 main 并入分支 —— merge 提交被 `git log --no-merges` 排除，不触
+  `commit-identity` 的 committer≡author 判据（判据③）。同一句短版也印在拒绝文案里。
+- **不加跳过开关**：没有 `--allow-stale` / `--skip-rebase-check` / `--force` / `--no-verify`。
+  `--verify-only` 路径也不加这一步（它一次 gh 都不调）。
+- 它**不取代** R6 的「合并前 CI 全绿」，也不改 R12/R13 的判据：合并入口仍然只有 `merge_guard`
+  一条命令，这只是它内部多一道闸门。条文与残余风险见 `docs/merge-rebase-gate.md`。
 
 合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）。合并模式必填认账四参数，
 `--body-file` 指的 body 先由 `team-board merge-record --card <卡号> --by <profile>/run<NNN> --pr 9 --body-out <body文件>` 生成

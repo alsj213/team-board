@@ -1346,3 +1346,113 @@ def test_validate_verify_only_alone_returns_no_accounting() -> None:
 
     assert opts.verify_only is True
     assert opts.accounting is None
+
+
+# ------------------------------- 合并前 rebase 闸门：ref 名 / 三条 argv / rc 分类 / base 形态
+
+def test_step_rebase_label_is_stable() -> None:
+    """证据行的步骤标签下游要 grep，值钉死成 ``rebase``。"""
+
+    assert mg.STEP_REBASE == "rebase"
+
+
+def test_merge_guard_ref_namespace_is_private() -> None:
+    """私有 ref 命名空间不在 ``refs/heads`` / ``refs/remotes`` 下（稽核看不见、push 不带）。"""
+
+    assert mg.MERGE_GUARD_REF_PREFIX == "refs/merge-guard"
+    assert not mg.MERGE_GUARD_REF_PREFIX.startswith("refs/heads")
+    assert not mg.MERGE_GUARD_REF_PREFIX.startswith("refs/remotes")
+    assert mg.rebase_base_ref(9) == "refs/merge-guard/9/base"
+    assert mg.rebase_head_ref(9) == "refs/merge-guard/9/head"
+
+
+def test_rebase_fetch_argv_verbatim() -> None:
+    argv = mg.rebase_fetch_argv("/r", "origin", 9, "main", "wt/t_bbeab29f")
+
+    assert argv == (
+        "git",
+        "-C",
+        "/r",
+        "fetch",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--quiet",
+        "origin",
+        "+refs/heads/main:refs/merge-guard/9/base",
+        "+refs/heads/wt/t_bbeab29f:refs/merge-guard/9/head",
+    )
+    # 不许浅抓：浅历史下 merge-base --is-ancestor 会假红
+    assert "--depth" not in argv
+
+
+def test_rebase_fetch_argv_uses_base_ref_name_not_hardcoded_main() -> None:
+    """base 来自 ``gh pr view`` 的 ``baseRefName``；``--remote`` 也不写死成 origin。"""
+
+    argv = mg.rebase_fetch_argv("/r", "upstream", 9, "release/1.0", "wt/t_x")
+
+    assert "+refs/heads/release/1.0:refs/merge-guard/9/base" in argv
+    assert "upstream" in argv
+    assert "+refs/heads/wt/t_x:refs/merge-guard/9/head" in argv
+
+
+def test_rebase_rev_parse_argv_verbatim() -> None:
+    assert mg.rebase_rev_parse_argv("/r", mg.rebase_head_ref(9)) == (
+        "git",
+        "-C",
+        "/r",
+        "rev-parse",
+        "refs/merge-guard/9/head",
+    )
+
+
+def test_rebase_merge_base_argv_verbatim() -> None:
+    assert mg.rebase_merge_base_argv("/r", 9) == (
+        "git",
+        "-C",
+        "/r",
+        "merge-base",
+        "--is-ancestor",
+        "refs/merge-guard/9/base",
+        "refs/merge-guard/9/head",
+    )
+
+
+@pytest.mark.parametrize(
+    ("rc", "expected"),
+    [
+        (0, mg.ANCESTOR_YES),
+        (1, mg.ANCESTOR_NO),
+        (128, mg.ANCESTOR_ERROR),  # 对象缺失 / 通信错误：判不了
+        (255, mg.ANCESTOR_ERROR),
+        (-1, mg.ANCESTOR_ERROR),  # 超时哨兵
+    ],
+)
+def test_classify_merge_base_rc(rc: int, expected: str) -> None:
+    assert mg.classify_merge_base_rc(rc) == expected
+
+
+@pytest.mark.parametrize(
+    ("base", "hint"),
+    [
+        ("", "不能是空串"),
+        ("ma in", "不能含空白字符"),
+        (" ma in", "不能含空白字符"),
+        ("refs/heads/main", "不能带 refs/ 前缀"),
+    ],
+)
+def test_check_base_ref_shape_rejects(base: str, hint: str) -> None:
+    """畸形 ``baseRefName`` → ``MergeGuardError``，文案点名 baseRefName（不是 --branch）。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.check_base_ref_shape(base)
+
+    message = str(excinfo.value)
+    assert "baseRefName" in message
+    assert hint in message
+    assert "--branch" not in message  # 复用 --branch 那套文案会造成误导
+
+
+def test_check_base_ref_shape_accepts_plain_branch_names() -> None:
+    for base in ("main", "master", "release/1.0", "wt/t_bbeab29f"):
+        mg.check_base_ref_shape(base)  # 不抛
+
