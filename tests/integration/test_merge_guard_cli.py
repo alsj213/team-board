@@ -235,6 +235,46 @@ def test_merge_path_branch_probe_error_rc2(
     assert stub.gh_calls() == []
 
 
+# ------ 1d. --branch 形态校验（P2-1）：空串 / 含空白 / refs/ 前缀 → rc2、零外部调用
+#
+# 修前（pm 实测）：--verify-only 对这三种输入都打「分支删除 | PASS」+ rc0。原因是
+# ls-remote 的入参是 refs/heads/<--branch> 直接拼的：'' → refs/heads/、
+# ' wt/x' → refs/heads/ wt/x、'refs/heads/wt/x' → refs/heads/refs/heads/wt/x，
+# 三者在远端都不存在 → rc=2 → 被读成「已删除」。合并路径与 --verify-only 必须同一套校验。
+
+MALFORMED_BRANCHES: list[tuple[str, str, str]] = [
+    ("空串", "", mg.BRANCH_RULE_EMPTY),
+    ("前导空格", f" {CARD_BRANCH}", mg.BRANCH_RULE_WHITESPACE),
+    ("中间制表符", "wt/\tt_bbeab29f", mg.BRANCH_RULE_WHITESPACE),
+    ("全角空格", f"　{CARD_BRANCH}", mg.BRANCH_RULE_WHITESPACE),
+    ("尾随换行", f"{CARD_BRANCH}\n", mg.BRANCH_RULE_WHITESPACE),
+    ("refs/ 前缀", f"refs/heads/{CARD_BRANCH}", mg.BRANCH_RULE_REFS_PREFIX),
+]
+
+
+@pytest.mark.parametrize(("label", "bad_branch", "rule"), MALFORMED_BRANCHES)
+@pytest.mark.parametrize("verify_only", [False, True])
+def test_malformed_branch_rc2_with_zero_calls(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    label: str,
+    bad_branch: str,
+    rule: str,
+    verify_only: bool,
+) -> None:
+    """畸形 ``--branch``：两条路径都 rc2、stdout 空、stderr 恰一行、零 gh / 零 git。"""
+
+    extra = ["--verify-only"] if verify_only else []
+    rc, out, err = run(args_for(stub, "--branch", bad_branch, *extra), capsys)
+
+    assert rc == 2, label
+    assert out == "", label  # 一个字的证据都没有（更不许有 PASS 行）
+    assert err.startswith("错误: --branch "), label
+    assert rule in err, label  # 说清是哪条规则
+    assert err.count("\n") == 1, label  # stderr 严格一行
+    assert stub.calls() == [], label  # 零 gh、零 git
+
+
 # ------------------------------------- 2. 合并成功但分支仍在 → rc1（不算成功）
 
 def test_merge_ok_but_branch_remains_rc1(
@@ -617,7 +657,9 @@ def test_verify_only_branch_present_rc1(
     assert rc == 1
     assert err == ""
     assert out.splitlines()[-1] == "结论：分支仍在远端"
-    assert out.splitlines()[0].startswith("分支删除 | FAIL | ")
+    # 步骤行只报 ref 现状：--verify-only 没有「删除」这一步，不许打 PASS / FAIL
+    assert out.splitlines()[0].startswith("远端 ref | 存在 | ")
+    assert "PASS" not in out and "FAIL" not in out
     assert stub.gh_calls() == []
 
 
@@ -628,6 +670,9 @@ def test_verify_only_branch_deleted_rc0(
 
     因为 ``--verify-only`` 不知道这个分支是「删掉了」还是「从来没存在过」——
     后者正是修前把 ``wt/t_never_existed_zzz`` 读成 rc0「已删除」的那条路。
+
+    步骤行同理：修前打 ``分支删除 | PASS | … | rc=2 | 分支已不在远端``，那一列会被
+    抄进卡当「删除已验证」的证据，而这条路径一次删除都没验证过。
     """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
@@ -642,7 +687,41 @@ def test_verify_only_branch_deleted_rc0(
     assert out.splitlines()[-1] == "结论：远端没有这个 ref（已删除，或从未存在过）"
     assert "分支已删除" not in out  # 旧措辞（会掩盖「从未存在过」）
     assert "或从未存在过" in out
+    # 步骤行：只报「远端 ref 不存在」，既不写 PASS，也不写「分支删除」
+    steps = [line for line in out.splitlines() if line.startswith("远端 ref | ")]
+    assert len(steps) == 1
+    assert steps[0].startswith("远端 ref | 不存在 | ")
+    assert "rc=2" in steps[0]
+    assert "PASS" not in out
+    assert "分支删除" not in out
     assert stub.gh_calls() == []
+
+
+def test_verify_only_legal_branch_rc2_never_claims_delete(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """合法 ``--branch`` + ``--verify-only`` + ``ls-remote rc=2``：输出里没有宣称删除的 PASS。
+
+    这是本卡的验收判据②：``rc=2`` 只能说明「这个 remote 现在没有这个 ref」。
+    同时钉住探针查的 ref **就是裸分支名拼出来的那一个** —— 不许出现
+    ``refs/heads/refs/heads/…`` 或带空白的 ref（那才是修前「假绿」的来源）。
+    """
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # --verify-only 没有「合并前存在」闸门
+
+    rc, out, err = run(args_for(stub, "--verify-only"), capsys)
+
+    assert rc == 0
+    assert err == ""
+    for line in out.splitlines():
+        if "PASS" in line:
+            assert "删除" not in line, line  # 任何 PASS 行都不许宣称删除
+    assert "分支删除" not in out
+    assert "已删除 |" not in out  # 步骤行的状态字段只有 存在 / 不存在 / 无法判定
+    assert stub.git_calls() == [
+        f"git -C {stub.repo} ls-remote --exit-code --refs origin refs/heads/{CARD_BRANCH}"
+    ]
 
 
 def test_verify_only_undetermined_rc1(

@@ -286,6 +286,103 @@ def test_non_main_branch_accepted(branch: str) -> None:
     mg.check_branch_is_not_main(branch)  # 不抛异常即通过
 
 
+# ------------------------------------------------ --branch 形态校验（P2-1 返工）
+#
+# 修前：validate 对 --branch 不做形态校验，--verify-only 把 ls-remote rc=2 一律读成
+# 「已删除」→ 空串 / 带空白 / 带 refs/ 前缀三种输入都打「分支删除 | PASS」+ rc0。
+
+
+@pytest.mark.parametrize(
+    ("label", "branch", "rule"),
+    [
+        ("空串", "", mg.BRANCH_RULE_EMPTY),
+        ("前导空格", " wt/t_bbeab29f", mg.BRANCH_RULE_WHITESPACE),
+        ("尾随空格", "wt/t_bbeab29f ", mg.BRANCH_RULE_WHITESPACE),
+        ("中间制表符", "wt/\tt_bbeab29f", mg.BRANCH_RULE_WHITESPACE),
+        ("尾随换行", "wt/t_bbeab29f\n", mg.BRANCH_RULE_WHITESPACE),
+        ("全角空格", "\u3000wt/t_bbeab29f", mg.BRANCH_RULE_WHITESPACE),
+        ("refs/heads 前缀", "refs/heads/wt/t_bbeab29f", mg.BRANCH_RULE_REFS_PREFIX),
+        ("refs/tags 前缀", "refs/tags/v1", mg.BRANCH_RULE_REFS_PREFIX),
+        ("裸 refs/", "refs/", mg.BRANCH_RULE_REFS_PREFIX),
+    ],
+)
+def test_check_branch_shape_rejects(label: str, branch: str, rule: str) -> None:
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.check_branch_shape(branch)
+
+    message = str(excinfo.value)
+    assert message.startswith("--branch "), label
+    assert rule in message, label  # 说清是哪条规则
+    assert "\n" not in message, label  # stderr 只许一行
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "wt/t_bbeab29f",
+        "feature-x",
+        "main",  # 形态合法，由 check_branch_is_not_main 拒
+        "Main",
+        "main2",
+        "refsfoo/x",  # 只有字面前缀 refs/ 才算
+        "wt/refs/heads",  # 前缀在中间不算
+    ],
+)
+def test_check_branch_shape_accepts(branch: str) -> None:
+    mg.check_branch_shape(branch)  # 不抛异常即通过
+
+
+@pytest.mark.parametrize("bad", ["", " wt/t_bbeab29f", "refs/heads/wt/t_bbeab29f"])
+def test_validate_rejects_malformed_branch(bad: str) -> None:
+    """validate 层也拒（不经 argparse 的伪造命名空间）：形态校验排在一切 gh / git 之前。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(branch=bad))
+
+    assert str(excinfo.value).startswith("--branch ")
+
+
+def test_validate_accepts_legal_branch_unchanged() -> None:
+    """合法分支名的行为不变（顺带钉住 --branch 原样进 Options，不做 trim）。"""
+
+    assert mg.validate(_validated_ns()).branch == "wt/t_bbeab29f"
+
+
+# ------------------------------------------- --verify-only 的步骤行（不写 PASS/FAIL）
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state"),
+    [
+        (mg.OUT_DELETED, "不存在"),
+        (mg.OUT_PRESENT, "存在"),
+        (mg.OUT_UNDETERMINED, "无法判定"),
+    ],
+)
+def test_format_verify_step_never_says_pass(outcome: str, state: str) -> None:
+    """``--verify-only`` 的步骤行只报 ref 现状：不许出现 PASS / FAIL，也不许宣称删除。"""
+
+    line = mg.format_verify_step(
+        outcome,
+        command="git ls-remote --exit-code --refs origin refs/heads/wt/x",
+        rc=2,
+        key="分支已不在远端",
+    )
+
+    assert line.startswith(f"远端 ref | {state} | ")
+    assert "PASS" not in line and "FAIL" not in line
+    assert "删除" not in line.split(" | ")[0]
+    assert mg.STEP_REMOTE_REF != mg.STEP_DELETE
+
+
+def test_format_verify_step_unknown_outcome_is_undetermined() -> None:
+    """未知 outcome 不许当成「不存在」（那会替没查过的 ref 打绿）。"""
+
+    line = mg.format_verify_step("nonsense", command="git ls-remote", rc=1, key="k")
+
+    assert line.startswith("远端 ref | 无法判定 | ")
+
+
 # ------------------------------------------------------------ parse_pr_view
 
 def _view_proc(payload: str, rc: int = 0) -> mg.CommandResult:

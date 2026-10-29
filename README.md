@@ -371,7 +371,10 @@ python3 -m team_board.merge_guard \
 - `--verify-only`：不合并，只回答「远端分支**现在**在不在」，**一次 gh 都不调**
   （巡检 / 取红样例用）。它**不能**证明「曾经存在并被删」：远端没有这个 ref 时结论是
   `结论：远端没有这个 ref（已删除，或从未存在过）`，rc 仍是 0 —— 要证明「被删」，
-  只能走合并路径（先有「分支存在」预检，再有「分支删除」验证）。
+  只能走合并路径（先有「分支存在」预检，再有「分支删除」验证）。它的步骤行单独一种
+  形态 `远端 ref | <存在|不存在|无法判定> | <命令原文> | rc=<n> | <关键输出>`，
+  **不写** `PASS` / `FAIL`、也不出现「分支删除」—— 这条路径一次删除都没验证过，
+  打 PASS 会被抄进卡当「删除已验证」的证据（2026-10-29 P2-1 返工）。
 
 退出码：
 
@@ -381,7 +384,8 @@ python3 -m team_board.merge_guard \
   `--verify-only` 时还包括「分支仍在」与「无法判定」（`结论：无法判定（…）`）。合并路径上
   「判不了」**不是** rc1 而是 rc2（见下条）。
 - `2` —— 参数或环境错误，含缺 `--delete-branch`、`--method` 不是 `merge`（`squash` /
-  `rebase`）。也包含：`--pr` / `--timeout` /
+  `rebase`）、`--branch` 形态非法（空串 / 含空白字符 / 带 `refs/` 前缀；合并路径与
+  `--verify-only` **同一套**校验，都在一切 `gh` / `git` 调用之前）。也包含：`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
   **合并前源分支在远端不存在**、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、
   `headRefOid` 缺失或不是 40/64 位十六进制、gh 不支持 `--match-head-commit`、
@@ -429,6 +433,27 @@ head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
 ```
 $ python3 -m team_board.merge_guard --pr 9 --branch wt/t_never_existed_zzz --method merge --delete-branch
 # stderr: 错误: 源分支 wt/t_never_existed_zzz 不在 origin 远端（rc=2）：(无输出)；合并前源分支必须先存在，拒绝合并
+```
+
+`--branch` 形态非法时同样 rc2、stdout 空、零 `gh` / 零 `git`（合并路径与 `--verify-only`
+同一套校验，三种输入各一行错误）：
+
+```
+$ python3 -m team_board.merge_guard --pr 9 --branch '' --method merge --delete-branch --verify-only
+# stderr: 错误: --branch 不能是空串：要的是裸分支名（例 wt/t_1234abcd）；空串会拼成 refs/heads/ 这个不存在的 ref，ls-remote 的 rc=2 会被读成「已删除」
+
+$ python3 -m team_board.merge_guard --pr 9 --branch ' wt/t_x' --method merge --delete-branch --verify-only
+# stderr: 错误: --branch ' wt/t_x' 不能含空白字符（第 1 个字符是 ' '）：要的是裸分支名，空白不会被 Git 规范化掉，refs/heads/<含空白> 在远端永远查不到
+
+$ python3 -m team_board.merge_guard --pr 9 --branch 'refs/heads/wt/t_x' --method merge --delete-branch --verify-only
+# stderr: 错误: --branch 'refs/heads/wt/t_x' 不能带 refs/ 前缀：要的是裸分支名（例 wt/t_1234abcd），本工具自己拼 refs/heads/；重复前缀会查成 refs/heads/refs/… 而永远不存在
+```
+
+`--verify-only` 的输出（一次 gh 都不调；注意步骤行是 `远端 ref`，不写 `PASS`）：
+
+```
+远端 ref | 不存在 | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
+结论：远端没有这个 ref（已删除，或从未存在过）
 ```
 
 分支还在时最后两行长这样（rc1，**不算合并成功**）：

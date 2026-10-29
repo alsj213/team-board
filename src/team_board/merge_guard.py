@@ -44,6 +44,26 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
 依据是 R13（合并方式统一定一种 = create a merge commit，见 ``docs/merge-policy.md``）——
 本工具不再把「用哪种方式」交给调用方决定。
 
+``--branch`` 只收裸分支名
+------------------------
+``--branch`` 在 ``validate`` 里（一切 ``gh`` / ``git`` 调用**之前**）就过形态校验：空串、
+含任意空白字符、带 ``refs/`` 前缀 → rc2、stdout 空、stderr 恰一行 ``错误: …``。合并路径
+与 ``--verify-only`` 走**同一套**校验，不许只修一半。
+
+为什么不能「宽容一些」：探针入参是 ``refs/heads/<--branch>`` 直接拼出来的，于是
+``--branch ''`` → ``refs/heads/``、``--branch ' wt/x'`` → ``refs/heads/ wt/x``、
+``--branch 'refs/heads/wt/x'`` → ``refs/heads/refs/heads/wt/x`` —— 三者在远端都**不存在**，
+``ls-remote`` 一律 ``rc=2``。修前 ``--verify-only`` 把 ``rc=2`` 读成「已删除」，给一个
+从来没查过的 ref 打「分支删除 | PASS」+ rc0，等于伪造删除证明。
+
+``--verify-only`` 的步骤行不写 PASS / FAIL
+----------------------------------------
+``--verify-only`` 既没看到「合并前分支在」，也没看到合并动作，``rc=2`` 分不出「已删除」
+与「从未存在过」。所以它的步骤行只报 ref 现状：``远端 ref | 不存在 | … | rc=2 | …``
+（``存在`` / ``不存在`` / ``无法判定``），``PASS`` / ``FAIL`` 与「分支已删除」字样一律
+不出现。「删除」这个结论只由合并路径下 —— 合并前已确认分支存在 + 合并后探针 ``rc=2``
+—— 才允许打出来。
+
 退出码
 ------
 - ``0``：合并完成，且已确认远端源分支删除（``--verify-only`` 时为「远端没有这个
@@ -54,7 +74,8 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
   / ``rebase`` 一律拒）、``--pr`` / ``--timeout`` /
   ``--interval`` / ``--command-timeout`` 取值越界（``--pr`` 上限 ``MAX_PR``；
   ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
-  ``--interval`` 不得大于 ``--timeout``）、``--branch`` 是 ``main`` / ``master``
+  ``--interval`` 不得大于 ``--timeout``）、``--branch`` 形态非法（空串 / 含空白字符 /
+  带 ``refs/`` 前缀）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
   ``headRefOid`` 缺失或不是 40/64 位十六进制、gh 不支持 ``--match-head-commit``、
   源分支在远端**不存在**、PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、
@@ -133,10 +154,24 @@ STEP_PREFLIGHT = "预检"
 STEP_HEAD_SHA = "head sha"
 STEP_MERGE = "合并"
 STEP_DELETE = "分支删除"
+#: ``--verify-only`` 的步骤标签：只回答「远端有没有这个 ref」，不宣称删除
+STEP_REMOTE_REF = "远端 ref"
 
 OUT_DELETED = "deleted"
 OUT_PRESENT = "present"
 OUT_UNDETERMINED = "undetermined"
+
+#: ``--verify-only`` 步骤行的状态字段：只报 ref 现状，**不用** ``PASS`` / ``FAIL``
+VERIFY_STATE_TEXT: dict[str, str] = {
+    OUT_DELETED: "不存在",
+    OUT_PRESENT: "存在",
+    OUT_UNDETERMINED: "无法判定",
+}
+
+#: ``--branch`` 形态规则（stderr 里逐条点明是哪一条，便于调用方改正）
+BRANCH_RULE_EMPTY = "不能是空串"
+BRANCH_RULE_WHITESPACE = "不能含空白字符"
+BRANCH_RULE_REFS_PREFIX = "不能带 refs/ 前缀"
 
 PROBE_PRESENT = OUT_PRESENT
 PROBE_DELETED = OUT_DELETED
@@ -403,6 +438,21 @@ def format_step(step: str, *, ok: bool, command: str, rc: int, key: str) -> str:
 
     status = "PASS" if ok else "FAIL"
     return f"{step} | {status} | {command} | rc={rc} | {key}"
+
+
+def format_verify_step(outcome: str, *, command: str, rc: int, key: str) -> str:
+    """``远端 ref | <存在|不存在|无法判定> | <命令原文> | rc=<n> | <关键输出一行>``。
+
+    为什么 ``--verify-only`` 这一步不用 ``PASS`` / ``FAIL``：它既没看到「合并前分支
+    在」，也没看到合并动作，``ls-remote`` 的 ``rc=2`` 只说明「这个 remote 现在没有这个
+    ref」，分不出「已删除」与「从未存在过」。修前这里打的是
+    ``分支删除 | PASS | … | rc=2 | 分支已不在远端``：畸形 ``--branch``（空串 / 带空白 /
+    带 ``refs/`` 前缀）拼出来的 ref 本来就查不到，工具却替它颁了「删除」证明。
+    现在步骤行只报 ref 现状，``PASS`` / ``FAIL`` 与「已删」字样一律不出现。
+    """
+
+    state = VERIFY_STATE_TEXT.get(outcome, VERIFY_STATE_TEXT[OUT_UNDETERMINED])
+    return f"{STEP_REMOTE_REF} | {state} | {command} | rc={rc} | {key}"
 
 
 # --------------------------------------------------------------- 外部命令
@@ -672,6 +722,42 @@ def check_branch_is_not_main(branch: str) -> None:
         )
 
 
+def check_branch_shape(branch: str) -> None:
+    """``--branch`` 必须是**裸分支名**：非空、不含空白字符、不带 ``refs/`` 前缀。
+
+    为什么必须在 ``validate`` 里拦（一切 ``gh`` / ``git`` 调用之前）：探针入参是
+    ``refs/heads/<--branch>`` 直接拼出来的，畸形输入拼出的 ref 在远端**永远不存在**，
+    ``git ls-remote --exit-code`` 一律 ``rc=2`` —— 而 ``rc=2`` 的语义是「没有这个 ref」。
+    合并路径至少还有「合并前分支必须在」那道闸门（也会误报成「不存在」但至少不合并），
+    ``--verify-only`` 没有闸门：修前它把 ``rc=2`` 读成「已删除」并打「分支删除 | PASS」
+    + rc0，等于替一个从没查过的 ref 颁了删除证明（pm 实测：``--branch ''`` /
+    ``' wt/t_x'`` / ``'refs/heads/wt/t_x'`` 三种输入都是 rc0 + PASS）。
+
+    三条规则都只有一行 ``错误: …``（不带换行），说清是哪条：
+    :data:`BRANCH_RULE_EMPTY` / :data:`BRANCH_RULE_WHITESPACE` /
+    :data:`BRANCH_RULE_REFS_PREFIX`。
+    """
+
+    if not branch:
+        raise MergeGuardError(
+            f"--branch {BRANCH_RULE_EMPTY}：要的是裸分支名（例 wt/t_1234abcd）；"
+            "空串会拼成 refs/heads/ 这个不存在的 ref，ls-remote 的 rc=2 会被读成「已删除」"
+        )
+    for index, char in enumerate(branch):
+        if char.isspace():
+            raise MergeGuardError(
+                f"--branch {branch!r} {BRANCH_RULE_WHITESPACE}"
+                f"（第 {index + 1} 个字符是 {char!r}）：要的是裸分支名，"
+                "空白不会被 Git 规范化掉，refs/heads/<含空白> 在远端永远查不到"
+            )
+    if branch.startswith("refs/"):
+        raise MergeGuardError(
+            f"--branch {branch!r} {BRANCH_RULE_REFS_PREFIX}：要的是裸分支名"
+            "（例 wt/t_1234abcd），本工具自己拼 refs/heads/；"
+            "重复前缀会查成 refs/heads/refs/… 而永远不存在"
+        )
+
+
 def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
     """解析 ``gh pr view --json number,state,headRefName,baseRefName``。"""
 
@@ -817,8 +903,10 @@ def validate(args: argparse.Namespace) -> Options:
 
     if not args.delete_branch:
         raise MergeGuardError(MISSING_DELETE_BRANCH)
-    pr = parse_positive_int("--pr", args.pr, maximum=MAX_PR)
     branch = args.branch
+    # 形态校验排在 --pr / --repo / 一切 gh / git 调用之前：畸形分支名一条外部命令都不发
+    check_branch_shape(branch)
+    pr = parse_positive_int("--pr", args.pr, maximum=MAX_PR)
     check_branch_is_not_main(branch)
     timeout = parse_positive_int("--timeout", args.timeout, maximum=MAX_TIMEOUT)
     interval = parse_positive_int("--interval", args.interval, maximum=MAX_INTERVAL)
@@ -1040,6 +1128,10 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
     所以**不许**下「分支已删除」这种结论 —— 那要靠合并路径的「分支存在」预检 +
     「分支删除」验证两步合起来才成立。退出码语义不变：``ls-remote`` 的 ``rc=2`` 仍
     映到本命令的 rc0。
+
+    步骤行走 :func:`format_verify_step`（``远端 ref | 不存在 | …``），**不写**
+    ``PASS`` / ``FAIL``：``PASS`` 那一列会被抄进卡里当「删除已验证」的证据，而这条
+    路径恰恰没有验证过任何删除。
     """
 
     result = poll_branch_deleted(
@@ -1048,9 +1140,8 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
         interval=opts.interval,
     )
     lines = [
-        format_step(
-            STEP_DELETE,
-            ok=result.outcome == OUT_DELETED,
+        format_verify_step(
+            result.outcome,
             command=" ".join(ls_remote_argv(opts.repo, opts.remote, opts.branch)),
             rc=result.returncode,
             key=result.key,
