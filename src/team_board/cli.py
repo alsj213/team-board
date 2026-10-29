@@ -46,15 +46,20 @@
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
 - 1：``--check-file`` 预检发现认账问题（每处一行 ``问题: <kind>：<detail>``）
 - 2：参数或环境错误（``merges.MergeAuditError`` → stderr ``错误: …``、stdout 空；
-  含 ``--card`` / ``--by`` / ``--pr`` 形态非法、生成模式缺必需参数、``--check-file``
-  与 ``--body-out`` 同给、``--body-out`` 父目录不存在、body 文件不存在 / 是目录 /
-  无权限 / 非 UTF-8 / 空、stdout 编码表示不了中文）
+  含 ``--card`` / ``--by`` / ``--pr`` 形态非法、``--branch`` 形态非法（空串 / 含空白 /
+  带 ``refs/`` 前缀，校验复用 :func:`team_board.merge_guard.check_branch_shape`，不复制
+  正则）、生成模式缺必需参数（``--card`` / ``--by`` / ``--pr`` / ``--branch`` /
+  ``--body-out`` 缺任一项）、``--check-file`` 与 ``--body-out`` 同给、``--body-out``
+  父目录不存在、body 文件不存在 / 是目录 / 无权限 / 非 UTF-8 / 空、stdout 编码表示
+  不了中文）
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -85,11 +90,6 @@ _PR_DIGITS = re.compile(r"[1-9][0-9]*", re.ASCII)
 #: 已经远超任何真实仓库；13 位毫秒（``1793160000000``）与天文数字
 #: （``99999999999999999999``）都属「填错了字段」，一律 rc2 而不是收下。
 MAX_MERGE_PR = 999_999_999
-
-#: ``merge-record`` 生成模式的默认 body 路径模板（``/tmp/<卡号>-merge-body.txt``）。
-#: bandit B108 假阳性：该路径**只打印**、默认不落盘（仅当显式给 ``--body-out`` 才写），
-#: 且写入用 ``write_bytes`` 全量覆盖、不参与共用临时文件的竞态
-DEFAULT_BODY_PATH_TMPL = "/tmp/{card}-merge-body.txt"  # nosec B108
 
 
 def _parse_date(value: str) -> date:
@@ -160,10 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     - ``commit-audit``：稽核区间内提交的 author 白名单与 committer 身份（0 无问题 /
       1 有问题 / 2 参数或环境错误），吃 ``--repo`` / ``--card`` / ``--rev`` /
       ``--main-branch`` / ``--db`` / ``--bots``；
-    - ``merge-record``：合并**前**生成认账 body（喂 ``gh pr merge --body-file``）或
-      ``--check-file`` 预检（0 成功/通过 / 1 预检有问题 / 2 参数或环境错误），吃
-      ``--card`` / ``--by`` / ``--pr`` / ``--subject`` / ``--body-out`` /
-      ``--check-file``；**只打印** ``gh pr merge`` 模板，不执行任何 git/gh 命令；
+    - ``merge-record``：合并**前**生成认账 body 与一条可直接照抄的 ``merge_guard``
+      合并命令（R12 ① 的唯一入口）或 ``--check-file`` 预检（0 成功/通过 / 1 预检有
+      问题 / 2 参数或环境错误），吃 ``--card`` / ``--by`` / ``--pr`` / ``--branch`` /
+      ``--subject`` / ``--body-out`` / ``--repo`` / ``--check-file``；**只打印**那条
+      命令模板，不执行任何 git/gh 命令；
     - ``body-audit``：稽核全板 ``tasks.body`` 的 UTF-8 字节分布与超限清单（0 无超限 /
       1 有超限 / 2 参数或环境错误），只吃 ``--db`` / ``--all``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
@@ -351,10 +352,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="合并提交标题（默认 Merge PR #<pr>（<card>））",
     )
     record_cmd.add_argument(
+        "--branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "该 PR 的 head 分支（形如 wt/t_1234abcd；生成模式必给）。"
+            "空串 / 含空白 / 带 refs/ 前缀 → rc2"
+        ),
+    )
+    record_cmd.add_argument(
         "--body-out",
         default=None,
         metavar="PATH",
-        help="把认账 body 原样写入该文件（末尾恰好一个换行）；父目录不存在 → rc2",
+        help=(
+            "把认账 body 原样写入该文件（末尾恰好一个换行）；父目录不存在 → rc2。"
+            "生成模式必给（命令里的 --body-file 必须指向真实文件）"
+        ),
+    )
+    record_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help=(
+            "仓库路径（默认 .）：只用来拼打印命令里的 cd / PYTHONPATH / --repo 三处，"
+            "不校验它是不是 git 仓库（那是 merge_guard 的事）"
+        ),
     )
     record_cmd.add_argument(
         "--check-file",
@@ -691,36 +713,64 @@ def _record_generate(
     by: str,
     pr: int,
     subject: str | None,
-    body_out: str | None,
+    body_out: str,
+    branch: str,
+    repo: str,
 ) -> int:
-    """生成模式：打印「body 段 + 空行 + 4 行注释段」，``--body-out`` 时把 body 写盘。
+    """生成模式：打印「body 段 + 空行 + 4 行注释段」，并把 body 写进 ``--body-out``。
 
-    注释段 4 行 = 3 行 ``# `` 注释 + 1 行原样 ``gh pr merge`` 命令模板（该行刻意
-    不加 ``# ``，否则复制出来就不能直接执行）。本函数**不执行**任何 git/gh 命令。
+    注释段 4 行 = 3 行 ``# `` 注释 + 1 行**可直接照抄执行**的 ``merge_guard`` 合并命令
+    （该行刻意不加 ``# ``，否则复制出来就不能直接执行）。命令形态对齐 R12 ①：唯一入口
+    是 ``merge_guard``，``--method merge`` + ``--delete-branch`` 齐；“钉到提交”的
+    ``--match-head-commit`` **不写进这一行**（由 merge_guard 自己从预检的
+    ``headRefOid`` 拼），手写进去只会让命令多一个必填项。本函数**不执行**任何 git/gh
+    命令。
+
+    ``--subject`` / ``--body-file`` 用 :func:`shlex.quote` 包：标题里带 ``"`` / ``$`` /
+    反引号时，手写双引号会让照抄出来的命令被 shell 改写成另一个标题。``--body-file``
+    恒打印**绝对路径**：merge_guard 的 ``read_body_file`` 拒相对路径（进程 cwd 与
+    ``--repo`` 两套 cwd 会解析成两个不同文件）。
     """
 
     body = merges.build_message(card=card, by=by, pr=pr, subject=subject)
     title = subject if subject is not None else f"Merge PR #{pr}（{card}）"
-    body_path = (
-        body_out
-        if body_out is not None
-        else DEFAULT_BODY_PATH_TMPL.format(card=card)
+    body_path = os.path.realpath(body_out)
+    repo_path = os.path.realpath(repo)
+    _write_body_file(body_path, body)
+    command = (
+        f"cd {repo_path} && PYTHONPATH={repo_path}/src python3 -m team_board.merge_guard"
+        f" --pr {pr} --branch {branch} --method merge --delete-branch"
+        f" --card {card} --by {by} --subject {shlex.quote(title)}"
+        f" --body-file {shlex.quote(body_path)} --repo {repo_path}"
     )
-    wrote = body_out is not None
-    if wrote:
-        _write_body_file(body_path, body)
-    written_note = "已写入" if wrote else "未写入，给了 --body-out 才写"
     lines = [
         body.rstrip("\n"),
         "",
         f"# 卡面认账块：上面 body 段的三行原样贴卡；"
         f"合并完成后用 merge-audit --card {card} --require 回读合并提交 sha 补一行",
-        "# 合并命令（本工具不执行）：",
-        f'gh pr merge {pr} -R alsj213/team-board --merge --subject "{title}"'
-        f" --body-file {body_path}",
-        f"# body 文件：{body_path}（{written_note}）",
+        "# 合并命令（本工具不执行；R12 ① 唯一入口 = merge_guard，缺 --delete-branch 会被拒）：",
+        command,
+        f"# body 文件：{body_path}（已写入）",
     ]
     return 0 if _write_stdout("\n".join(lines) + "\n") else 2
+
+
+def _check_branch_for_command(branch: str) -> None:
+    """生成模式的 ``--branch`` 形态校验：**复用** merge_guard 的那三条规则。
+
+    不复制正则：``merge_guard.check_branch_shape`` 是「裸分支名」的唯一判据（空串 /
+    含空白 / 带 ``refs/`` 前缀三种输入各自的错误文案都在那里）。这里只把它的
+    ``MergeGuardError`` 折成本子命令既有的 ``MergeAuditError`` 口径（stderr
+    ``错误: …`` + rc2）。惰性 import：``merge_guard`` 只依赖 ``team_board.merges``，
+    无循环导入，但本项目只在真要拼命令时才加载它。
+    """
+
+    from . import merge_guard
+
+    try:
+        merge_guard.check_branch_shape(branch)
+    except merge_guard.MergeGuardError as exc:
+        raise merges.MergeAuditError(str(exc)) from exc
 
 
 def _run_merge_record(args: argparse.Namespace) -> int:
@@ -761,12 +811,25 @@ def _run_merge_record(args: argparse.Namespace) -> int:
             raise merges.MergeAuditError(
                 "生成模式必须同时给 --card / --by / --pr（缺 " + " / ".join(missing) + "）"
             )
+        if args.branch is None:
+            raise merges.MergeAuditError(
+                "生成合并命令必须给 --branch（该 PR 的 head 分支；"
+                "R6 要求 headRefName == wt/<卡号>）"
+            )
+        _check_branch_for_command(args.branch)
+        if args.body_out is None:
+            raise merges.MergeAuditError(
+                "生成合并命令必须给 --body-out（命令里的 --body-file 必须指向一个"
+                "真实存在的文件，否则照抄即 rc2「--body-file 文件不存在」）"
+            )
         return _record_generate(
             card=card,
             by=by,
             pr=pr,
             subject=args.subject,
             body_out=args.body_out,
+            branch=args.branch,
+            repo=args.repo,
         )
     except merges.MergeAuditError as exc:
         _write_stderr_error(str(exc))

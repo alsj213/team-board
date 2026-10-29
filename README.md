@@ -314,11 +314,15 @@ trailer 区），任一条有问题即 rc1。
 
 ### 合并前：`merge-record`（生成 body / 预检 body）
 
-- **生成**：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --body-out /tmp/t_xxx-merge-body.txt`
-  —— 打印认账 body 段（三行 trailer）+ 卡面认账块说明 + `gh pr merge` 命令模板
-  （**只打印，不执行任何 git/gh 命令**）；`--body-out` 把 body 段原样写盘（UTF-8，
-  末尾恰好一个换行），文件内容与 stdout 的 body 段逐字节一致。未给 `--body-out` 时
-  注释里报默认路径 `/tmp/<卡号>-merge-body.txt` 且**不写文件**。
+- **生成**：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt`
+  —— 打印认账 body 段（三行 trailer）+ 卡面认账块说明 + **一行 `merge_guard` 合并命令**
+  （R12 ① 的唯一入口，带齐 `--method merge` / `--delete-branch` / 认账四参数；
+  **只打印，不执行任何 git/gh 命令**）；`--body-out` 把 body 段原样写盘（UTF-8，
+  末尾恰好一个换行），文件内容与 stdout 的 body 段逐字节一致，命令里的 `--body-file`
+  恒为**绝对路径**。生成模式下 `--branch` 与 `--body-out` **必填**（缺任一项 → rc2、
+  stdout 空、stderr 一行 `错误: …`），`--branch` 形态非法（空串 / 含空白 / 带 `refs/`
+  前缀）同样是 rc2。`--repo`（默认 `.`）只用来拼命令里的 `cd` / `PYTHONPATH` /
+  `--repo` 三处。
 - **预检**：`team-board merge-record --check-file /tmp/t_xxx-merge-body.txt` —— 合并
   **前**校验一份 body 文件的三字段（可选 `--card/--by/--pr` 做一致性校验）；通过
   rc0（`通过：三字段齐（merged-by/merge-card/merge-pr）`），有问题 rc1（每处一行
@@ -536,7 +540,7 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/9/base r
   一条命令，这只是它内部多一道闸门。条文与残余风险见 `docs/merge-rebase-gate.md`。
 
 合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）。合并模式必填认账四参数，
-`--body-file` 指的 body 先由 `team-board merge-record --card <卡号> --by <profile>/run<NNN> --pr 9 --body-out <body文件>` 生成
+`--body-file` 指的 body 先由 `team-board merge-record --card <卡号> --by <profile>/run<NNN> --pr 9 --branch wt/<卡号> --body-out <body文件>` 生成
 （body 文件缺失 / 缺 trailer / 与 `--card`·`--by`·`--pr` 不一致同样 rc2，见上一节）：
 
 ```

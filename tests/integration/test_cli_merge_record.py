@@ -1,17 +1,26 @@
-"""cli merge-record 的集成测试：生成认账 body、``--body-out`` 落盘、``--check-file`` 预检。
+"""cli merge-record 的集成测试：生成认账 body + ``merge_guard`` 合并命令、``--check-file`` 预检。
 
-覆盖：生成模式 stdout 前 5 行形状 + 4 行注释段、``--body-out`` 内容与 stdout 的
-body 段逐字节一致（末尾恰好一个换行）、默认 body 路径**不写文件**、``--subject``
-覆盖标题、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 / 字段与参数不一致 rc1、
-rc2 一组（``--pr`` 取值域含 0 / 负 / 空串 / 13 位毫秒 / 天文数字 / 超上限 /
-``+1`` / ``1_0``，``--by`` 与 ``--card`` 形态，生成模式缺参数，``--check-file``
-不存在 / 是目录 / 空文件 / 非 UTF-8 / 与 ``--body-out`` 同给，``--body-out``
-父目录不存在）、stdout 编码表示不了中文的 rc2。
+覆盖：生成模式 stdout 前 5 行形状 + 4 行注释段、第 9 行是**可直接照抄执行**的
+``merge_guard`` 命令（R12 ① 的唯一入口；``--method merge`` / ``--delete-branch`` /
+认账四参数齐、``--match-head-commit`` 不进模板）、该行 ``shlex.split`` 后喂
+``merge_guard.main()`` 能走到「源分支不在远端」而不是撞 argparse、``--body-out``
+内容与 stdout 的 body 段逐字节一致（末尾恰好一个换行）、``--subject`` 覆盖标题且经
+``shlex.quote`` 后能逐字还原、``--body-out`` 相对路径打印成绝对路径、``--branch`` /
+``--body-out`` 缺任一项 rc2、``--branch`` 形态非法（空串 / 含空白 / ``refs/`` 前缀）
+rc2、预检绿 rc0 / 缺字段 rc1 / 格式非法 rc1 / 字段与参数不一致 rc1、rc2 一组
+（``--pr`` 取值域含 0 / 负 / 空串 / 13 位毫秒 / 天文数字 / 超上限 / ``+1`` / ``1_0``，
+``--by`` 与 ``--card`` 形态，生成模式缺参数，``--check-file`` 不存在 / 是目录 /
+空文件 / 非 UTF-8 / 与 ``--body-out`` 同给，``--body-out`` 父目录不存在）、stdout
+编码表示不了中文的 rc2，以及**文档守卫**：``README.md`` 与
+``docs/merge-accountability.md`` 里每条 ``merge-record …`` 生成命令抠出来真跑一遍
+必须 rc0（文档漂移即 CI 红）。
 """
 
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,13 +28,19 @@ from pathlib import Path
 import pytest
 
 from team_board import cli
+from team_board import merge_guard as mg
 
 CARD = "t_ad5e7ff6"
 BY = "pm/run137"
 PR = "15"
+#: 该 PR 的 head 分支（生成模式必填；形态取 ``wt/t_<卡号>``）
+BRANCH = "wt/t_bbeab29f"
 
 #: 未给 ``--subject`` 时的默认标题（``merges.build_message`` 的契约）
 DEFAULT_TITLE = f"Merge PR #{PR}（{CARD}）"
+
+#: 仓库根（文档守卫要读 README.md / docs）
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -39,11 +54,22 @@ def run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, 
 def generate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], *extra: str
 ) -> tuple[int, str, str, Path]:
-    """生成模式跑一遍（带 ``--body-out``），返回 ``(rc, out, err, body 文件)``。"""
+    """生成模式跑一遍（``--branch`` / ``--body-out`` / ``--repo`` 都给）。
+
+    返回 ``(rc, out, err, body 文件)``。
+    """
 
     body_path = tmp_path / "merge-body.txt"
     rc, out, err = run(
-        ["--card", CARD, "--by", BY, "--pr", PR, "--body-out", str(body_path), *extra],
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", str(tmp_path),
+            "--body-out", str(body_path),
+            *extra,
+        ],
         capsys,
     )
     return rc, out, err, body_path
@@ -53,6 +79,31 @@ def body_segment(out: str) -> str:
     """从 stdout 里切出 body 段（前 5 行：标题 / 空行 / 三行 trailer）。"""
 
     return "\n".join(out.splitlines()[:5]) + "\n"
+
+
+def printed_command(out: str) -> str:
+    """取 stdout 第 9 行（打印出来的那条 ``merge_guard`` 合并命令原文）。"""
+
+    return out.splitlines()[8]
+
+
+def printed_argv(out: str) -> list[str]:
+    """把打印行拆成 ``merge_guard`` 的 argv：去掉 ``cd <repo> && `` 与 ``PYTHONPATH=…/src``。"""
+
+    line = printed_command(out)
+    assert line.startswith("cd "), line
+    before, sep, after = line.partition(" && ")
+    assert sep and before.startswith("cd "), line
+    parts = shlex.split(after)
+    assert parts[0].startswith("PYTHONPATH="), parts
+    assert parts[1:4] == ["python3", "-m", "team_board.merge_guard"], parts
+    return parts[4:]
+
+
+def flag_value(argv: list[str], flag: str) -> str:
+    """取 ``--flag VALUE`` 的 VALUE。"""
+
+    return argv[argv.index(flag) + 1]
 
 
 @pytest.fixture()
@@ -70,7 +121,7 @@ def body_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
 def test_generate_prints_body_then_comment_block(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """stdout = body 段 + 空行 + 注释段（4 行：3 条 ``# `` 注释 + 1 条命令模板）。"""
+    """stdout = body 段 + 空行 + 注释段（4 行：3 条 ``# `` 注释 + 1 条 merge_guard 命令）。"""
 
     rc, out, err, body_path = generate(tmp_path, capsys)
 
@@ -86,14 +137,21 @@ def test_generate_prints_body_then_comment_block(
     assert lines[5] == ""
     assert lines[6].startswith("# 卡面认账块：")
     assert f"merge-audit --card {CARD} --require" in lines[6]
-    assert lines[7] == "# 合并命令（本工具不执行）："
-    assert lines[8] == (
-        f'gh pr merge {PR} -R alsj213/team-board --merge --subject "{DEFAULT_TITLE}"'
-        f" --body-file {body_path}"
+    assert lines[7] == (
+        "# 合并命令（本工具不执行；R12 ① 唯一入口 = merge_guard，缺 --delete-branch 会被拒）："
     )
-    assert lines[9] == f"# body 文件：{body_path}（已写入）"
-    # 本工具只打印、不执行：stdout 里除了这条模板不该有别的命令
-    assert out.count("gh pr merge ") == 1
+    repo = os.path.realpath(str(tmp_path))
+    body = os.path.realpath(str(body_path))
+    assert lines[8] == (
+        f"cd {repo} && PYTHONPATH={repo}/src python3 -m team_board.merge_guard"
+        f" --pr {PR} --branch {BRANCH} --method merge --delete-branch"
+        f" --card {CARD} --by {BY} --subject {shlex.quote(DEFAULT_TITLE)}"
+        f" --body-file {body} --repo {repo}"
+    )
+    assert lines[9] == f"# body 文件：{body}（已写入）"
+    # 本工具只打印、不执行；旧的裸 gh pr merge 形态不许再出现
+    assert "gh pr merge" not in out
+    assert out.count("team_board.merge_guard") == 1
 
 
 def test_body_out_file_equals_body_segment(
@@ -111,34 +169,173 @@ def test_body_out_file_equals_body_segment(
     assert written.decode("utf-8").splitlines()[0] == DEFAULT_TITLE
 
 
-def test_subject_override_is_used_by_body_and_template(
+def test_subject_override_is_used_by_body_and_command(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--subject`` 同时进 body 首行与 ``gh pr merge --subject`` 模板。"""
+    """``--subject`` 同时进 body 首行与打印命令的 ``--subject``（``shlex`` 还原后逐字相等）。"""
 
-    rc, out, err, body_path = generate(tmp_path, capsys, "--subject", "feat: 自定义标题")
+    subject = 'feat: 含 "引号"、$HOME 与 `反引号` 的标题'
+    rc, out, err, body_path = generate(tmp_path, capsys, "--subject", subject)
 
     assert rc == 0, (rc, out, err)
     lines = out.splitlines()
-    assert lines[0] == "feat: 自定义标题"
-    assert '--subject "feat: 自定义标题"' in lines[8]
-    assert body_path.read_text(encoding="utf-8").splitlines()[0] == "feat: 自定义标题"
+    assert lines[0] == subject
+    assert flag_value(printed_argv(out), "--subject") == subject
+    assert body_path.read_text(encoding="utf-8").splitlines()[0] == subject
 
 
-def test_without_body_out_does_not_write_default_file(
-    capsys: pytest.CaptureFixture[str]
+def test_printed_command_is_merge_guard_and_runnable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """没给 ``--body-out`` → 注释里报默认路径且标「未写入」，该文件不存在。"""
+    """打印行 = R12 ① 的命令形态；``shlex.split`` 后喂 ``merge_guard.main()`` 不撞 argparse。
 
-    default = Path(f"/tmp/{CARD}-merge-body.txt")
-    default.unlink(missing_ok=True)
+    这是本卡的核心理由：卡面/文档写「照抄它打印的命令」，那这一行就必须真被
+    ``merge_guard`` 收下。这里把 ``merge_guard._run`` 换成「``git ls-remote`` 返回
+    rc=2」，命令一路走到「合并前源分支必须先存在」的闸门（rc2），不联网、零 gh 调用。
+    """
 
-    rc, out, err = run(["--card", CARD, "--by", BY, "--pr", PR], capsys)
+    rc, out, err, body_path = generate(tmp_path, capsys)
 
     assert rc == 0, (rc, out, err)
-    assert f"# body 文件：{default}（未写入，给了 --body-out 才写）" in out
-    assert f"--body-file {default}" in out
-    assert not default.exists()
+    body = os.path.realpath(str(body_path))
+    repo = os.path.realpath(str(tmp_path))
+    argv = printed_argv(out)
+    assert argv == [
+        "--pr", PR,
+        "--branch", BRANCH,
+        "--method", "merge",
+        "--delete-branch",
+        "--card", CARD,
+        "--by", BY,
+        "--subject", DEFAULT_TITLE,
+        "--body-file", body,
+        "--repo", repo,
+    ]
+    # 「钉到提交」由 merge_guard 自己从预检的 headRefOid 拼，不进模板
+    assert "--match-head-commit" not in argv
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv_: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        calls.append(argv_)
+        return mg.CommandResult(argv=argv_, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(mg, "_run", fake_run)
+
+    rc = mg.main(argv)
+    captured = capsys.readouterr()
+
+    assert rc == 2, (captured.out, captured.err)
+    assert captured.out == ""
+    assert "不在 origin 远端" in captured.err
+    # 照抄不撞 argparse：认账四参数 + --branch 全被接住
+    assert "the following arguments are required" not in captured.err
+    # 闸门在 gh 之前：只有一次 git ls-remote，一个 gh 调用都没发
+    assert len(calls) == 1, calls
+    assert calls[0][0] == "git"
+
+
+def test_relative_body_out_prints_absolute_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--body-out recv-body.txt``（相对路径）→ 打印行里的 ``--body-file`` 是绝对路径且存在。"""
+
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--repo", str(tmp_path),
+            "--body-out", "recv-body.txt",
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    body = flag_value(printed_argv(out), "--body-file")
+    assert os.path.isabs(body)
+    assert body == os.path.realpath(str(tmp_path / "recv-body.txt"))
+    assert Path(body).is_file()
+    assert f"# body 文件：{body}（已写入）" in out
+
+
+# ------------------------------------------------------------- 生成模式：rc2
+
+
+def test_without_branch_is_rc2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """缺 ``--branch`` → rc2、stdout 0 字节、stderr 恰一行，且不写 body 文件。"""
+
+    target = tmp_path / "never-written.txt"
+
+    rc, out, err = run(
+        ["--card", CARD, "--by", BY, "--pr", PR, "--body-out", str(target)], capsys
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "--branch" in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
+
+
+def test_without_body_out_is_rc2(capsys: pytest.CaptureFixture[str]) -> None:
+    """缺 ``--body-out`` → rc2、stdout 0 字节、stderr 恰一行（``--body-file`` 必须真实存在）。"""
+
+    rc, out, err = run(
+        ["--card", CARD, "--by", BY, "--pr", PR, "--branch", BRANCH], capsys
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "--body-out" in err
+    assert err.count("\n") == 1, repr(err)
+
+
+@pytest.mark.parametrize(
+    ("branch", "needle"),
+    [
+        ("", "不能是空串"),
+        (" wt/t_x", "不能含空白字符"),
+        ("wt/t x", "不能含空白字符"),
+        ("refs/heads/wt/t_x", "不能带 refs/ 前缀"),
+    ],
+)
+def test_rc2_branch_shape(
+    branch: str,
+    needle: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--branch`` 形态非法（复用 ``merge_guard.check_branch_shape``）→ rc2、stdout 空、一行。"""
+
+    target = tmp_path / "never-written.txt"
+
+    rc, out, err = run(
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", branch,
+            "--body-out", str(target),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert needle in err
+    assert err.count("\n") == 1, repr(err)
+    assert not target.exists()
 
 
 # ------------------------------------------------------------- 预检模式：绿
@@ -159,7 +356,7 @@ def test_check_file_green(
 def test_check_file_green_with_consistent_params(
     body_file: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--card/--by/--pr`` 与文件内容一致 → 仍 rc0。"""
+    """``--card/--by/--pr`` 与文件内容一致 → 仍 rc0（预检模式不要求 ``--branch``）。"""
 
     rc, out, err = run(
         ["--check-file", str(body_file), "--card", CARD, "--by", BY, "--pr", PR], capsys
@@ -375,7 +572,14 @@ def test_rc2_body_out_parent_missing(
     target = tmp_path / "no-such-dir" / "body.txt"
 
     rc, out, err = run(
-        ["--card", CARD, "--by", BY, "--pr", PR, "--body-out", str(target)], capsys
+        [
+            "--card", CARD,
+            "--by", BY,
+            "--pr", PR,
+            "--branch", BRANCH,
+            "--body-out", str(target),
+        ],
+        capsys,
     )
 
     assert rc == 2, (rc, out, err)
@@ -406,6 +610,12 @@ def test_ascii_stdout_returns_two(tmp_path: Path) -> None:
             BY,
             "--pr",
             PR,
+            "--branch",
+            BRANCH,
+            "--repo",
+            str(tmp_path),
+            "--body-out",
+            str(tmp_path / "ascii-body.txt"),
         ],
         capture_output=True,
         env=env,
@@ -416,3 +626,112 @@ def test_ascii_stdout_returns_two(tmp_path: Path) -> None:
     assert proc.stdout == b""
     assert proc.stderr.startswith("错误: ".encode())
     assert b"Traceback" not in proc.stderr
+
+
+# ------------------------- 文档守卫：README / docs 里的 merge-record 生成命令必须真能跑
+#
+# merge-record 的生成模式契约改过两次（``--pr`` 取值域、现在的 ``--branch`` /
+# ``--body-out`` 必填并改打印 merge_guard 命令），每次都有「文档里的命令照抄即 rc2」。
+# 所以这里不靠人眼对：把两份文档里每条 ``merge-record …`` **生成**命令抠出来，占位符
+# 换成型别合法的值，真跑 ``cli.main([...])``，必须 rc0。文档漂移 → CI 红。
+#
+# 两类不算生成命令（都跳过）：
+# - ``--check-file`` 预检命令：它要的 body 文件在文档里并不存在；
+# - 只提了一个参数名的片段（如「由 ``merge-record --body-out`` 生成」）：不是完整命令。
+
+_DOC_FILES = ("README.md", "docs/merge-accountability.md")
+_CARD_TOKEN = "t_bbeab29f"
+_CONTINUATION = re.compile(r"\\\s*$")
+
+
+def _logical_lines(path: Path) -> list[str]:
+    """按 ``\\`` 续行把物理行拼成逻辑行（文档里的命令块都是这么排的）。"""
+
+    logical: list[str] = []
+    buffer = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        continued = _CONTINUATION.search(line)
+        if continued is not None:
+            buffer += line[: continued.start()]
+            continue
+        logical.append(buffer + line)
+        buffer = ""
+    if buffer:
+        logical.append(buffer)
+    return logical
+
+
+def _documented_generate_commands() -> list[tuple[str, list[str]]]:
+    """抠出两份文档里每条 ``merge-record`` 生成命令的 ``(文件, 参数列表)``。"""
+
+    found: list[tuple[str, list[str]]] = []
+    for name in _DOC_FILES:
+        for line in _logical_lines(REPO_ROOT / name):
+            at = line.find("merge-record")
+            if at < 0:
+                continue
+            rest = line[at + len("merge-record"):]
+            # 行内命令用反引号收尾；说明文字用破折号 / 分号 / 句号收尾
+            for marker in ("`", "——", "；", "。"):
+                cut = rest.find(marker)
+                if cut >= 0:
+                    rest = rest[:cut]
+            rest = rest.strip()
+            if not rest:
+                continue
+            args = shlex.split(rest)
+            if "--check-file" in args or "--card" not in args:
+                continue
+            found.append((name, args))
+    return found
+
+
+def _fill_doc_placeholders(args: list[str], tmp_path: Path) -> list[str]:
+    """把文档里的占位符换成型别合法的值；留下任何 ``<…>`` 都算文档 bug。"""
+
+    body = str(tmp_path / "doc-body.txt")
+    mapping = (
+        ("pm/runNNN", "pm/run1"),
+        ("pm/run<NNN>", "pm/run1"),
+        ("<profile>/run<NNN>", "pm/run1"),
+        ("t_xxxxxxx", _CARD_TOKEN),
+        ("t_xxx", _CARD_TOKEN),
+        ("<卡号>", _CARD_TOKEN),
+        ("<profile>", "pm"),
+        ("<NNN>", "1"),
+        ("<body文件>", body),
+        ("<body-file>", body),
+        ("NN", PR),
+    )
+    filled: list[str] = []
+    for arg in args:
+        for token, value in mapping:
+            arg = arg.replace(token, value)
+        if arg.startswith("/tmp/"):
+            arg = body
+        assert "<" not in arg and ">" not in arg, f"文档命令里有没填的占位符：{arg}"
+        filled.append(arg)
+    return filled
+
+
+def test_docs_merge_record_examples_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """两份文档里每条 ``merge-record`` 生成命令（占位符填掉）→ rc0，且打印 merge_guard。"""
+
+    commands = _documented_generate_commands()
+
+    # 文档增删样例都必须跟着改这里，否则守卫悄悄瞎掉
+    assert len(commands) == 4, commands
+    names = [name for name, _ in commands]
+    assert names.count("README.md") == 2, commands
+    assert names.count("docs/merge-accountability.md") == 2, commands
+
+    for name, args in commands:
+        filled = _fill_doc_placeholders(args, tmp_path)
+        assert "--branch" in filled, (name, filled)
+        assert "--body-out" in filled, (name, filled)
+        rc, out, err = run(filled, capsys)
+        assert rc == 0, (name, filled, err)
+        assert err == ""
+        assert "team_board.merge_guard" in out, (name, out)
