@@ -398,6 +398,48 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
     )
 
 
+#: 会被子进程继承、把 git 指向「另一个仓库 / 另一个索引 / 另一套对象库」的定位类
+#: 环境变量。调用 git 前必须剔除：``git -C <path>`` **只切目录，不隔离这些变量**
+#: —— 在 git hook（hook 期间 git 会设 ``GIT_DIR``）、``git bisect run``、
+#: ``git rebase --exec``、包装过的 IDE / CI 里调本命令时，父进程设的 ``GIT_DIR``
+#: 会让 ``--repo`` 形同虚设（报头写 A 仓库，实际审 B 仓库，给出假绿）。逐项理由：
+#: ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_COMMON_DIR`` 换仓库与工作树；
+#: ``GIT_INDEX_FILE`` / ``GIT_OBJECT_DIRECTORY`` / ``GIT_ALTERNATE_OBJECT_DIRECTORIES``
+#: 换索引与对象库（读到的提交不是 ``<path>`` 的）；``GIT_NAMESPACE`` / ``GIT_PREFIX``
+#: 换 ref 命名空间与相对路径前缀；``GIT_CEILING_DIRECTORIES`` /
+#: ``GIT_DISCOVERY_ACROSS_FILESYSTEM`` 改仓库发现边界（能让「不是仓库」变成「是仓库」）。
+#:
+#: 只剔「定位」这一类，其余变量（``PATH`` / ``HOME`` / ``LANG`` / 代理 /
+#: ``GIT_SSH*`` 等）**原样保留** —— 图省事写成 ``env={}`` 会把 ``PATH`` 一起抹掉，
+#: git 直接找不到。
+_GIT_LOCATION_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    }
+)
+
+
+def _git_env() -> dict[str, str]:
+    """``os.environ`` 的一份副本，剔掉 :data:`_GIT_LOCATION_ENV` 里的定位变量。
+
+    ``subprocess.run(env=...)`` 传 ``None`` 等于继承父进程全部环境（含 ``GIT_DIR``），
+    传 ``{}`` 又等于清空（``PATH`` 没了）；所以这里显式构造「剔除后的副本」。
+    """
+
+    return {
+        key: value for key, value in os.environ.items() if key not in _GIT_LOCATION_ENV
+    }
+
+
 def _git(repo: str | os.PathLike[str], *args: str) -> subprocess.CompletedProcess[str]:
     """在 ``repo`` 里跑 git，不抛 ``CalledProcessError``，退出码交给调用方判。
 
@@ -417,12 +459,17 @@ def _git(repo: str | os.PathLike[str], *args: str) -> subprocess.CompletedProces
         # bandit B603/B607 假阳性：可执行文件名写死为 "git"（走 PATH 以跨平台一致）；
         # 参数以 argv 列表传入、shell=False（默认），仓库路径/rev 只作为独立 argv
         # 元素，不经 shell 解释，无注入面
+        #
+        # env=_git_env()：显式传「剔除 git 定位类变量后的副本」，否则 hook /
+        # bisect / rebase --exec 里继承来的 GIT_DIR 会让 -C <repo> 失效，
+        # 静默去审另一个仓库并返回假绿（见 _GIT_LOCATION_ENV）
         return subprocess.run(  # nosec B603 B607
             ["git", "-C", os.fspath(repo), *args],
             capture_output=True,
             encoding="utf-8",
             errors="strict",
             check=False,
+            env=_git_env(),
         )
     except FileNotFoundError as exc:
         raise MergeAuditError(
