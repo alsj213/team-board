@@ -9,26 +9,39 @@
    本工具**不提供**不带删除的合并路径 —— 没有 ``--no-delete-branch`` /
    ``--keep-branch``，也没有 ``--admin`` / ``--auto`` / ``--force`` 这类绕过 PR
    检查的口子。
-2. **出口**：合并后只认 ``git ls-remote --exit-code --refs`` 的退出码：``0`` =
-   分支仍在远端、``2`` = 没有这个 ref（已删）、其它 = 判不了。分支还在就是 rc1，
-   **绝不当成合并成功**；gh 自己的 stderr 警告（如 worktree 里
-   ``failed to delete local branch``）不算失败，判定只看远端。
+2. **合并前**：先确认源分支在远端**存在**（``git ls-remote --exit-code --refs``，
+   ``rc=0`` 才算存在）。不存在的分支名一律 rc2、stdout 空、一个 gh 调用都不发。
+   没有这一步，出口判定会把「这个 ref 从来没存在过」读成「已删除」并 rc0 ——
+   fork PR（gh 不删 fork 侧分支）与 ``--remote`` 指到另一个 remote 时必现。
+3. **出口**：合并后只认 ``git ls-remote --exit-code --refs`` 的退出码：``0`` =
+   分支仍在远端、``2`` = 没有这个 ref（已删除**或从未存在过**，单靠出口判不出来）、
+   其它 = 判不了。分支还在就是 rc1，**绝不当成合并成功**。
+
+``gh pr merge`` 返回非 0 **不等于**合并失败：gh 2.103.3 的 ``mergeRun`` 顺序是
+``merge()`` → ``deleteLocalBranch()`` → ``deleteRemoteBranch()``，删本地分支失败就
+``return`` 非 0，而那时远端分支还没删、PR 却已经合了。所以非 0 之后必须先
+``gh pr view <n> --json state`` 反查：``MERGED`` = 合并已发生，继续做删除验证
+（分支已删 → rc0、仍在 → rc1、判不了 → 判不了路径）；不是 ``MERGED`` 才是 rc1
+「合并失败」。gh 自己的 stderr 警告（如 worktree 里 ``failed to delete local branch``）
+同样不算失败 —— 判定只看远端。
 
 判定器不认识 PR 的「合并方式」（merge / squash / rebase）；本工具要求必传
 ``--method`` 但不设默认值，由调用方（合并卡）决定。
 
 退出码
 ------
-- ``0``：合并完成，且已确认远端源分支删除（``--verify-only`` 时为「分支已删除」）。
-- ``1``：未达成 —— gh 合并失败 / 合并成功但源分支仍在远端 / ``--verify-only``
-  时分支仍在远端或无法判定。
+- ``0``：合并完成，且已确认远端源分支删除（``--verify-only`` 时为「远端没有这个
+  ref」—— 注意这一档**不能**证明「曾经存在并被删」，它只回答「现在在不在」）。
+- ``1``：未达成 —— gh 合并失败（且 PR 状态不是 ``MERGED``） / 合并成功但源分支仍在
+  远端 / ``--verify-only`` 时分支仍在远端或无法判定。
 - ``2``：参数或环境错误：缺 ``--delete-branch``、``--pr`` / ``--timeout`` /
   ``--interval`` / ``--command-timeout`` 取值越界（``--pr`` 上限 ``MAX_PR``；
   ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
-  PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、gh/git 输出不是 UTF-8、
-  stdout 编码表示不了中文、子命令超时、合并后通信持续失败导致无法判定。
+  源分支在远端**不存在**、PR 不是 ``OPEN``、``PATH`` 里没有 ``gh`` / ``git``、
+  gh/git 输出不是 UTF-8、stdout 编码表示不了中文、子命令超时、合并后通信持续失败
+  导致无法判定。
 
 rc2 一律 stderr 一行 ``错误: …``、不冒 traceback，且**退出码绝不为 1**（rc1 是
 「未达成」专用码：任何异常都不许落到它上面）。stdout 只有一种反例：**合并已经发生
@@ -76,6 +89,7 @@ DEFAULT_COMMAND_TIMEOUT = 60
 #: :func:`classify_probe_rc` 判成 :data:`PROBE_ERROR`（既不是 0 也不是 2）
 PROBE_TIMEOUT_RC = -1
 
+STEP_BRANCH_PRESENT = "分支存在"
 STEP_PREFLIGHT = "预检"
 STEP_MERGE = "合并"
 STEP_DELETE = "分支删除"
@@ -620,8 +634,67 @@ def _keep_evidence(lines: list[str]) -> Iterator[None]:
         ) from exc
 
 
+def ensure_branch_present(opts: Options) -> CommandResult:
+    """**合并前**确认源分支在远端存在（rc=0 才算存在）；否则 ``MergeGuardError`` → rc2。
+
+    为什么必须有这一步：出口判定只认 ``ls-remote`` 的 ``rc=2``，而 ``rc=2`` 只说明
+    「现在这个 remote 上没有这个 ref」，不说明「曾经在、并且被删」。少了合并前的这一
+    次确认，「从来没存在过的分支名」在合并路径与 ``--verify-only`` 路径上都会被读成
+    「已删除」并 rc0（PR 来自 fork、``--remote`` 指到另一个 remote 时必现）。
+
+    任何非 0 的 rc（含 ``2`` = 没有这个 ref、``128`` = 通信错误）都算「合并前源分支
+    不存在」→ rc2、stderr 一行、stdout 空、**一个 gh 调用都不发**（此函数在
+    ``gh pr view`` 之前跑）。子命令超时由 :func:`_run` 抛
+    :class:`CommandTimeout`（也是 rc2，合并未发生）。
+    """
+
+    argv = ls_remote_argv(opts.repo, opts.remote, opts.branch)
+    proc = _run(argv, cwd=opts.repo, timeout=opts.command_timeout)
+    if proc.returncode != 0:
+        raise MergeGuardError(
+            f"源分支 {opts.branch} 不在 {opts.remote} 远端（rc={proc.returncode}）："
+            f"{key_line(proc)}；合并前源分支必须先存在，拒绝合并"
+        )
+    return proc
+
+
+def fetch_pr_state(opts: Options) -> str | None:
+    """``gh pr view <n> --json state``：反查 gh 非 0 时 PR 的真实状态。
+
+    只判 ``state`` 一个字段：``MERGED`` = 合并已经发生（gh 的非 0 来自合并**之后**的
+    步骤，比如删本地分支失败），调用方要继续做删除验证；其它值 = 合并没发生。
+
+    反查本身失败（gh 不在 PATH、非 0、输出不是 JSON / 不是对象 / 没有 string 类型的
+    ``state``）一律返回 ``None`` —— 反查是补充证据，不是新的失败源，**不许**把 rc1
+    「合并失败」悄悄变成 rc2。
+    """
+
+    argv = ("gh", "pr", "view", str(opts.pr), "--json", "state")
+    try:
+        proc = _run(argv, cwd=opts.repo, timeout=opts.command_timeout)
+    except MergeGuardError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    state = payload.get("state")
+    return state if isinstance(state, str) else None
+
+
 def _run_verify_only(opts: Options) -> tuple[list[str], int]:
-    """``--verify-only``：只验证「远端分支是否已删」，一次 gh 都不调。"""
+    """``--verify-only``：只验证「远端分支现在在不在」，一次 gh 都不调。
+
+    措辞口径（本工具的硬规矩）：``rc=0`` 只能说「远端没有这个 ref（已删除，或从未
+    存在过）」。``--verify-only`` 既没看到过「合并前分支在」，也没看到过合并动作，
+    所以**不许**下「分支已删除」这种结论 —— 那要靠合并路径的「分支存在」预检 +
+    「分支删除」验证两步合起来才成立。退出码语义不变：``ls-remote`` 的 ``rc=2`` 仍
+    映到本命令的 rc0。
+    """
 
     result = poll_branch_deleted(
         make_probe(opts.repo, opts.remote, opts.branch, timeout=opts.command_timeout),
@@ -638,7 +711,7 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
         )
     ]
     if result.outcome == OUT_DELETED:
-        lines.append("结论：分支已删除")
+        lines.append("结论：远端没有这个 ref（已删除，或从未存在过）")
         return lines, 0
     if result.outcome == OUT_PRESENT:
         lines.append("结论：分支仍在远端")
@@ -648,8 +721,10 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
 
 
 def _run_merge(opts: Options) -> tuple[list[str], int]:
-    """预检 → 合并 → 删除验证。"""
+    """分支存在预检 → gh 预检 → 合并 → 删除验证。"""
 
+    # 合并**前**的「源分支必须存在」闸门：排在所有 gh 调用之前，失败即 rc2 且 stdout 空。
+    presence = ensure_branch_present(opts)
     view_argv = (
         "gh",
         "pr",
@@ -681,6 +756,13 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
 
     lines = [
         format_step(
+            STEP_BRANCH_PRESENT,
+            ok=True,
+            command=presence.command,
+            rc=presence.returncode,
+            key=key_line(presence),
+        ),
+        format_step(
             STEP_PREFLIGHT,
             ok=True,
             command=view.command,
@@ -689,7 +771,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
                 f"state={info.state}, headRefName={info.head_ref}, "
                 f"baseRefName={info.base_ref}"
             ),
-        )
+        ),
     ]
 
     merge_argv = (
@@ -705,33 +787,51 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
     with _keep_evidence(lines):
         merge = _run(merge_argv, cwd=opts.repo, timeout=opts.command_timeout)
         if merge.returncode != 0:
-            # gh 返回非 0：把 gh 的输出原文写出来，rc1，且不许再跑删除验证
+            # gh 非 0 **不等于**合并失败：2.103.3 的 mergeRun 是 merge() → 删本地分支
+            # → 删远端分支，删本地分支失败就返回非 0，那时 PR 已合、远端分支还没删。
+            # 所以先反查 PR 状态，再决定是「合并失败」还是「合并已发生」。
             _write_stderr_raw(merge.stdout)
             _write_stderr_raw(merge.stderr)
+            state = fetch_pr_state(opts)
+            state_text = state if state is not None else "反查失败"
+            if state != "MERGED":
+                lines.append(
+                    format_step(
+                        STEP_MERGE,
+                        ok=False,
+                        command=merge.command,
+                        rc=merge.returncode,
+                        key=key_line(merge),
+                    )
+                )
+                lines.append(
+                    f"结论：合并失败（gh pr merge 退出码 {merge.returncode}，"
+                    f"PR 状态 {state_text}，未做分支删除验证）"
+                )
+                return lines, 1
+            # MERGED：合并已发生，gh 的非 0 来自合并之后的步骤 —— 继续做删除验证。
             lines.append(
                 format_step(
                     STEP_MERGE,
-                    ok=False,
+                    ok=True,
+                    command=merge.command,
+                    rc=merge.returncode,
+                    key=(
+                        f"gh 退出码 {merge.returncode}，但 PR 状态已是 MERGED；"
+                        f"{key_line(merge)}"
+                    ),
+                )
+            )
+        else:
+            lines.append(
+                format_step(
+                    STEP_MERGE,
+                    ok=True,
                     command=merge.command,
                     rc=merge.returncode,
                     key=key_line(merge),
                 )
             )
-            lines.append(
-                f"结论：合并失败（gh pr merge 退出码 {merge.returncode}，"
-                "未做分支删除验证）"
-            )
-            return lines, 1
-
-        lines.append(
-            format_step(
-                STEP_MERGE,
-                ok=True,
-                command=merge.command,
-                rc=merge.returncode,
-                key=key_line(merge),
-            )
-        )
 
         result = poll_branch_deleted(
             make_probe(

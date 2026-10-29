@@ -273,6 +273,14 @@ def test_format_step_pass() -> None:
     assert line == "预检 | PASS | gh pr view 9 --json number | rc=0 | state=OPEN"
 
 
+def test_step_branch_present_label() -> None:
+    """新增的「分支存在」步骤标签是独立常量，不蹭「预检」/「分支删除」。"""
+
+    assert mg.STEP_BRANCH_PRESENT == "分支存在"
+    assert mg.STEP_BRANCH_PRESENT != mg.STEP_PREFLIGHT
+    assert mg.STEP_BRANCH_PRESENT != mg.STEP_DELETE
+
+
 def test_format_step_fail() -> None:
     line = mg.format_step(
         mg.STEP_DELETE, ok=False, command="git ls-remote", rc=0, key="sha refs/heads/x"
@@ -374,6 +382,116 @@ def test_validate_rejects_interval_greater_than_timeout() -> None:
 def test_validate_rejects_duration_over_upper_bound(field: str, value: str) -> None:
     with pytest.raises(mg.MergeGuardError):
         mg.validate(_validated_ns(**{field: value}))
+
+
+# --------------------------------------------- 合并前的「源分支必须存在」闸门
+
+def _opts(**overrides: object) -> mg.Options:
+    base: dict[str, object] = {
+        "pr": 9,
+        "branch": "wt/t_bbeab29f",
+        "method": "merge",
+        "repo": ".",
+        "remote": "origin",
+        "timeout": 60,
+        "interval": 2,
+        "command_timeout": 60,
+        "verify_only": False,
+    }
+    base.update(overrides)
+    return mg.Options(**base)  # type: ignore[arg-type]
+
+
+def _fake_run(rc: int, *, stdout: str = "", stderr: str = "") -> Callable[..., mg.CommandResult]:
+    def fake(argv: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        return mg.CommandResult(argv=argv, returncode=rc, stdout=stdout, stderr=stderr)
+
+    return fake
+
+
+def test_ensure_branch_present_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        mg, "_run", _fake_run(0, stdout="c5768d4\trefs/heads/wt/t_bbeab29f\n")
+    )
+
+    proc = mg.ensure_branch_present(_opts())
+
+    assert proc.returncode == 0
+    assert proc.command == (
+        "git -C . ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f"
+    )
+
+
+@pytest.mark.parametrize(
+    ("rc", "stderr"),
+    [
+        (2, ""),  # 没有这个 ref
+        (128, "fatal: unable to access 'https://github.com/x/y.git'\n"),  # 通信错误
+        (1, ""),
+    ],
+)
+def test_ensure_branch_present_rejects(
+    monkeypatch: pytest.MonkeyPatch, rc: int, stderr: str
+) -> None:
+    """非 0 一律「合并前源分支不存在」→ MergeGuardError（CLI 层即 rc2、零 gh 调用）。"""
+
+    monkeypatch.setattr(mg, "_run", _fake_run(rc, stderr=stderr))
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.ensure_branch_present(_opts())
+
+    message = str(excinfo.value)
+    assert "不在" in message and "origin" in message
+    assert "wt/t_bbeab29f" in message
+    assert f"rc={rc}" in message
+    assert "\n" not in message  # stderr 只许一行
+
+
+# ------------------------------------------------ gh 非 0 时的 PR 状态反查
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('{"state": "MERGED"}', "MERGED"),
+        ('{"state": "OPEN"}', "OPEN"),
+        ('{"state": "CLOSED"}', "CLOSED"),
+    ],
+)
+def test_fetch_pr_state_parses(
+    monkeypatch: pytest.MonkeyPatch, payload: str, expected: str
+) -> None:
+    monkeypatch.setattr(mg, "_run", _fake_run(0, stdout=payload))
+
+    assert mg.fetch_pr_state(_opts()) == expected
+
+
+@pytest.mark.parametrize(
+    ("rc", "payload"),
+    [
+        (1, '{"state": "MERGED"}'),  # 反查本身失败
+        (0, "not json"),  # 输出不是 JSON
+        (0, '["MERGED"]'),  # 不是 JSON 对象
+        (0, '{"number": 9}'),  # 没有 state
+        (0, '{"state": 1}'),  # state 不是字符串
+    ],
+)
+def test_fetch_pr_state_returns_none_on_garbage(
+    monkeypatch: pytest.MonkeyPatch, rc: int, payload: str
+) -> None:
+    monkeypatch.setattr(mg, "_run", _fake_run(rc, stdout=payload))
+
+    assert mg.fetch_pr_state(_opts()) is None
+
+
+def test_fetch_pr_state_swallows_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """反查遇到环境错误（gh 不见了）返回 None，不许把它升级成新的失败源。"""
+
+    def boom(argv: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        raise mg.MergeGuardError("找不到 gh 可执行文件")
+
+    monkeypatch.setattr(mg, "_run", boom)
+
+    assert mg.fetch_pr_state(_opts()) is None
 
 
 # ------------------------------------------------------- 子命令超时（timeout=）

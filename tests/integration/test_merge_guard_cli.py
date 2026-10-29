@@ -21,11 +21,18 @@ CARD_BRANCH = "wt/t_bbeab29f"
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  # 合并之后（marker 存在）的反查走另一份固定输出：合并前必须报 OPEN，
+  # 合并后要能报 MERGED（gh 非 0 时的 state 反查用例）
+  if [ -n "$FAKE_MERGED_MARK" ] && [ -f "$FAKE_MERGED_MARK" ] && [ -n "$FAKE_VIEW_JSON_AFTER" ]; then
+    printf '%s' "$FAKE_VIEW_JSON_AFTER"
+    exit "${FAKE_VIEW_RC_AFTER:-0}"
+  fi
   if [ -n "$FAKE_VIEW_SLEEP" ]; then sleep "$FAKE_VIEW_SLEEP"; fi
   printf '%s' "$FAKE_VIEW_JSON"
   exit "${FAKE_VIEW_RC:-0}"
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  if [ -n "$FAKE_MERGED_MARK" ]; then : > "$FAKE_MERGED_MARK"; fi
   if [ -n "$FAKE_MERGE_OUT" ]; then printf '%s\\n' "$FAKE_MERGE_OUT"; fi
   if [ -n "$FAKE_MERGE_ERR" ]; then printf '%s\\n' "$FAKE_MERGE_ERR" >&2; fi
   exit "${FAKE_MERGE_RC:-0}"
@@ -36,6 +43,14 @@ exit 9
 
 GIT_STUB = """#!/bin/sh
 printf 'git %s\\n' "$*" >> "$FAKE_LOG"
+n=0
+if [ -n "$FAKE_GIT_COUNT" ] && [ -f "$FAKE_GIT_COUNT" ]; then n=$(cat "$FAKE_GIT_COUNT"); fi
+n=$((n + 1))
+if [ -n "$FAKE_GIT_COUNT" ]; then printf '%s' "$n" > "$FAKE_GIT_COUNT"; fi
+# 第一次 ls-remote 可以是「合并前源分支存在」闸门，用独立的退出码
+if [ "$n" = "1" ] && [ -n "$FAKE_LS_REMOTE_FIRST_RC" ]; then
+  exit "$FAKE_LS_REMOTE_FIRST_RC"
+fi
 if [ -n "$FAKE_GIT_SLEEP" ]; then sleep "$FAKE_GIT_SLEEP"; fi
 exit "${FAKE_LS_REMOTE_RC:-2}"
 """
@@ -74,6 +89,12 @@ class Stub:
             ),
         )
 
+    def view_after_merge(self, *, state: str = "MERGED", rc: int = 0) -> None:
+        """合并之后（``gh pr merge`` 已经跑过）的 ``gh pr view --json state`` 输出。"""
+
+        self.setenv("FAKE_VIEW_JSON_AFTER", json.dumps({"state": state}))
+        self.setenv("FAKE_VIEW_RC_AFTER", str(rc))
+
 
 @pytest.fixture()
 def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
@@ -86,8 +107,12 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     repo.mkdir()
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
+    monkeypatch.setenv("FAKE_MERGED_MARK", str(tmp_path / "merged.mark"))
     monkeypatch.setenv("FAKE_VIEW_RC", "0")
     monkeypatch.setenv("FAKE_MERGE_RC", "0")
+    # 默认：合并前的「源分支存在」闸门通过（分支在），合并后的探针报「没有这个 ref」
+    monkeypatch.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")
     monkeypatch.setenv("FAKE_LS_REMOTE_RC", "2")
     out = Stub(bindir=bindir, log=log, repo=repo, setenv=monkeypatch.setenv)
     out.view()
@@ -148,6 +173,45 @@ def test_no_way_to_turn_off_delete_branch(stub: Stub, capsys: pytest.CaptureFixt
     assert stub.calls() == []
 
 
+# --------------- 1b. 合并前源分支不存在：rc2、stdout 空、零 gh 调用（新闸门）
+
+def test_merge_path_branch_never_existed_rc2_and_zero_gh_calls(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """「这个 ref 从来没存在过」不许被读成「已删除」：合并前就 rc2。
+
+    依据（pm 实跑）：``--verify-only --branch wt/t_never_existed_zzz`` 修前打
+    「结论：分支已删除」+ rc0。合并路径同理 —— 闸门必须在 ``gh pr view`` 之前。
+    """
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "2")  # 合并前就「没有这个 ref」
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""  # 合并还没发生 → 一个字的证据都不该有
+    assert err.startswith("错误: 源分支 wt/t_bbeab29f 不在 origin 远端（rc=2）")
+    assert err.count("\n") == 1  # stderr 恰一行
+    assert stub.gh_calls() == []  # 零 gh 调用（写操作更是一个都没有）
+    assert len(stub.git_calls()) == 1
+
+
+def test_merge_path_branch_probe_error_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """合并前的探针通信错误（rc=128）同样是 rc2，不许当成「分支在」继续合并。"""
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "128")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "rc=128" in err
+    assert stub.gh_calls() == []
+
+
 # ------------------------------------- 2. 合并成功但分支仍在 → rc1（不算成功）
 
 def test_merge_ok_but_branch_remains_rc1(
@@ -161,6 +225,7 @@ def test_merge_ok_but_branch_remains_rc1(
     assert err == ""
     assert "结论：合并成功但源分支仍在远端（合并不算完成）" in out
     assert "分支删除 | FAIL" in out
+    assert out.splitlines()[0].startswith("分支存在 | PASS | git -C ")
     assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
     assert stub.git_calls()  # 确实做了远端判定
 
@@ -178,10 +243,14 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert err == ""
     lines = out.splitlines()
     assert lines[0].startswith(
+        f"分支存在 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
+        f"origin refs/heads/{CARD_BRANCH} | rc=0 | "
+    )
+    assert lines[1].startswith(
         "预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName | rc=0 | "
     )
-    assert lines[1].startswith("合并 | PASS | gh pr merge 9 --squash --delete-branch | rc=0 | ")
-    assert lines[2].startswith(
+    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --squash --delete-branch | rc=0 | ")
+    assert lines[3].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
     )
@@ -206,24 +275,115 @@ def test_gh_stderr_warning_is_not_a_failure(
     assert "结论：合并完成" in out
 
 
-# --------------------------------- 4. gh pr merge 失败 → rc1，且不跑删除验证
+# ------------------------------- 4. gh pr merge 非 0：先反查 state，再决定 rc
+#
+# gh 2.103.3 的 mergeRun 顺序是 merge() → deleteLocalBranch() → deleteRemoteBranch()：
+# 删本地分支失败就 return 非 0，而那时 PR 已合、远端分支还没删。所以「gh 非 0」不能
+# 一律当「合并失败」。
 
 def test_merge_failure_rc1_and_no_verification(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """gh 非 0 + state 不是 MERGED → rc1「合并失败」，且不跑删除验证。"""
+
     stub.setenv("FAKE_MERGE_RC", "1")
     stub.setenv("FAKE_MERGE_ERR", "pull request is not mergeable: required check failing")
+    stub.view_after_merge(state="OPEN")
 
     rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 1
-    assert stub.git_calls() == []  # 没有再跑删除验证
+    # 只有合并前那一次「源分支存在」探针，合并后一次删除验证都没跑
+    assert len(stub.git_calls()) == 1
+    assert stub.git_calls()[0].startswith("git -C ")
     assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
+    assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
     assert "合并 | FAIL" in out
     assert "合并失败" in out
+    assert "PR 状态 OPEN" in out
     assert "合并成功" not in out
     assert not [line for line in out.splitlines() if line.startswith("分支删除 | ")]
     assert "required check failing" in err  # gh 输出原文写出来了
+
+
+def test_merge_gh_nonzero_but_state_merged_then_verification_deleted_rc0(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """gh 非 0 + state=MERGED + 远端分支已删 → rc0，**不许**说「合并失败」。
+
+    真实触发：``gh pr merge --delete-branch`` 删本地分支失败（分支被别处 worktree
+    / checkout 占着）→ 非 0 退出，但 PR 已经合并、远端分支还没删。
+    """
+
+    stub.setenv("FAKE_MERGE_RC", "1")
+    stub.setenv("FAKE_MERGE_ERR", "failed to delete local branch wt/t_bbeab29f")
+    stub.view_after_merge(state="MERGED")
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")  # 远端已经没有这个 ref
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0
+    assert "合并失败" not in out
+    assert "gh pr view 9 --json state" in stub.gh_calls()
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=1 | " in out
+    assert "PR 状态已是 MERGED" in out
+    assert "分支删除 | PASS | " in out
+    assert out.splitlines()[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
+    # gh 的退出码与输出原文都留了证
+    assert "rc=1" in out
+    assert "failed to delete local branch" in err
+
+
+def test_merge_gh_nonzero_state_merged_branch_present_rc1(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """gh 非 0 + state=MERGED + 分支仍在远端 → rc1（合并成功但没删干净）。"""
+
+    stub.setenv("FAKE_MERGE_RC", "1")
+    stub.view_after_merge(state="MERGED")
+    stub.setenv("FAKE_LS_REMOTE_RC", "0")
+
+    rc, out, _err = run(args_for(stub), capsys)
+
+    assert rc == 1
+    assert "合并失败" not in out
+    assert out.splitlines()[-1] == "结论：合并成功但源分支仍在远端（合并不算完成）"
+
+
+def test_merge_gh_nonzero_state_undetermined_rc2_keeps_evidence(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """gh 非 0 + MERGED + 删除验证判不了 → 走「合并已完成但无法判定」rc2。"""
+
+    stub.setenv("FAKE_MERGE_RC", "1")
+    stub.view_after_merge(state="MERGED")
+    stub.setenv("FAKE_LS_REMOTE_RC", "128")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2  # 不是 1
+    assert "合并失败" not in out
+    assert out.splitlines()[0].startswith("分支存在 | PASS | ")
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "无法判定" in err
+
+
+def test_merge_gh_nonzero_state_query_fails_stays_rc1(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """反查本身失败 → 退回旧口径 rc1「合并失败」（反查不是新的失败源，不许变 rc2）。"""
+
+    stub.setenv("FAKE_MERGE_RC", "1")
+    stub.view_after_merge(state="MERGED", rc=1)  # 反查命令自己失败
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 1
+    assert "合并失败" in out
+    assert "PR 状态 反查失败" in out
+    assert err.count("\n") == 0 or "错误: " not in err
 
 
 # ------------------------------------------- 5. --verify-only（一次 gh 都不调）
@@ -245,13 +405,21 @@ def test_verify_only_branch_present_rc1(
 def test_verify_only_branch_deleted_rc0(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """远端没有这个 ref → rc0，但结论**只能说「没有」，不许说「分支已删除」**。
+
+    因为 ``--verify-only`` 不知道这个分支是「删掉了」还是「从来没存在过」——
+    后者正是修前把 ``wt/t_never_existed_zzz`` 读成 rc0「已删除」的那条路。
+    """
+
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
 
     rc, out, err = run(args_for(stub, "--verify-only"), capsys)
 
-    assert rc == 0
+    assert rc == 0  # rc 语义不变
     assert err == ""
-    assert out.splitlines()[-1] == "结论：分支已删除"
+    assert out.splitlines()[-1] == "结论：远端没有这个 ref（已删除，或从未存在过）"
+    assert "分支已删除" not in out  # 旧措辞（会掩盖「从未存在过」）
+    assert "或从未存在过" in out
     assert stub.gh_calls() == []
 
 
@@ -422,6 +590,8 @@ def test_missing_gh_rc2(
     _write_exe(bindir / "git", GIT_STUB)
     monkeypatch.setenv("PATH", str(bindir))
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "calls.log"))
+    monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
+    monkeypatch.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")  # 分支存在闸门先过
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -450,13 +620,13 @@ def test_missing_gh_rc2(
     assert "gh" in captured.err
 
 
-def test_missing_git_after_merge_rc2(
+def test_missing_git_rc2_before_any_gh_call(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """合并成功后 git 不可用 → 判不了，rc2（不许当绿，也不许当 rc1）。
+    """``git`` 不可用 → 合并前的「源分支存在」闸门就 rc2：零 gh 调用、stdout 空。
 
-    合并已经发生，所以 stdout **必须仍保留**「预检 | PASS」「合并 | PASS」两步证据
-    （rc2 的常规口径是 stdout 空，这里是有意的唯一反例）。
+    修前这一步不存在，git 缺失只能在**合并之后**才被发现（rc2 但 PR 已被合并）。
+    现在往前挪到合并之前，这个风险整条消失。
     """
 
     bindir = tmp_path / "gh-only-bin"
@@ -465,6 +635,7 @@ def test_missing_git_after_merge_rc2(
     log = tmp_path / "calls.log"
     monkeypatch.setenv("PATH", str(bindir))  # 没有 git
     monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_MERGED_MARK", str(tmp_path / "merged.mark"))
     monkeypatch.setenv("FAKE_VIEW_RC", "0")
     monkeypatch.setenv("FAKE_MERGE_RC", "0")
     monkeypatch.setenv(
@@ -479,13 +650,43 @@ def test_missing_git_after_merge_rc2(
     rc, out, err = run(args_for(Stub(bindir, log, repo, monkeypatch.setenv)), capsys)
 
     assert rc == 2  # 不是 1
-    assert out.splitlines()[0].startswith("预检 | PASS | ")
-    assert out.splitlines()[1].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    assert out == ""  # 合并没发生 → 没有证据要保
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "git" in err
+    assert not log.exists() or "gh " not in log.read_text(encoding="utf-8")
+
+
+def test_git_vanishes_after_merge_keeps_evidence(
+    stub: Stub, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合并成功后 git 突然不可用（容器重建 / PATH 被改）→ rc2，且必须保住已完成证据。
+
+    合并前的「分支存在」闸门用的是同一次 ``_run``，所以这里只让**合并后的探针**
+    失败（``make_probe`` 返回的探针抛 ``MergeGuardError``），复现「合并已发生、验证
+    做不了」这一状态。
+    """
+
+    def make_broken_probe(*_args: object, **_kwargs: object) -> Callable[[], mg.CommandResult]:
+        def probe() -> mg.CommandResult:
+            raise mg.MergeGuardError("找不到 git 可执行文件（PATH 里没有 git），无法合并/验证")
+
+        return probe
+
+    monkeypatch.setattr(mg, "make_probe", make_broken_probe)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 2  # 不是 1
+    lines = out.splitlines()
+    assert lines[0].startswith("分支存在 | PASS | ")
+    assert lines[1].startswith("预检 | PASS | ")
+    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
     assert "git" in err
-    assert "gh pr merge 9 --merge --delete-branch" in log.read_text(encoding="utf-8")
+    assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()
 
 
 # ------------------------------- 合并后通信一直失败 → rc2（明确未通过，不当绿）
@@ -498,8 +699,10 @@ def test_merge_ok_but_undetermined_rc2(
     rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 2  # 不是 1：判不了就是未通过
-    assert out.startswith("预检 | PASS | ")  # 合并已发生 → 证据必须留下
-    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
+    lines = out.splitlines()
+    assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
+    assert lines[1].startswith("预检 | PASS | ")
+    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -645,7 +848,8 @@ def test_probe_timeout_after_merge_is_not_rc0(
 
     assert rc != 0  # 绝不把超时读成「合并完成」
     assert rc == 2
-    assert out.startswith("预检 | PASS | ")
+    assert out.splitlines()[0].startswith("分支存在 | PASS | ")
+    assert "预检 | PASS | " in out
     assert "合并 | PASS | gh pr merge 9 --merge --delete-branch" in out
     assert "分支删除 | FAIL" in out  # 超时不算 PASS
     assert err.startswith("错误: ")
@@ -666,8 +870,10 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 2  # 不是 1
-    assert out.splitlines()[0].startswith("预检 | PASS | ")
-    assert out.splitlines()[1].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
+    lines = out.splitlines()
+    assert lines[0].startswith("分支存在 | PASS | ")
+    assert lines[1].startswith("预检 | PASS | ")
+    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
