@@ -33,7 +33,8 @@ PYTHONPATH=src python -m team_board.cli merge-audit --repo . --card t_xxxxxxxx -
 
 `0` = 该卡有零问题的认账合并；`1` = 缺字段 / 键名大写 / 重复字段 / 字段没落在
 trailer 区 / `merged-by` 与 assignee 不符；`2` = 参数或环境错。
-合并前用 `merge-record` 生成认账块，照抄它打印的 `gh pr merge …` 命令，别手写。
+合并前用 `merge-record` 生成认账块，照抄它打印的 `merge_guard` 命令（body 就是同一份
+`--body-out` 文件），别手写。
 
 ## 判据② · author 白名单（取「建卡时 assignee」）
 
@@ -113,10 +114,14 @@ team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
 卡面认账块由 `merge-record` 生成、合并后由
 `merge-audit --card <卡号> --require` 回读合并提交 sha 补一行：
 
-1. 合并前：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --body-out /tmp/t_xxx-merge-body.txt`
-   打印 body 段（三行 trailer）+ 卡面认账块说明 + `gh pr merge` 命令模板（**只打印，
-   不执行**）；`--check-file PATH` 是另一模式：合并前预检一份 body 文件是否三字段齐
+1. 合并前：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt`
+   打印 body 段（三行 trailer）+ 卡面认账块说明 + 一行 `merge_guard` 合并命令（R12 ① 的
+   唯一入口，带齐 `--delete-branch` 与认账四参数；**只打印，不执行**）；`--check-file PATH`
+   是另一模式：合并前预检一份 body 文件是否三字段齐
    （不合格 rc1，参数/文件级错误 rc2）。
+   打印行里 `--branch` / `--repo`（含 `cd` 与 `PYTHONPATH` 两处拼接）与 `--subject` /
+   `--body-file` 一样过 `shlex.quote`：仓库路径含空格、分支名含 `;` / `$` 时照抄仍是
+   **一条**命令；`--subject` 含换行 → rc2（否则打印行被切成半条）。
 2. 合并后：`team-board merge-audit --repo . --card t_xxx --require; echo "rc=$?"`
    rc0 时把回读到的三字段 + `gh pr view NN --json mergeCommit` 的 sha 贴卡。
 
@@ -136,9 +141,9 @@ team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
 ## 合并操作五步（命令原文，照抄可跑）
 
 ```bash
-# 1. 生成认账 body（合并前；只打印模板，不执行 git/gh）
+# 1. 生成认账 body + 一行可直接照抄的 merge_guard 合并命令（只打印，不执行 git/gh）
 PYTHONPATH=src python -m team_board.cli merge-record \
-  --card t_xxx --by pm/runNNN --pr NN --body-out /tmp/t_xxx-merge-body.txt
+  --card t_xxx --by pm/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt
 
 # 2. R6 三条前置（不改门槛）
 PYTHONPATH=src python -m team_board.cli merge-record --check-file /tmp/t_xxx-merge-body.txt
