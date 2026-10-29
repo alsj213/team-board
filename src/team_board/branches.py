@@ -37,14 +37,28 @@
   origin 两份合并成一条**；分支名里出现卡号、但分支名**不精确等于**
   ``wt/<卡号>``（``wt/<卡号>-fix``、``<卡号>``、``x/<卡号>``、``wt/<卡号>/y``
   都算）即判红。分支名里提取不到卡号的（``main``、``pm/ci-check``、
-  ``wt/ci-setup``、``HEAD``）一律跳过。C-1 是**全仓枚举，与 ``--branch`` 无关**。
+  ``wt/ci-setup``、``HEAD``）一律跳过。``evidence/<单段名>``（R11 证据分支
+  命名空间，只许一段）不参与 C-1 —— 它不占卡分支命名空间。
+  C-1 是**全仓枚举，与 ``--branch`` 无关**。
 - ``fork 点不在 main``（C-2）：只对规则 A 正在稽核的那批卡分支 ref 生效（因此
   **受 ``--branch`` 影响**）。在 ``<base>..<ref>`` 的自有提交（``--no-merges``、
-  时间正序）里取**第一个申报本卡号的提交**（取不到该 ref 即跳过，这些提交由
-  规则 A 判「未声明卡号 / 跨卡提交」），该提交的父提交（fork 点）必须落在本地
-  ``<main_branch>`` 或 ``origin/<main_branch>`` 任一上（本地 ``main`` 可能落后
-  ``origin/main``，只看本地会造假红）；没有父提交（孤立历史）或落在别的卡分支
-  上同样判红，后者会点名属于哪些卡的分支。
+  ``--first-parent``、时间正序）里取**第一个申报本卡号的提交**（取不到该 ref
+  即跳过，这些提交由规则 A 判「未声明卡号 / 跨卡提交」），该提交的父提交
+  （fork 点）必须落在本地 ``<main_branch>`` 或 ``origin/<main_branch>`` 任一上
+  （本地 ``main`` 可能落后 ``origin/main``，只看本地会造假红）；没有父提交
+  （孤立历史）或落在别的卡分支上同样判红。后者点名的卡号只来自「fork 点是
+  别的卡分支 ref 的祖先」这一条判据 —— 分支上自己的前置提交（跨卡提交）由
+  规则 A + 豁免表管，C-2 不拿它们做归因。
+
+已知限制（本版本明确不做）：
+
+- 豁免表对规则 C 不生效；「分支上先落一条跨卡提交、再落本卡提交」仍按
+  「本卡第一个提交的父提交不在 main 上」判红，只是不再把前置提交的卡号算进
+  归因；
+- 浅克隆（``--depth`` 边界）下 ``merge-base --is-ancestor`` 会假红，CI 用
+  ``fetch-depth: 0`` 不受影响；
+- ``证据分支（N 条…）:`` 单列段与 ``--branch evidence/<名>`` 直接 rc0 归
+  ``t_3e2a3582``，本模块只做「不判红」这一半。
 
 退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``，
 含 ``PATH`` 里没有 ``git``、豁免表不是 UTF-8、**git 输出不是 UTF-8**）。
@@ -66,6 +80,9 @@ CARD_RE = re.compile(r"(?<![0-9a-zA-Z_])t_[0-9a-f]{8}(?![0-9a-f])")
 
 #: 卡分支名：``wt/`` + 卡号，整体精确匹配
 BRANCH_RE = re.compile(r"^wt/(t_[0-9a-f]{8})$")
+
+#: R11 证据分支命名空间：``evidence/`` + **单段**名
+_EVIDENCE_RE = re.compile(r"^evidence/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 #: allowlist 里的 sha 字段：7–40 位小写十六进制
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -535,6 +552,12 @@ def _all_branch_names(repo: str | Path) -> dict[str, tuple[str, ...]]:
     return {name: tuple(sorted(refs)) for name, refs in found.items()}
 
 
+def _is_evidence_branch(name: str) -> bool:
+    """R11 证据分支命名空间：``evidence/<单段名>``（只许一段）。"""
+
+    return _EVIDENCE_RE.match(name) is not None
+
+
 def _branch_set_findings(
     names: dict[str, tuple[str, ...]],
 ) -> tuple[BranchSetFinding, ...]:
@@ -547,6 +570,9 @@ def _branch_set_findings(
 
     findings: list[BranchSetFinding] = []
     for branch in sorted(names):
+        if _is_evidence_branch(branch):
+            # R11 ②：证据分支不占卡分支命名空间，不参与 C-1
+            continue
         refs = tuple(sorted(set(names[branch])))
         for card in sorted(_cards_in(branch)):
             if branch == f"wt/{card}":
@@ -616,6 +642,7 @@ def _fork_findings(
                 repo,
                 "log",
                 "--no-merges",
+                "--first-parent",
                 "--reverse",
                 f"--format={_RS}%H{_US}%s",
                 f"{base_ref}..{ref}",
@@ -646,6 +673,11 @@ def _fork_findings(
         parent = _git(repo, "rev-parse", "--quiet", "--verify", f"{first}^")
         if parent.returncode == 0:
             fork_point = parent.stdout.strip() or None
+        elif parent.returncode != 1:
+            # rc1 = 没有父提交（孤立历史）；rc≥2 是环境级错误，不许伪装成业务红
+            detail = (parent.stderr or parent.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else f"退出码 {parent.returncode}"
+            raise AuditError(f"读取 fork 点失败（{first}^）: {tail}")
 
         if fork_point is not None and any(
             _is_ancestor(repo, fork_point, main_ref) for main_ref in main_refs
@@ -653,16 +685,10 @@ def _fork_findings(
             continue
 
         claimed: set[str] = set()
-        for commit in own[:index]:
-            if any(
-                _is_ancestor(repo, commit.sha, main_ref) for main_ref in main_refs
-            ):
-                # base 用本地 main 可能落后 origin/main：已在主分支历史上
-                # 的提交不是「别的卡」的提交
-                continue
-            claimed |= _cards_in(commit.subject)
         if fork_point is not None:
-            claimed |= {
+            # 只按「fork 点是别的卡分支 ref 的祖先」归因；分支自己的前置提交
+            # （跨卡提交）由规则 A + 豁免表管，不算进 forked_from_cards
+            claimed = {
                 other_card
                 for other_card, other_ref in refs
                 if other_card != card

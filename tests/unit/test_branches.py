@@ -364,6 +364,98 @@ def test_branch_set_merges_local_and_origin_same_name() -> None:
     assert _branch_set_findings(names) == ()
 
 
+# ------------------------------------------------- R11 证据分支命名空间（不占卡分支）
+
+
+def test_evidence_branch_names_are_recognised() -> None:
+    for name in (
+        "evidence/t_aaaaaaaa",
+        "evidence/t_aaaaaaaa-ci",
+        "evidence/t_aaaaaaaa.perf_1",
+        "evidence/t_589cc33a",
+        "evidence/ci-logs",
+    ):
+        assert branches._is_evidence_branch(name) is True, name
+
+
+def test_evidence_lookalikes_are_not_evidence_branches() -> None:
+    """不属于 R11 命名空间的一律不算证据分支（不享受 C-1 豁免）。"""
+
+    for name in (
+        "evidence/a/t_aaaaaaaa",  # 多段
+        "evidence/-x",  # 非字母数字开头
+        "evidence/",  # 空名
+        "evidence2/t_aaaaaaaa",  # 不是 evidence/ 前缀
+        "wt/t_aaaaaaaa",
+        "Evidence/t_aaaaaaaa",  # 大小写敏感
+    ):
+        assert branches._is_evidence_branch(name) is False, name
+
+
+def test_branch_set_skips_evidence_branches() -> None:
+    """R11 ②：证据分支不占卡分支命名空间，C-1 必须静默。
+
+    这条是回归锁：C-1 全仓枚举、与 ``--branch`` 无关，一旦把
+    ``evidence/t_<卡号>`` 判红，任何人按 R11 建证据分支都会让所有 PR 的
+    branch-audit job 变红。
+    """
+
+    names: dict[str, tuple[str, ...]] = {
+        "evidence/t_589cc33a": ("refs/heads/evidence/t_589cc33a",),
+    }
+    assert _branch_set_findings(names) == ()
+
+    names = {
+        "wt/t_aaaaaaaa": (
+            "refs/heads/wt/t_aaaaaaaa",
+            "refs/remotes/origin/wt/t_aaaaaaaa",
+        ),
+        "evidence/t_aaaaaaaa": ("refs/heads/evidence/t_aaaaaaaa",),
+        "evidence/t_aaaaaaaa-ci": ("refs/heads/evidence/t_aaaaaaaa-ci",),
+        "evidence/t_aaaaaaaa.perf_1": ("refs/heads/evidence/t_aaaaaaaa.perf_1",),
+        "main": ("refs/heads/main",),
+    }
+    assert _branch_set_findings(names) == ()
+
+
+def test_branch_set_still_flags_non_evidence_multi_segment_branch() -> None:
+    """多段 ``evidence/a/<卡号>`` 不是 R11 证据分支 → C-1 仍判红。"""
+
+    names: dict[str, tuple[str, ...]] = {
+        "wt/t_aaaaaaaa": ("refs/heads/wt/t_aaaaaaaa",),
+        "evidence/a/t_aaaaaaaa": ("refs/heads/evidence/a/t_aaaaaaaa",),
+    }
+    findings = _branch_set_findings(names)
+    assert len(findings) == 1
+    assert findings[0].card == "t_aaaaaaaa"
+    assert findings[0].branch == "evidence/a/t_aaaaaaaa"
+    assert findings[0].evidence == (
+        "分支名 evidence/a/t_aaaaaaaa 不在 wt/t_aaaaaaaa"
+        "（卡分支只能叫 wt/t_aaaaaaaa）"
+    )
+
+
+def test_branch_set_still_flags_evidence2_prefixed_branch() -> None:
+    """``evidence2/<卡号>`` 不是 ``evidence/`` 前缀 → 照旧判红。"""
+
+    names: dict[str, tuple[str, ...]] = {
+        "evidence2/t_aaaaaaaa": ("refs/heads/evidence2/t_aaaaaaaa",),
+    }
+    findings = _branch_set_findings(names)
+    assert len(findings) == 1
+    assert findings[0].branch == "evidence2/t_aaaaaaaa"
+
+
+def test_evidence_branch_without_card_is_silent() -> None:
+    """``evidence/-x`` 不是证据分支，但也不含卡号 → C-1 本来就不报。"""
+
+    names: dict[str, tuple[str, ...]] = {
+        "evidence/-x": ("refs/heads/evidence/-x",),
+    }
+    assert branches._is_evidence_branch("evidence/-x") is False
+    assert _branch_set_findings(names) == ()
+
+
 def test_render_report_multi_branch_item() -> None:
     finding = BranchSetFinding(
         card="t_aaaaaaaa",
