@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,14 +25,35 @@ import pytest
 from team_board import merge_guard as mg
 
 CARD_BRANCH = "wt/t_bbeab29f"
+#: 认账四参数的默认取值（合并模式必填；body 文件由 fixture 写在临时目录里）
+MERGE_CARD = "t_bbeab29f"
+MERGE_BY = "pm/run200"
+MERGE_SUBJECT = "Merge PR #9（t_bbeab29f）"
+#: 合法 body：恰好三行 trailer（与 ``team-board merge-record --body-out`` 的输出同形）
+BODY_TEXT = (
+    f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #9\n"
+)
 
 #: 假 gh 的 ``pr view`` 报出来的 head 提交（40 位十六进制）：合并 argv 必须带它
 HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
 #: ``gh pr view`` 要的字段（``headRefOid`` 是「预检钉到提交」的凭据）
 VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
 VIEW_CALL = f"gh pr view 9 --json {VIEW_FIELDS}"
-#: 合并命令原文：分支名 + 钉住的 head 提交，一条都不许少
-MERGE_CALL = f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID}"
+
+
+def merge_call(
+    stub: Stub,
+    *,
+    subject: str = MERGE_SUBJECT,
+    body_file: Path | None = None,
+) -> str:
+    """合并命令原文：``--merge --delete-branch --match-head-commit`` 原位 + 两个认账参数。"""
+
+    path = stub.body_file if body_file is None else body_file
+    return (
+        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"--subject {subject} --body-file {path}"
+    )
 
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
@@ -81,7 +105,13 @@ class Stub:
     bindir: Path
     log: Path
     repo: Path
+    body_file: Path
     setenv: Callable[[str, str], None]
+
+    def set_body(self, text: str) -> None:
+        """改 body 文件内容（坏输入用例复用同一路径，``--body-file`` 不必变）。"""
+
+        self.body_file.write_text(text, encoding="utf-8")
 
     def calls(self) -> list[str]:
         if not self.log.exists():
@@ -128,6 +158,9 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     log = tmp_path / "calls.log"
     repo = tmp_path / "repo"
     repo.mkdir()
+    # 认账 body：合并模式必填，内容恰好是合法三行 trailer（坏输入用例用 Stub.set_body 覆盖）
+    body_file = tmp_path / "merge-body.txt"
+    body_file.write_text(BODY_TEXT, encoding="utf-8")
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
@@ -137,13 +170,63 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     # 默认：合并前的「源分支存在」闸门通过（分支在），合并后的探针报「没有这个 ref」
     monkeypatch.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")
     monkeypatch.setenv("FAKE_LS_REMOTE_RC", "2")
-    out = Stub(bindir=bindir, log=log, repo=repo, setenv=monkeypatch.setenv)
+    out = Stub(bindir=bindir, log=log, repo=repo, body_file=body_file, setenv=monkeypatch.setenv)
     out.view()
     return out
 
 
 def args_for(stub: Stub, *extra: str, delete_branch: bool = True) -> list[str]:
-    """一条能走通的基本命令；``extra`` 追加在最后（覆盖同名参数）。"""
+    """一条能走通的基本命令；``extra`` 追加在最后（覆盖同名参数）。
+
+    合并模式必填的认账四参数默认带上（``--card`` / ``--by`` / ``--subject`` /
+    ``--body-file``）；``--verify-only`` 的用例请改用 :func:`args_for_verify` ——
+    它与这四个参数互斥，一起给就是 rc2。
+    """
+
+    base = [
+        "--pr",
+        "9",
+        "--branch",
+        CARD_BRANCH,
+        "--method",
+        "merge",
+        "--repo",
+        str(stub.repo),
+        "--timeout",
+        "1",
+        "--interval",
+        "1",
+        "--card",
+        MERGE_CARD,
+        "--by",
+        MERGE_BY,
+        "--subject",
+        MERGE_SUBJECT,
+        "--body-file",
+        str(stub.body_file),
+    ]
+    if delete_branch:
+        base.append("--delete-branch")
+    return base + list(extra)
+
+
+def accounting_args(stub: Stub) -> list[str]:
+    """认账四参数（合并模式必填）；手搭 argv 的用例复用它。"""
+
+    return [
+        "--card",
+        MERGE_CARD,
+        "--by",
+        MERGE_BY,
+        "--subject",
+        MERGE_SUBJECT,
+        "--body-file",
+        str(stub.body_file),
+    ]
+
+
+def args_for_verify(stub: Stub, *extra: str, delete_branch: bool = True) -> list[str]:
+    """``--verify-only`` 的基本命令：**不带**认账四参数（它们与 verify-only 互斥）。"""
 
     base = [
         "--pr",
@@ -161,7 +244,7 @@ def args_for(stub: Stub, *extra: str, delete_branch: bool = True) -> list[str]:
     ]
     if delete_branch:
         base.append("--delete-branch")
-    return base + list(extra)
+    return [*base, "--verify-only", *extra]
 
 
 def run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -264,8 +347,9 @@ def test_malformed_branch_rc2_with_zero_calls(
 ) -> None:
     """畸形 ``--branch``：两条路径都 rc2、stdout 空、stderr 恰一行、零 gh / 零 git。"""
 
-    extra = ["--verify-only"] if verify_only else []
-    rc, out, err = run(args_for(stub, "--branch", bad_branch, *extra), capsys)
+    extra = ["--branch", bad_branch]
+    builder = args_for_verify if verify_only else args_for
+    rc, out, err = run(builder(stub, *extra), capsys)
 
     assert rc == 2, label
     assert out == "", label  # 一个字的证据都没有（更不许有 PASS 行）
@@ -289,7 +373,7 @@ def test_merge_ok_but_branch_remains_rc1(
     assert "结论：合并成功但源分支仍在远端（合并不算完成）" in out
     assert "分支删除 | FAIL" in out
     assert out.splitlines()[0].startswith("分支存在 | PASS | git -C ")
-    assert MERGE_CALL in stub.gh_calls()
+    assert merge_call(stub) in stub.gh_calls()
     assert stub.git_calls()  # 确实做了远端判定
 
 
@@ -312,7 +396,7 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[1].startswith(f"预检 | PASS | {VIEW_CALL} | rc=0 | ")
     # 预检钉到提交：新增一行 head sha 证据（值是假 gh 报的 headRefOid）
     assert lines[2] == f"head sha | PASS | {HEAD_OID}"
-    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | rc=0 | ")
+    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
     assert lines[4].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
@@ -320,7 +404,7 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
     assert stub.gh_calls() == [
         VIEW_CALL,
-        MERGE_CALL,
+        merge_call(stub),
     ]
 
 
@@ -340,10 +424,10 @@ def test_merge_pins_head_sha(stub: Stub, capsys: pytest.CaptureFixture[str]) -> 
     assert rc == 0
     assert err == ""
     assert f"head sha | PASS | {HEAD_OID}" in out  # 预检钉到提交的证据行
-    assert MERGE_CALL in stub.gh_calls()
+    assert merge_call(stub) in stub.gh_calls()
     # 每一次合并调用都必须带 sha：一条不带 sha 的重试都不许有
     merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
-    assert merge_calls == [MERGE_CALL]
+    assert merge_calls == [merge_call(stub)]
 
 
 def test_view_missing_head_oid_rc2(
@@ -405,7 +489,7 @@ def test_old_gh_unknown_match_head_commit_rc2_no_downgrade(
     assert "--match-head-commit" in err
     assert "不提供不带 head sha 的合并路径" in err
     merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
-    assert merge_calls == [MERGE_CALL]  # 没有「不带 sha 再试一次」
+    assert merge_calls == [merge_call(stub)]  # 没有「不带 sha 再试一次」
     assert len(stub.git_calls()) == 1  # 只有合并前那次存在性探针，没有删除验证
 
 
@@ -424,9 +508,8 @@ def test_verify_only_timeout_is_total_budget(
 
     started = time.monotonic()
     rc, out, err = run(
-        args_for(
+        args_for_verify(
             stub,
-            "--verify-only",
             "--timeout",
             "1",
             "--interval",
@@ -462,7 +545,7 @@ def test_merge_path_timeout_is_total_budget_rc2(
 
     assert rc == 2  # 合并已发生但判不了 → rc2，不是 1
     assert elapsed <= 1.5
-    assert f"合并 | PASS | {MERGE_CALL}" in out  # 证据必须留住
+    assert f"合并 | PASS | {merge_call(stub)}" in out  # 证据必须留住
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
     assert "无法判定" in err
@@ -490,6 +573,7 @@ def test_method_defaults_to_merge_without_flag(
         "1",
         "--interval",
         "1",
+        *accounting_args(stub),
     ]
     assert "--method" not in argv  # 确保真的没传
 
@@ -497,10 +581,10 @@ def test_method_defaults_to_merge_without_flag(
 
     assert rc == 0
     assert err == ""
-    assert f"合并 | PASS | {MERGE_CALL} | rc=0 | " in out
+    assert f"合并 | PASS | {merge_call(stub)} | rc=0 | " in out
     assert stub.gh_calls() == [
         VIEW_CALL,
-        MERGE_CALL,
+        merge_call(stub),
     ]
 
 
@@ -555,7 +639,7 @@ def test_merge_failure_rc1_and_no_verification(
     # 只有合并前那一次「源分支存在」探针，合并后一次删除验证都没跑
     assert len(stub.git_calls()) == 1
     assert stub.git_calls()[0].startswith("git -C ")
-    assert MERGE_CALL in stub.gh_calls()
+    assert merge_call(stub) in stub.gh_calls()
     assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
     assert "合并 | FAIL" in out
     assert "合并失败" in out
@@ -584,7 +668,7 @@ def test_merge_gh_nonzero_but_state_merged_then_verification_deleted_rc0(
     assert rc == 0
     assert "合并失败" not in out
     assert "gh pr view 9 --json state" in stub.gh_calls()
-    assert f"合并 | PASS | {MERGE_CALL} | rc=1 | " in out
+    assert f"合并 | PASS | {merge_call(stub)} | rc=1 | " in out
     assert "PR 状态已是 MERGED" in out
     assert "分支删除 | PASS | " in out
     assert out.splitlines()[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
@@ -623,7 +707,7 @@ def test_merge_gh_nonzero_state_undetermined_rc2_keeps_evidence(
     assert rc == 2  # 不是 1
     assert "合并失败" not in out
     assert out.splitlines()[0].startswith("分支存在 | PASS | ")
-    assert f"合并 | PASS | {MERGE_CALL}" in out
+    assert f"合并 | PASS | {merge_call(stub)}" in out
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
     assert "无法判定" in err
@@ -652,7 +736,7 @@ def test_verify_only_branch_present_rc1(
 ) -> None:
     stub.setenv("FAKE_LS_REMOTE_RC", "0")
 
-    rc, out, err = run(args_for(stub, "--verify-only"), capsys)
+    rc, out, err = run(args_for_verify(stub), capsys)
 
     assert rc == 1
     assert err == ""
@@ -680,7 +764,7 @@ def test_verify_only_branch_deleted_rc0(
     # （否则第一次报「分支在」，--timeout 1 的预算就只够一次探针，结论变成 rc1）
     stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")
 
-    rc, out, err = run(args_for(stub, "--verify-only"), capsys)
+    rc, out, err = run(args_for_verify(stub), capsys)
 
     assert rc == 0  # rc 语义不变
     assert err == ""
@@ -710,7 +794,7 @@ def test_verify_only_legal_branch_rc2_never_claims_delete(
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
     stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # --verify-only 没有「合并前存在」闸门
 
-    rc, out, err = run(args_for(stub, "--verify-only"), capsys)
+    rc, out, err = run(args_for_verify(stub), capsys)
 
     assert rc == 0
     assert err == ""
@@ -730,7 +814,7 @@ def test_verify_only_undetermined_rc1(
     stub.setenv("FAKE_LS_REMOTE_RC", "128")
     stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")  # 同上：第一次就该是 128，不是「分支在」
 
-    rc, out, _err = run(args_for(stub, "--verify-only"), capsys)
+    rc, out, _err = run(args_for_verify(stub), capsys)
 
     assert rc == 1
     assert out.splitlines()[-1].startswith("结论：无法判定（")
@@ -775,6 +859,10 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     """上界 999999999 本身是合法值（不是越界）。"""
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
+    # body 里的 merge-pr 必须与 --pr 一致（check_message 会逐字段比对）
+    stub.set_body(
+        f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #999999999\n"
+    )
 
     rc, out, _err = run(
         [
@@ -789,16 +877,19 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
             "1",
             "--interval",
             "1",
+            *accounting_args(stub),
         ],
         capsys,
     )
 
     assert rc == 0
-    # 未传 --method → 默认 merge（gh 收到的是 --merge）
-    assert (
-        f"gh pr merge 999999999 --merge --delete-branch --match-head-commit {HEAD_OID}"
-        in stub.gh_calls()
+    # 未传 --method → 默认 merge（gh 收到的是 --merge）；认账两参数追加在后面
+    merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
+    assert len(merge_calls) == 1
+    assert merge_calls[0].startswith(
+        f"gh pr merge 999999999 --merge --delete-branch --match-head-commit {HEAD_OID} "
     )
+    assert f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}" in merge_calls[0]
     assert "结论：合并完成" in out
 
 
@@ -815,6 +906,7 @@ def test_branch_main_rejected(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
         "--delete-branch",
         "--repo",
         str(stub.repo),
+        *accounting_args(stub),
     ]
 
     rc, out, err = run(argv, capsys)
@@ -836,6 +928,7 @@ def test_branch_master_rejected(stub: Stub, capsys: pytest.CaptureFixture[str]) 
         "--delete-branch",
         "--repo",
         str(stub.repo),
+        *accounting_args(stub),
     ]
 
     rc, out, err = run(argv, capsys)
@@ -950,8 +1043,10 @@ def test_missing_git_rc2_before_any_gh_call(
     )
     repo = tmp_path / "repo"
     repo.mkdir()
+    body_file = tmp_path / "merge-body.txt"
+    body_file.write_text(BODY_TEXT, encoding="utf-8")
 
-    rc, out, err = run(args_for(Stub(bindir, log, repo, monkeypatch.setenv)), capsys)
+    rc, out, err = run(args_for(Stub(bindir, log, repo, body_file, monkeypatch.setenv)), capsys)
 
     assert rc == 2  # 不是 1
     assert out == ""  # 合并没发生 → 没有证据要保
@@ -985,12 +1080,12 @@ def test_git_vanishes_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | ")
+    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
     assert "git" in err
-    assert MERGE_CALL in stub.gh_calls()
+    assert merge_call(stub) in stub.gh_calls()
 
 
 # ------------------------------- 合并后通信一直失败 → rc2（明确未通过，不当绿）
@@ -1006,7 +1101,7 @@ def test_merge_ok_but_undetermined_rc2(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL}")
+    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)}")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -1158,7 +1253,7 @@ def test_probe_timeout_after_merge_is_not_rc0(
     assert rc == 2
     assert out.splitlines()[0].startswith("分支存在 | PASS | ")
     assert "预检 | PASS | " in out
-    assert f"合并 | PASS | {MERGE_CALL}" in out
+    assert f"合并 | PASS | {merge_call(stub)}" in out
     assert "分支删除 | FAIL" in out  # 超时不算 PASS
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -1181,7 +1276,7 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3].startswith(f"合并 | PASS | {MERGE_CALL} | ")
+    assert lines[3].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
@@ -1233,7 +1328,8 @@ def _documented_merge_commands() -> list[list[str]]:
 
 
 def test_documented_commands_carry_required_branch() -> None:
-    """条文 ② 与模板 ⑦ 两条命令都必须带 ``--branch wt/<卡号>``（``--branch`` 必填）。"""
+    """条文 ② 与模板 ⑦ 两条命令都必须带 ``--branch wt/<卡号>``（``--branch`` 必填），
+    并且必须带齐认账四参数（缺任一项 → 经它合出的提交过不了 ``merge-audit --require``）。"""
 
     argvs = _documented_merge_commands()
 
@@ -1241,6 +1337,20 @@ def test_documented_commands_carry_required_branch() -> None:
     for argv in argvs:
         assert "--branch" in argv, argv
         assert "wt/<卡号>" in argv, argv
+        for flag in ("--card", "--by", "--subject", "--body-file"):
+            assert flag in argv, (flag, argv)
+
+
+def _fill_documented(argv: list[str], stub: Stub) -> list[str]:
+    """把文档命令里的占位符换成合法值（``<body-file>`` 换成 fixture 造的 body 文件）。"""
+
+    return [
+        arg.replace("<n>", "9")
+        .replace("<卡号>", MERGE_CARD)
+        .replace("<NNN>", "200")
+        .replace("<body-file>", str(stub.body_file))
+        for arg in argv
+    ]
 
 
 def test_documented_command_runs_to_preflight_and_merge(
@@ -1254,7 +1364,7 @@ def test_documented_command_runs_to_preflight_and_merge(
         # 每次跑都是一个新进程视角：换一份「第几次 git 调用」计数，
         # 让「分支存在」闸门重新走 FAKE_LS_REMOTE_FIRST_RC=0 那条
         stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"git-{index}.count"))
-        filled = [arg.replace("<n>", "9").replace("<卡号>", "t_bbeab29f") for arg in argv]
+        filled = _fill_documented(argv, stub)
         rc, out, err = run(
             [*filled, "--repo", str(stub.repo), "--timeout", "1", "--interval", "1"],
             capsys,
@@ -1264,7 +1374,150 @@ def test_documented_command_runs_to_preflight_and_merge(
         assert err == ""
         assert "分支存在 | PASS | " in out
         assert "预检 | PASS | " in out
-        assert MERGE_CALL in stub.gh_calls()
+        assert merge_call(stub) in stub.gh_calls()
+
+
+# ------------------------- 12b. README 里的样例行同样必须可跑（文档守卫的另一半）
+#
+# 只在 docs/merge-policy.md 上做守卫是不够的：PR #30 把 ``--card`` / ``--by`` /
+# ``--subject`` / ``--body-file`` 变成合并模式必填之后，README 那条「源分支不存在」
+# 的样例照抄已经拿不到文档写的报错（先撞「缺少 --card」），而 808 条全绿照不到。
+# 这里把 README.md 的每条样例行连同它下面那行 ``# stderr: …`` 一起抠出来真跑：
+# 期望文案一律取 README 原文，**不在测试里再抄一遍**（两边一起改就永远绿）。
+
+README = Path(__file__).resolve().parents[2] / "README.md"
+
+#: README 里的样例行前缀（``python3`` / ``python`` 两种写法都认）；不带 ``$ `` 的用法模板不算
+_README_CMD_RE = re.compile(r"^\$ python3? -m team_board\.merge_guard(?:\s|$)")
+#: 样例行下面那行期望 stderr
+_README_STDERR_RE = re.compile(r"^# stderr: (?P<text>.+)$")
+
+
+def _readme_guard_commands() -> list[tuple[list[str], str, str]]:
+    """把 README 每条样例行配成 ``(argv, 文档期望的 stderr, 样例前那段说明文字)``。
+
+    反斜杠续行拼回一条命令；样例下面必须紧跟 ``# stderr: …``（不跟 = 样例行没法判，
+    按文档 bug 处理）。``argv`` 已去掉 ``python3 -m team_board.merge_guard`` 前缀。
+    """
+
+    pairs: list[tuple[list[str], str, str]] = []
+    lines = README.read_text(encoding="utf-8").splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if _README_CMD_RE.match(line) is None:
+            index += 1
+            continue
+        start = index
+        command = line[1:].strip()  # 去掉开头的 "$ "
+        while command.endswith("\\"):
+            index += 1
+            command = f"{command[:-1].strip()} {lines[index].strip()}"
+        argv = shlex.split(command)
+        assert argv[:3] == ["python3", "-m", "team_board.merge_guard"], line
+        prefix: list[str] = []
+        back = start - 1
+        while back >= 0 and len(prefix) < 3:  # 只收样例上方那一段说明（跨过围栏与空行）
+            text = lines[back].strip()
+            if text and not text.startswith("```"):
+                prefix.insert(0, text)
+            back -= 1
+        index += 1
+        match = _README_STDERR_RE.match(lines[index]) if index < len(lines) else None
+        assert match is not None, f"README 的样例行下面没有 `# stderr: …`：{line}"
+        pairs.append((argv[3:], match.group("text"), " ".join(prefix)))
+        index += 1
+    return pairs
+
+
+def test_readme_samples_are_all_guarded() -> None:
+    """README 的 4 条样例行（1 条合并模式 + 3 条 ``--verify-only``）一条不漏地被抠出来。"""
+
+    pairs = _readme_guard_commands()
+
+    assert len(pairs) == 4  # README 增删样例都必须跟着改这里，否则守卫悄悄瞎掉
+    occurrences = [
+        line
+        for line in README.read_text(encoding="utf-8").splitlines()
+        if "-m team_board.merge_guard" in line
+    ]
+    # 多出来的那一处是不带 "$ " 的用法模板（[--verify-only] 那行）
+    assert len(occurrences) == len(pairs) + 1
+
+
+def test_readme_merge_mode_sample_carries_accounting_flags() -> None:
+    """README 那条合并模式样例必须保持「合并模式 + 认账四参数」形态，不许降级成 ``--verify-only``，
+    并且样例前面写清了 body 先由 ``merge-record --body-out`` 生成。"""
+
+    merge_mode = [
+        (argv, prefix)
+        for argv, _text, prefix in _readme_guard_commands()
+        if "--verify-only" not in argv
+    ]
+
+    assert len(merge_mode) == 1
+    argv, prefix = merge_mode[0]
+    assert "--branch" in argv
+    assert "wt/t_never_existed_zzz" in argv
+    assert "--method" in argv and "merge" in argv
+    assert "--delete-branch" in argv
+    for flag in ("--card", "--by", "--subject", "--body-file"):
+        assert flag in argv, (flag, argv)
+    assert "merge-record" in prefix, prefix
+    assert "--body-out" in prefix, prefix
+
+
+def _fill_readme(argv: list[str], stub: Stub) -> list[str]:
+    """把 README 样例里的占位符换成合法值；留下任何 ``<…>`` 都算文档 bug。"""
+
+    mapping = {
+        "<卡号>": MERGE_CARD,
+        "<profile>": "pm",
+        "<NNN>": "200",
+        "<subject>": MERGE_SUBJECT,
+        "<body文件>": str(stub.body_file),
+    }
+    filled: list[str] = []
+    for arg in argv:
+        for token, value in mapping.items():
+            arg = arg.replace(token, value)
+        assert re.search(r"<[^<>]*>", arg) is None, f"README 样例行里有没填的占位符：{arg}"
+        filled.append(arg)
+    return filled
+
+
+def test_readme_samples_run_and_match_documented_stderr(
+    stub: Stub, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """照抄 README 每条样例行 → rc2、stdout 0 字节、stderr 与 README 的 ``# stderr:`` 逐字相同。
+
+    这条就是 README「合并前源分支不存在」样例的守卫：文档写的报错一旦被参数校验挡在
+    前面（PR #30 的 P2），这里立刻红。
+    """
+
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "2")  # 合并前的「源分支存在」闸门报不存在
+
+    pairs = _readme_guard_commands()
+    assert pairs
+    for index, (argv, documented, _prefix) in enumerate(pairs):
+        # 每条样例都是新进程视角：换一份「第几次 git 调用」计数
+        stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"readme-git-{index}.count"))
+        filled = [
+            *_fill_readme(argv, stub),
+            "--repo",
+            str(stub.repo),
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+        ]
+        rc, out, err = run(filled, capsys)
+
+        assert rc == 2, (filled, out, err)
+        assert out == ""  # stdout 0 字节
+        assert err.strip() == documented.strip(), (filled, err, documented)
+        if "--verify-only" not in argv:
+            assert stub.gh_calls() == []  # 合并模式：一个 gh 调用都没发
 
 
 # ---------------- 15. stdout 断管 / 关闭：rc 必须是本次运行的真实结论
@@ -1304,7 +1557,7 @@ def test_broken_pipe_keeps_true_rc(
 
     assert rc == expected
     assert len(stub.gh_calls()) == 2  # 预检 + 合并都照常发生
-    assert MERGE_CALL in stub.gh_calls()
+    assert merge_call(stub) in stub.gh_calls()
 
 
 def test_broken_pipe_keeps_rc2_with_evidence(
@@ -1364,7 +1617,7 @@ def test_closed_stdout_keeps_true_rc(
     stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")
     stub.setenv("FAKE_LS_REMOTE_RC", "0")
     cases = [
-        (args_for(stub, "--verify-only"), 1),
+        (args_for_verify(stub), 1),
         (args_for(stub, delete_branch=False), 2),
     ]
     for index, (argv, expected) in enumerate(cases):
@@ -1421,7 +1674,7 @@ def test_signal_after_merge_keeps_evidence_rc2(
             proc.communicate()
 
     assert proc.returncode == 2  # 不是 143 / 130 / 124 / 0
-    assert f"合并 | PASS | {MERGE_CALL}" in out
+    assert f"合并 | PASS | {merge_call(stub)}" in out
     assert "分支存在 | PASS | " in out  # 合并前那一步也留着
     assert err.startswith(f"错误: 收到信号 {signame}（")
     assert err.count("\n") == 1  # 恰好一行
@@ -1462,3 +1715,390 @@ def test_signals_restored_after_main_returns(
 
     assert rc == 0  # 默认 stub：分支已删 → 合并完成
     assert {signum: signal.getsignal(signum) for signum in before} == before
+
+
+# =============== 认账四参数（--card / --by / --subject / --body-file，卡 t_bb6600d8）
+#
+# 缺口（pm 实跑）：``gh pr merge`` 不带 ``--subject`` / ``--body-file`` 时用 gh 默认文案，
+# 合并提交**没有任何 trailer** → 经 merge_guard 合出来的提交必然过不了
+# ``merge-audit --require``（缺 merged-by / merge-card / merge-pr）。本节四组用例分别锁住：
+# ① argv 逐字转发；② 缺参数四连红（rc2 + stdout 空 + 零 gh 调用）；③ body 坏输入；
+# ④ 认账闭环（假 gh 真造 merge commit + 删远端分支 → merge-audit --require rc0）。
+
+
+def test_merge_argv_forwards_accounting_verbatim(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """① argv 逐字：三个语义词原位，``--subject`` / ``--body-file`` 追加在 sha 之后。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0
+    assert err == ""
+    assert stub.gh_calls() == [VIEW_CALL, merge_call(stub)]
+    call = stub.gh_calls()[1]
+    assert call.startswith(
+        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+    )
+    assert call.endswith(f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}")
+    assert f"合并 | PASS | {merge_call(stub)} | rc=0 | " in out
+
+
+def _drop_flag(argv: list[str], flag: str) -> list[str]:
+    """从 argv 里删掉 ``flag`` 与它后面那个值（用来造「缺某一项」的红样例）。"""
+
+    kept: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token == flag:
+            skip = True
+            continue
+        kept.append(token)
+    return kept
+
+
+@pytest.mark.parametrize("flag", ["--card", "--by", "--subject", "--body-file"])
+def test_missing_accounting_flag_rc2_with_zero_gh_calls(
+    stub: Stub, capsys: pytest.CaptureFixture[str], flag: str
+) -> None:
+    """② 红样例四连：缺任一项 → rc2、stdout **0 字节**、stderr 恰一行、假 gh 零调用。"""
+
+    rc, out, err = run(_drop_flag(args_for(stub), flag), capsys)
+
+    assert rc == 2
+    assert out == ""  # 一个字节都不许有（0 字节 stdout）
+    assert err.startswith(f"错误: 合并命令缺少 {flag}"), err
+    assert err.count("\n") == 1  # stderr 严格一行
+    # 零调用用调用日志断言，不靠肉眼：合并前的「分支存在」闸门也没跑
+    assert stub.calls() == []
+    assert not stub.log.exists() or stub.calls() == []
+
+
+@pytest.mark.parametrize(
+    ("label", "overrides", "hint"),
+    [
+        ("文件不存在", {"body_file": "missing"}, "不存在"),
+        ("空文件", {"body": ""}, "空文件"),
+        ("非 UTF-8", {"body_bytes": b"merged-by: pm/run200\n\xff\xfe\n"}, "UTF-8"),
+        ("三字段缺一", {"body": f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\n"}, "缺字段"),
+        (
+            "merge-card 不一致",
+            {"body": f"merged-by: {MERGE_BY}\nmerge-card: t_deadbeef\nmerge-pr: #9\n"},
+            "字段与参数不一致",
+        ),
+        ("merge-pr 不一致", {"body": f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #10\n"}, "#10"),
+        ("纯空白 body", {"body": " \n"}, "缺字段"),
+    ],
+)
+def test_bad_body_file_rc2_with_zero_gh_calls(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    label: str,
+    overrides: dict[str, object],
+    hint: str,
+) -> None:
+    """③ body 坏输入：rc2 + 零 gh 调用（判定全在 ensure_branch_present 之前）。"""
+
+    argv = args_for(stub)
+    if "body_file" in overrides:
+        # 「文件不存在」：换一个不存在的路径
+        argv = _replace_flag_value(argv, "--body-file", str(tmp_path / "missing-body.txt"))
+    if "body" in overrides:
+        stub.set_body(str(overrides["body"]))
+    if "body_bytes" in overrides:
+        stub.body_file.write_bytes(overrides["body_bytes"])  # type: ignore[arg-type]
+
+    rc, out, err = run(argv, capsys)
+
+    assert rc == 2, label
+    assert out == "", label
+    assert err.startswith("错误: "), label
+    assert err.count("\n") == 1, label
+    assert hint in err, label
+    assert stub.calls() == [], label
+
+
+def _replace_flag_value(argv: list[str], flag: str, value: str) -> list[str]:
+    """把 argv 里 ``flag`` 后面的值替换成 ``value``。"""
+
+    out = list(argv)
+    index = out.index(flag)
+    out[index + 1] = value
+    return out
+
+
+# ---------------------- ②b. --body-file 的路径形态（P2-1：两套 cwd 解析同一个相对路径）
+#
+# 修之前：校验 ``read_body_file`` 按**进程 cwd** 解析，而 ``gh pr merge`` 的 cwd 是
+# ``--repo``。同一个相对路径在两处指向不同文件：校验读 caller 的那份、gh 读 ``--repo``
+# 下那份 —— 轻则 gh 报读不到、rc1 冒充「未达成」；重则 gh 静默合进另一份 body，合出
+# 一条**没有任何 trailer** 的提交（R15-A 的红样例）。现在相对路径在 validate 阶段 rc2
+# 拒掉，交给 gh 的路径与校验的路径恒为同一个绝对路径。
+
+
+def test_relative_body_file_rc2_with_zero_calls(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """cwd 里有合法 body、``--repo`` 指向别处且那里没有同名文件、``--body-file`` 给
+
+    相对路径 → **rc2**（不是 rc1）、stdout 空、stderr 恰一行、零 gh 零 git 调用。
+    """
+
+    monkeypatch.chdir(tmp_path)  # body 就在 cwd 下（tmp_path/merge-body.txt）
+    assert not (stub.repo / stub.body_file.name).exists()  # --repo 下没有同名文件
+    argv = _replace_flag_value(args_for(stub), "--body-file", stub.body_file.name)
+
+    rc, out, err = run(argv, capsys)
+
+    assert rc == 2, err
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "--body-file" in err and "绝对路径" in err
+    assert stub.calls() == []
+
+
+def test_absolute_body_file_unchanged_when_cwd_differs_from_repo(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """反向保护：同一份文件给**绝对路径**、cwd 与 ``--repo`` 不同 → 行为不变（照旧合并 rc0）。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")  # 合并后探针报「没有这个 ref」
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, err
+    assert err == ""
+    assert "合并 | PASS | " in out
+    # 交给 gh 的就是校验时用的那个绝对路径原文
+    assert merge_call(stub) in stub.gh_calls()
+
+
+#: 探针卡号（合法形态的假号，不是真卡号）
+PROBE_CARD = "t_deadbeef"
+PROBE_BRANCH = f"wt/{PROBE_CARD}"
+PROBE_PR = 20
+#: 真 git 的绝对路径（假 gh 内部要造 merge commit，不能被 PATH 里的假 git 抢走）
+REAL_GIT = shutil.which("git") or "git"
+
+#: 假 gh：收到 ``pr merge`` 时**真的**按 ``--subject`` / ``--body-file`` 造一个 merge commit，
+#: 再删远端分支（本地裸库当 origin）。--subject / --body-file 缺一个就退出 9。
+MERGE_GH_STUB = '''#!{python}
+"""假 gh（认账闭环用）：真的合出带 trailer 的合并提交，再删远端源分支。"""
+
+import json
+import os
+import subprocess
+import sys
+
+GIT = os.environ["FAKE_REAL_GIT"]
+WORK = os.environ["FAKE_WORK"]
+BRANCH = os.environ["FAKE_PROBE_BRANCH"]
+LOG = os.environ["FAKE_LOG"]
+MARK = os.environ["FAKE_MERGED_MARK"]
+
+argv = sys.argv[1:]
+with open(LOG, "a", encoding="utf-8") as handle:
+    handle.write("gh " + " ".join(argv) + "\\n")
+
+
+def git(*args):
+    proc = subprocess.run([GIT, "-C", WORK, *args], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout + proc.stderr)
+        raise SystemExit(proc.returncode)
+    return proc
+
+
+if argv[:2] == ["pr", "view"]:
+    if os.path.exists(MARK):
+        print(json.dumps({"state": "MERGED"}))
+        raise SystemExit(0)
+    sha = git("rev-parse", "origin/" + BRANCH).stdout.strip()
+    print(json.dumps({"number": int(argv[2]), "state": "OPEN", "headRefName": BRANCH,
+                      "baseRefName": "main", "headRefOid": sha}))
+    raise SystemExit(0)
+
+if argv[:2] == ["pr", "merge"]:
+    if "--subject" not in argv or "--body-file" not in argv:
+        sys.stderr.write("fake gh: pr merge 缺 --subject / --body-file\\n")
+        raise SystemExit(9)
+    subject = argv[argv.index("--subject") + 1]
+    with open(argv[argv.index("--body-file") + 1], encoding="utf-8") as handle:
+        body = handle.read()
+    with open(MARK, "w", encoding="utf-8") as handle:
+        handle.write("merged\\n")
+    git("fetch", "-q", "origin")
+    git("merge", "--no-ff", "--no-commit", "origin/" + BRANCH)
+    message = os.path.join(WORK, ".fake-gh-message.txt")
+    with open(message, "w", encoding="utf-8") as handle:
+        handle.write(subject + "\\n\\n" + body)
+    git("commit", "-q", "--no-verify", "-F", message)
+    git("push", "-q", "origin", "--delete", BRANCH)
+    print("fake gh: merged #" + argv[2])
+    raise SystemExit(0)
+
+sys.stderr.write("fake gh: unexpected args " + " ".join(argv) + "\\n")
+raise SystemExit(9)
+'''
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        [REAL_GIT, "-C", str(cwd), *args], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, (args, proc.stdout, proc.stderr)
+    return proc
+
+
+def _probe_repo(tmp_path: Path) -> tuple[Path, Path, str]:
+    """造一对「裸库当 origin + 工作库」：main 上一条基线提交，wt/t_deadbeef 上一条特性提交。"""
+
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    subprocess.run([REAL_GIT, "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run([REAL_GIT, "init", "-q", "-b", "main", str(work)], check=True)
+    for key, value in (
+        ("user.email", "probe@local"),
+        ("user.name", "probe"),
+        ("commit.gpgsign", "false"),
+    ):
+        _git("config", key, value, cwd=work)
+
+    (work / "base.txt").write_text("base\n", encoding="utf-8")
+    _git("add", "base.txt", cwd=work)
+    _git("commit", "-q", "-m", "base", cwd=work)
+    _git("remote", "add", "origin", str(origin), cwd=work)
+    _git("push", "-q", "origin", "main", cwd=work)
+
+    _git("checkout", "-q", "-b", PROBE_BRANCH, cwd=work)
+    (work / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git("add", "feature.txt", cwd=work)
+    _git("commit", "-q", "-m", f"feat({PROBE_CARD}): probe", cwd=work)
+    _git("push", "-q", "origin", PROBE_BRANCH, cwd=work)
+    _git("checkout", "-q", "main", cwd=work)
+
+    baseline = _git("rev-parse", "HEAD", cwd=work).stdout.strip()
+    return work, origin, baseline
+
+
+def test_merge_guard_commit_passes_merge_audit_require(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """④ 认账闭环（裁决点名的那条）：经 merge_guard 合出的提交 ``merge-audit --require`` 判绿。
+
+    假 gh **真的**按 ``--subject`` / ``--body-file`` 造一个 merge commit
+    （``git merge --no-ff --no-commit`` + ``git commit -F``）再删远端分支；合并完成后跑
+    ``merge-audit --repo <探针库> --baseline <合并前 HEAD> --card t_deadbeef --require``
+    ⇒ rc0 且输出含 ``by=pm/run200``。
+    """
+
+    work, _origin, baseline = _probe_repo(tmp_path)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(MERGE_GH_STUB.replace("#!{python}", f"#!{sys.executable}"), encoding="utf-8")
+    gh.chmod(0o755)
+
+    log = tmp_path / "gh.log"
+    mark = tmp_path / "merged.mark"
+    body = tmp_path / "merge-body.txt"
+    body.write_text(
+        f"merged-by: {MERGE_BY}\nmerge-card: {PROBE_CARD}\nmerge-pr: #{PROBE_PR}\n",
+        encoding="utf-8",
+    )
+    # 判据①（merged-by 的 profile == 该卡 tasks.assignee）要读看板库：造一份最小库，
+    # 探针卡 assignee=pm，与 merged-by: pm/run200 的 profile 严格一致。
+    board = tmp_path / "board.db"
+    with sqlite3.connect(board) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT)")
+        conn.execute("INSERT INTO tasks (id, assignee) VALUES (?, ?)", (PROBE_CARD, "pm"))
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FAKE_REAL_GIT", REAL_GIT)
+    monkeypatch.setenv("FAKE_WORK", str(work))
+    monkeypatch.setenv("FAKE_PROBE_BRANCH", PROBE_BRANCH)
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_MERGED_MARK", str(mark))
+
+    subject = f"Merge PR #{PROBE_PR}（{PROBE_CARD}）"
+    rc, out, err = run(
+        [
+            "--pr",
+            str(PROBE_PR),
+            "--branch",
+            PROBE_BRANCH,
+            "--method",
+            "merge",
+            "--delete-branch",
+            "--card",
+            PROBE_CARD,
+            "--by",
+            MERGE_BY,
+            "--subject",
+            subject,
+            "--body-file",
+            str(body),
+            "--repo",
+            str(work),
+            "--timeout",
+            "1",
+            "--interval",
+            "1",
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (out, err)
+    assert err == ""
+    assert f"--subject {subject} --body-file {body}" in " ".join(
+        line for line in log.read_text(encoding="utf-8").splitlines()
+    )
+    assert "结论：合并完成" in out
+
+    # 真 git 看到的合并提交：2 个父提交 + 三行 trailer
+    message = _git("log", "-1", "--format=%B", cwd=work).stdout
+    assert "merged-by: pm/run200" in message
+    assert f"merge-card: {PROBE_CARD}" in message
+    assert f"merge-pr: #{PROBE_PR}" in message
+
+    env = {**os.environ, "PYTHONPATH": str(Path(mg.__file__).resolve().parents[1])}
+    audit = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "team_board.cli",
+            "merge-audit",
+            "--repo",
+            str(work),
+            "--baseline",
+            baseline,
+            "--card",
+            PROBE_CARD,
+            "--db",
+            str(board),
+            "--require",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert audit.returncode == 0, audit.stdout + audit.stderr
+    assert f"by={MERGE_BY}" in audit.stdout
+    assert "结论：无问题" in audit.stdout

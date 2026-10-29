@@ -340,6 +340,8 @@ trailer 区），任一条有问题即 rc1。
 python3 -m team_board.merge_guard \
   --pr <正整数> --branch <PR 的 head 分支名> \
   [--method {merge}=merge] --delete-branch \
+  --card <t_ 加 8 位小写十六进制> --by <profile>/run<NNN> \
+  --subject <合并提交标题> --body-file <认账 body 文件> \
   [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] \
   [--command-timeout SEC=60] [--verify-only]
 ```
@@ -350,6 +352,20 @@ python3 -m team_board.merge_guard \
   直接 rc2，且**一个 gh 写操作都不发**，
   stderr 固定一行
   `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
+- **认账四参数（合并模式必填）**：`--card`（形如 `t_1234abcd`）、`--by`（形如 `pm/run200`）、
+  `--subject`（单行非空白合并提交标题）、`--body-file`（含 `merged-by` / `merge-card` /
+  `merge-pr` 三行 trailer 的文件，由 `team-board merge-record --body-out` 生成）—— 四者
+  **原样转发**给 `gh pr merge`。缺任一项 / 形态非法 / `--subject` 含换行 / body 文件不存在、
+  不是普通文件、非严格 UTF-8、为空 / body 内容经 `merges.check_message` 判出问题
+  （缺字段、重复、格式非法、与 `--card` / `--by` / `--pr` 不一致）→ **rc2、stdout 空、
+  stderr 恰一行、零 `gh` 零 `git` 调用**（全部在 `ensure_branch_present()` 之前判完）。
+  `--body-file` **必须是绝对路径**：本工具按进程 cwd 校验 body，而 `gh pr merge` 的 cwd 是
+  `--repo`（`--repo` 默认 `.`），同一个相对路径在两处指向不同文件 —— 轻则 gh 报读不到
+  （rc1 冒充「未达成」），重则静默合进另一份 body、合出**没有 trailer** 的提交。相对路径
+  → rc2（2026-10-29 P2-1 返工）。
+  为什么必填：`gh pr merge` 不带 `--subject` / `--body-file` 时用 gh 默认文案生成合并提交
+  message，**没有任何 trailer**，经本工具合出来的提交必然过不了 `merge-audit --require`
+  （缺认账三字段）。`--verify-only` 与这四个参数**互斥**（同给 → rc2）。
 - `--pr` 取值 1–999999999（13 位毫秒这种误用一律 rc2）；`--timeout` / `--interval` /
   `--command-timeout` 必须是 ≥1 的 ASCII 十进制整数（`0`、负数、`1_000`、空串、空串之外的
   空白都 rc2），且**各有 3600 秒的上界**（`MAX_TIMEOUT` / `MAX_INTERVAL` /
@@ -372,8 +388,10 @@ python3 -m team_board.merge_guard \
   `headRefName` 必须与 `--branch` **逐字相等**，`headRefOid` 必须是 40 位（SHA-1）或
   64 位（SHA-256）十六进制提交 SHA —— 缺字段或格式不对一律 rc2，说清实际值。预检通过
   后把提交钉进证据：`head sha | PASS | <sha>`。
-- 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>`
-  （`<sha>` = 预检读到的 `headRefOid`）。只比分支名不约束内容：预检到合并之间源分支被
+- 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>
+  --subject <subject> --body-file <path>`
+  （`<sha>` = 预检读到的 `headRefOid`；后两个参数来自 `--subject` / `--body-file`，顺序固定）。
+  只比分支名不约束内容：预检到合并之间源分支被
   force-push / 追加提交时，合的会是预检**从未见过**的提交，工具却照样打 PASS + rc0。
   带上 `--match-head-commit` 后由 gh 自己比对，head 变了直接拒。老版本 gh 报
   `unknown flag: --match-head-commit` → **rc2**、stdout 空、stderr 一行，**不许**静默
@@ -397,7 +415,9 @@ python3 -m team_board.merge_guard \
   只能走合并路径（先有「分支存在」预检，再有「分支删除」验证）。它的步骤行单独一种
   形态 `远端 ref | <存在|不存在|无法判定> | <命令原文> | rc=<n> | <关键输出>`，
   **不写** `PASS` / `FAIL`、也不出现「分支删除」—— 这条路径一次删除都没验证过，
-  打 PASS 会被抄进卡当「删除已验证」的证据（2026-10-29 P2-1 返工）。
+  打 PASS 会被抄进卡当「删除已验证」的证据（2026-10-29 P2-1 返工）。它与认账四参数
+  （`--card` / `--by` / `--subject` / `--body-file`）**互斥**：同给 → rc2（verify-only
+  不合并，给 body 说明调用方误判）。
 
 退出码：
 
@@ -408,7 +428,12 @@ python3 -m team_board.merge_guard \
   「判不了」**不是** rc1 而是 rc2（见下条）。
 - `2` —— 参数或环境错误，含缺 `--delete-branch`、`--method` 不是 `merge`（`squash` /
   `rebase`）、`--branch` 形态非法（空串 / 含空白字符 / 带 `refs/` 前缀；合并路径与
-  `--verify-only` **同一套**校验，都在一切 `gh` / `git` 调用之前）。也包含：`--pr` / `--timeout` /
+  `--verify-only` **同一套**校验，都在一切 `gh` / `git` 调用之前）。也包含：合并模式缺
+  `--card` / `--by` / `--subject` / `--body-file` 任一项、`--card` / `--by` 形态非法、
+  `--subject` 空 / 纯空白 / 含换行、`--body-file` 路径为空 / **不是绝对路径**（相对路径会在
+  进程 cwd 与 `--repo` 两处解析成不同文件，见上）/ 不存在 / 不是普通文件 /
+  非严格 UTF-8 / 空文件、body 内容不合认账三字段（缺字段 / 重复 / 格式非法 / 与参数
+  不一致）、`--verify-only` 与这四个认账参数同给、`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
   **合并前源分支在远端不存在**、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、
   `headRefOid` 缺失或不是 40/64 位十六进制、gh 不支持 `--match-head-commit`、
@@ -446,15 +471,18 @@ stdout 失败」，`141` 是 SIGPIPE）。
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
 预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
 head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
-合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 | rc=0 | (无输出)
+合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 --subject Merge PR #9（t_bbeab29f） --body-file /tmp/t_bbeab29f-merge-body.txt | rc=0 | (无输出)
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
 ```
 
-合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）：
+合并前的源分支不存在时（rc2，stdout 空，一个 gh 调用都没发）。合并模式必填认账四参数，
+`--body-file` 指的 body 先由 `team-board merge-record --card <卡号> --by <profile>/run<NNN> --pr 9 --body-out <body文件>` 生成
+（body 文件缺失 / 缺 trailer / 与 `--card`·`--by`·`--pr` 不一致同样 rc2，见上一节）：
 
 ```
-$ python3 -m team_board.merge_guard --pr 9 --branch wt/t_never_existed_zzz --method merge --delete-branch
+$ python3 -m team_board.merge_guard --pr 9 --branch wt/t_never_existed_zzz --method merge --delete-branch \
+    --card <卡号> --by <profile>/run<NNN> --subject <subject> --body-file <body文件>
 # stderr: 错误: 源分支 wt/t_never_existed_zzz 不在 origin 远端（rc=2）：(无输出)；合并前源分支必须先存在，拒绝合并
 ```
 
