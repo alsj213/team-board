@@ -22,9 +22,9 @@ team-board member engineer
 team-board export
 ```
 
-共七个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` / `serve`
-（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，
-`merge-audit` 见「合并认账稽核」一节）。
+共八个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `serve`（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，
+`merge-audit` / `merge-record` 见「合并认账稽核」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -258,10 +258,25 @@ trailer 区），任一条有问题即 rc1。
   里没有 `git`、git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
   `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
 
+### 合并前：`merge-record`（生成 body / 预检 body）
+
+- **生成**：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --body-out /tmp/t_xxx-merge-body.txt`
+  —— 打印认账 body 段（三行 trailer）+ 卡面认账块说明 + `gh pr merge` 命令模板
+  （**只打印，不执行任何 git/gh 命令**）；`--body-out` 把 body 段原样写盘（UTF-8，
+  末尾恰好一个换行），文件内容与 stdout 的 body 段逐字节一致。未给 `--body-out` 时
+  注释里报默认路径 `/tmp/<卡号>-merge-body.txt` 且**不写文件**。
+- **预检**：`team-board merge-record --check-file /tmp/t_xxx-merge-body.txt` —— 合并
+  **前**校验一份 body 文件的三字段（可选 `--card/--by/--pr` 做一致性校验）；通过
+  rc0（`通过：三字段齐（Merge-By/Merge-Card/Merge-PR）`），有问题 rc1（每处一行
+  `问题: <kind>：<detail>`），文件/参数级错误 rc2。
+
+三字段的分层口径（机器可判 / 卡面留痕 / 做不到）、合并操作五步与残余风险见
+[`docs/merge-accountability.md`](docs/merge-accountability.md)。
+
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
-`branch-audit` / `merge-audit` 各有自己的参数）：
+`branch-audit` / `merge-audit` / `merge-record` 各有自己的参数）：
 
 - `--db PATH` —— 看板库路径，默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
