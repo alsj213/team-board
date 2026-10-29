@@ -315,7 +315,9 @@ class Accounting:
     card: str
     by: str
     subject: str
-    #: 认账 body 文件路径（``gh pr merge --body-file`` 收到的是这个路径原文）
+    #: 认账 body 文件路径 —— **绝对路径**（:func:`read_body_file` 已拒掉相对路径），
+    #: 校验与 ``gh pr merge --body-file`` 解析的是同一个文件（gh 的 cwd 是 ``--repo``，
+    #: 而校验按进程 cwd 解析，相对路径会在两处指向不同文件）
     body_file: str
 
 
@@ -863,18 +865,32 @@ def check_subject(subject: str) -> str:
 
 
 def read_body_file(raw: str) -> str:
-    """读 ``--body-file`` 并校验：非空路径 / 存在 / 普通文件 / 严格 UTF-8 / 非空文件。
+    """读 ``--body-file`` 并校验：非空路径 / **必须是绝对路径** / 存在 / 普通文件 / 严格
+    UTF-8 / 非空文件。
 
     为什么逐条判、不用 ``Path.read_text()`` 一把梭：``read_text`` 对「不存在」「是目录」
     「非 UTF-8」抛的是三种不同异常（``FileNotFoundError`` / ``IsADirectoryError`` /
     ``UnicodeDecodeError``），漏一种就冒 traceback；裸冒 traceback 是 rc1，而 rc1 是
     「未达成」专用码 —— 参数错的合并请求绝不许落到它上面。
+
+    为什么必须绝对路径：本函数按**进程 cwd** 解析路径，而 ``gh pr merge`` 的 cwd 是
+    ``--repo``（见 ``_run(..., cwd=opts.repo)``）。同一个相对路径在两处指向不同文件 ——
+    校验读到 caller 的那份、gh 读 ``--repo`` 下那份：轻则「文件不存在」被 gh 判成合并
+    失败、rc1 冒充「未达成」，重则 gh 静默合进另一份 body，合出**没有任何 trailer** 的
+    提交（正是 R15-A 的红样例）。所以相对路径在这一步就 rc2 拒掉，交给 gh 的路径与
+    校验的路径恒为同一个绝对路径。
     """
 
     if not raw:
         raise MergeGuardError(
             "--body-file 路径为空：要的是认账 body 文件（三行 trailer："
             "merged-by / merge-card / merge-pr）"
+        )
+    if not os.path.isabs(raw):
+        raise MergeGuardError(
+            f"--body-file 必须是绝对路径: {raw!r}（本工具按进程 cwd 校验、gh pr merge 的 "
+            "cwd 是 --repo，同一个相对路径会解析成两个不同文件：轻则 gh 报读不到、rc1 冒充"
+            "「未达成」，重则静默合进另一份 body、合出没有 trailer 的提交）"
         )
     try:
         info = os.stat(raw)

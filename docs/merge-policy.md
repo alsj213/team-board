@@ -22,7 +22,8 @@ python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --
 不带 `--subject` / `--body-file` 时用默认文案生成合并提交 message，**没有任何 trailer**，
 经 `merge_guard` 合出来的提交必然过不了 `merge-audit --require`（缺 `merged-by` / `merge-card` /
 `merge-pr`）。body 文件用 `team-board merge-record --body-out` 生成；`--verify-only` 与这四个
-参数互斥。
+参数互斥。`--body-file` 必须是**绝对路径**（相对路径会在进程 cwd 与 `--repo` 两处解析成
+不同文件，gh 可能读不到、甚至静默合进另一份 body —— rc2 拦掉）。
 
 `--method` 只允许取 `merge`；`squash` / `rebase` 一律拒绝（该 CLI 落地时按本条写死默认值与合法值域）。
 **`merge_guard` 已强制**（合并入口只有 ② 与模板 ⑦ 那同一条命令，脚本是 `src/team_board/merge_guard.py`，PR #20 已落地）：

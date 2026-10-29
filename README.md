@@ -359,6 +359,10 @@ python3 -m team_board.merge_guard \
   不是普通文件、非严格 UTF-8、为空 / body 内容经 `merges.check_message` 判出问题
   （缺字段、重复、格式非法、与 `--card` / `--by` / `--pr` 不一致）→ **rc2、stdout 空、
   stderr 恰一行、零 `gh` 零 `git` 调用**（全部在 `ensure_branch_present()` 之前判完）。
+  `--body-file` **必须是绝对路径**：本工具按进程 cwd 校验 body，而 `gh pr merge` 的 cwd 是
+  `--repo`（`--repo` 默认 `.`），同一个相对路径在两处指向不同文件 —— 轻则 gh 报读不到
+  （rc1 冒充「未达成」），重则静默合进另一份 body、合出**没有 trailer** 的提交。相对路径
+  → rc2（2026-10-29 P2-1 返工）。
   为什么必填：`gh pr merge` 不带 `--subject` / `--body-file` 时用 gh 默认文案生成合并提交
   message，**没有任何 trailer**，经本工具合出来的提交必然过不了 `merge-audit --require`
   （缺认账三字段）。`--verify-only` 与这四个参数**互斥**（同给 → rc2）。
@@ -426,7 +430,8 @@ python3 -m team_board.merge_guard \
   `rebase`）、`--branch` 形态非法（空串 / 含空白字符 / 带 `refs/` 前缀；合并路径与
   `--verify-only` **同一套**校验，都在一切 `gh` / `git` 调用之前）。也包含：合并模式缺
   `--card` / `--by` / `--subject` / `--body-file` 任一项、`--card` / `--by` 形态非法、
-  `--subject` 空 / 纯空白 / 含换行、`--body-file` 路径为空 / 不存在 / 不是普通文件 /
+  `--subject` 空 / 纯空白 / 含换行、`--body-file` 路径为空 / **不是绝对路径**（相对路径会在
+  进程 cwd 与 `--repo` 两处解析成不同文件，见上）/ 不存在 / 不是普通文件 /
   非严格 UTF-8 / 空文件、body 内容不合认账三字段（缺字段 / 重复 / 格式非法 / 与参数
   不一致）、`--verify-only` 与这四个认账参数同给、`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、

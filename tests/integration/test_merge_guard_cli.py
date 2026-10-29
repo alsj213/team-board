@@ -1833,6 +1833,60 @@ def _replace_flag_value(argv: list[str], flag: str, value: str) -> list[str]:
     return out
 
 
+# ---------------------- ②b. --body-file 的路径形态（P2-1：两套 cwd 解析同一个相对路径）
+#
+# 修之前：校验 ``read_body_file`` 按**进程 cwd** 解析，而 ``gh pr merge`` 的 cwd 是
+# ``--repo``。同一个相对路径在两处指向不同文件：校验读 caller 的那份、gh 读 ``--repo``
+# 下那份 —— 轻则 gh 报读不到、rc1 冒充「未达成」；重则 gh 静默合进另一份 body，合出
+# 一条**没有任何 trailer** 的提交（R15-A 的红样例）。现在相对路径在 validate 阶段 rc2
+# 拒掉，交给 gh 的路径与校验的路径恒为同一个绝对路径。
+
+
+def test_relative_body_file_rc2_with_zero_calls(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """cwd 里有合法 body、``--repo`` 指向别处且那里没有同名文件、``--body-file`` 给
+
+    相对路径 → **rc2**（不是 rc1）、stdout 空、stderr 恰一行、零 gh 零 git 调用。
+    """
+
+    monkeypatch.chdir(tmp_path)  # body 就在 cwd 下（tmp_path/merge-body.txt）
+    assert not (stub.repo / stub.body_file.name).exists()  # --repo 下没有同名文件
+    argv = _replace_flag_value(args_for(stub), "--body-file", stub.body_file.name)
+
+    rc, out, err = run(argv, capsys)
+
+    assert rc == 2, err
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert "--body-file" in err and "绝对路径" in err
+    assert stub.calls() == []
+
+
+def test_absolute_body_file_unchanged_when_cwd_differs_from_repo(
+    stub: Stub,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """反向保护：同一份文件给**绝对路径**、cwd 与 ``--repo`` 不同 → 行为不变（照旧合并 rc0）。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")  # 合并后探针报「没有这个 ref」
+    monkeypatch.chdir(tmp_path)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, err
+    assert err == ""
+    assert "合并 | PASS | " in out
+    # 交给 gh 的就是校验时用的那个绝对路径原文
+    assert merge_call(stub) in stub.gh_calls()
+
+
 #: 探针卡号（合法形态的假号，不是真卡号）
 PROBE_CARD = "t_deadbeef"
 PROBE_BRANCH = f"wt/{PROBE_CARD}"

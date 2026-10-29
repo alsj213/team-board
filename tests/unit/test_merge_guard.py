@@ -1190,6 +1190,44 @@ def test_validate_rejects_empty_body_file_path() -> None:
     assert "路径为空" in str(excinfo.value)
 
 
+def test_validate_rejects_relative_body_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """相对路径 → rc2（校验按进程 cwd 解析、``gh pr merge`` 按 ``--repo`` 解析）。
+
+    这是 PR #30 的 P2-1：同一个相对路径在两处指向不同文件 —— 校验读到 caller cwd 的那份、
+    gh 读 ``--repo`` 下的那份。轻则 gh 报读不到（rc1 冒充「未达成」），重则静默合进另一份
+    body、合出没有 trailer 的提交。所以即便 caller cwd 里**真有一份合法 body**也必须拒。
+    """
+
+    (tmp_path / "body.txt").write_text(BODY_TEXT, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(body_file="body.txt"))
+
+    assert "--body-file" in str(excinfo.value)
+    assert "绝对路径" in str(excinfo.value)
+
+
+def test_validate_accepts_absolute_body_file_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反向保护：同一份文件给绝对路径 → 行为不变（原样进 ``Accounting``）。"""
+
+    body = tmp_path / "body.txt"
+    body.write_text(BODY_TEXT, encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # cwd 与 body 所在目录不同，绝对路径照样可读
+
+    opts = mg.validate(_validated_ns(body_file=str(body)))
+
+    assert opts.accounting is not None
+    # 交给 gh 的路径 == 校验用的路径（同一个绝对路径原文）
+    assert opts.accounting.body_file == str(body)
+
+
 def test_validate_rejects_missing_body_file(tmp_path: Path) -> None:
     missing = tmp_path / "nope.txt"
 
