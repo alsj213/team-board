@@ -153,8 +153,8 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
 
 ## 分支稽核（branch-audit）
 
-一条命令查两类偏差：**卡分支上的提交归属**与 **checkout 偏移**。只读 git，不改任何
-分支、不碰工作区。
+一条命令查三类偏差：**卡分支上的提交归属**、**checkout 偏移** 与 **分支结构
+（一卡一分支）**。只读 git，不改任何分支、不碰工作区。
 
 ```
 team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--allow-file PATH]
@@ -163,10 +163,11 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 - `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
 - `--main-branch NAME` —— 主分支名（默认 `main`）；本地没有就退回 `origin/<NAME>`。
 - `--branch NAME` —— 只查这一条分支（`wt/t_xxx` 或 `t_xxx` 两种写法都行）；
-  CI 用它让每张 PR 只对自己的分支负责。指定的分支存在但不是卡分支 → 输出
-  `… 不是卡分支，跳过提交归属检查`，只做 checkout 检查。指定的卡号解析不到
-  `wt/t_xxx` 卡分支（例如只有漏写 `wt/` 前缀的裸分支）→ **退出码 2**，不会
-  静默稽核零条分支后报绿。
+  CI 用它让每张 PR 只对自己的分支负责。它**只影响规则 A 与 C-2**：**C-1 永远全仓
+  枚举、与 `--branch` 无关**（所以 CI 里只传 `--branch` 也照样拦得住「一卡两分支」）。
+  指定的分支存在但不是卡分支 → 输出 `… 不是卡分支，跳过提交归属检查`，规则 A 与
+  C-2 都不跑（C-1 照跑）。指定的卡号解析不到 `wt/t_xxx` 卡分支（例如只有漏写
+  `wt/` 前缀的裸分支）→ **退出码 2**，不会静默稽核零条分支后报绿。
 - `--allow-file PATH` —— 豁免表（默认 `<repo>/.team-board/branch-audit-allow.txt`）。
 
 **规则 A：卡分支上的提交归属。** 卡分支指名字精确等于 `wt/t_<8 位卡号>` 的本地
@@ -188,6 +189,29 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 必须停在 `<main-branch>`；其它 worktree 的 detached HEAD 一律判红，分支是
 `wt/t_<X>` 时目录名必须精确是 `t_<X>`，其它分支也必须是 `main`。豁免不适用于规则 B。
 
+**规则 C：一卡一分支。** 两类判红，**豁免表对规则 C 同样不生效**（豁免只对规则 A
+生效，现 0 条）：
+
+- **C-1「一卡多分支」**：卡分支只能叫 `wt/<卡号>`。分支名里申报了卡号、但分支名
+  **不精确等于** `wt/<卡号>`（`wt/t_xxxxxxxx-fix`、裸 `t_xxxxxxxx`、`x/t_xxxxxxxx`、
+  `wt/t_xxxxxxxx/y` 都算）→ 判红；同一分支名的本地与 `origin/` 两份**合并成一条**
+  （不会因两边都在而重复判红）。分支名里提取不到卡号的（`main`、`pm/ci-check`、
+  `wt/ci-setup`）一律跳过；`evidence/<单段名>`（R11 证据分支命名空间）不参与 C-1。
+  **C-1 是全仓枚举、与 `--branch` 无关** —— 因此 CI 只传 `--branch` 也照样拦。
+- **C-2「fork 点不在 main」**：取卡分支上**第一个申报本卡号**的提交，其父提交
+  （fork 点）必须落在本地 `<main-branch>` 或 `origin/<main-branch>` 任一上（本地
+  `main` 可能落后 `origin/main`，只看本地会造假红）；没有父提交（孤立历史）判红；
+  fork 点落在别的卡分支上则点名对方卡号（`（它属于卡 t_xxxxxxxx 的分支）`）。
+  C-2 受 `--branch` 影响。
+- 报告新增段 `分支结构偏差（N 处）`；结论行 `… （提交归属 a 处 / checkout b 处 /
+  分支结构 c 处）`，`分支结构 c 处` 无条件打印（0 也打）。
+
+**爆炸半径**（务必先读再动分支）：C-1 是全仓枚举 —— 任何**一条**含合法卡号却不是
+`wt/<卡号>` 的分支（`wt/t_x-fix`、裸 `t_x`、`x/t_x`、`evidence2/t_x`、rebase 备份
+分支，或本地未 `git fetch origin --prune` 留下的 stale `origin/*` 残留）都会让
+**所有** PR 的 `branch-audit` job 一起变红；而规则 C 不适用豁免表（豁免只对规则 A
+生效，现 0 条），撞上只能删/改分支。本地跑之前先 `git fetch origin --prune`。
+
 退出码：
 
 - `0` —— 无偏差（打印人类可读结论，结尾 `结论：无偏差`）。
@@ -199,7 +223,15 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
   stdout/stderr 编码表示不了中文；stderr 以 `错误: ` 开头、stdout 为空、不冒
   traceback（argparse 级坏参数照旧 rc2）。崩溃绝不会和「发现偏差」同码。
 
-故意造偏差的演示（全部在 `mktemp -d` 里造仓，跑完自动清理，真仓库状态前后一致）：
+故意造偏差的演示（全部在 `mktemp -d` 里造仓，跑完自动清理，真仓库状态前后一致）。
+共 6 个场景，逐条比对退出码与关键文案，任一不符脚本自己 rc1：
+
+- 场景 A —— 卡分支上出现别的卡号的提交（跨卡提交）；
+- 场景 A' —— 卡分支上的提交没写卡号（未声明卡号）；
+- 场景 B —— 主 checkout 停在卡分支 + 卡 worktree 目录名不对（checkout 偏移）；
+- 场景 C —— 同一卡号有第二条分支 `wt/t_xxxxxxxx-fix`（规则 C-1 一卡两分支）；
+- 场景 D —— 从 `wt/t_bbbbbbbb` 拉出 `wt/t_aaaaaaaa`（规则 C-2 fork 点不在 main）；
+- 绿色基线 —— main 干净 + 卡分支干净 + 卡 worktree 目录名 = 卡号。
 
 ```
 bash scripts/demo-branch-audit.sh
