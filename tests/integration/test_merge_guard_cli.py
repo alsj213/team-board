@@ -2197,10 +2197,12 @@ def test_rebase_gate_rejects_stale_branch_rc2(
     assert "git merge-base --is-ancestor rc=1" in err
     assert "合并前必须先 rebase 到 main" in err
     # P2-A（返工卡 t_0a16dc4d）：只说「先 rebase」不够 —— 拒绝文案必须带「谁来做 rebase」的
-    # 短版，否则读者按最省事的做法（在合并卡里用 pm 身份 rebase）补完就被 commit-identity 判红
+    # 短版，否则读者按最省事的做法（在合并卡里用 pm 身份 rebase）补完就被 commit-identity 判红；
+    # 同时不许把「把 main 同步合并进卡分支」当替代方案（实测 merge-accountability 在 PR head 必红）
     assert "setup-bot-identity" in err
-    assert "git merge origin/main" in err
-    assert "判据③" in err
+    assert "commit-identity" in err
+    assert "merge-accountability" in err
+    assert "git merge origin/main" not in err
     # gh 只调过那一次预检：一个 `gh pr merge` 都没发
     assert stub.gh_calls() == [VIEW_CALL]
     assert not any(call.startswith("gh pr merge") for call in stub.gh_calls())
@@ -2299,9 +2301,9 @@ def test_rebase_gate_rejects_malformed_base_ref_name(
 
 
 def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
-    """返工卡 ``t_0a16dc4d`` 的两条 P2：三处文档都要写「谁来做 rebase」，且不许再声称畸形
-    ``baseRefName`` 时「一个 git 调用都不发」—— 闸门之前已经跑过一次 ``ls-remote`` 存在性探针，
-    那句是假声明（实测 git 调用条数 1）。
+    """返工卡 ``t_0a16dc4d`` 的两条 P2：三处文档都要写「谁来做 rebase」+「同步合并提交必红」，
+    且不许再声称畸形 ``baseRefName`` 时「一个 git 调用都不发」—— 闸门之前已经跑过一次
+    ``ls-remote`` 存在性探针，那句是假声明（实测 git 调用条数 1）。
 
     判定权在文档原文，不在实现里：真正的 git 调用顺序由
     :func:`test_rebase_gate_rejects_malformed_base_ref_name` 用假脚本钉住，本用例只防文档回退。
@@ -2318,8 +2320,10 @@ def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
 
     for name, text in places.items():
         assert "setup-bot-identity" in text, name  # 谁来做：作者的 bot 身份 worktree
-        assert "git merge origin/main" in text, name  # 或者 merge main 进分支
+        assert "merge-accountability" in text, name  # 同步合并提交会在 PR head 上必红
         assert "一个 git 调用都不发" not in text, name  # 假声明不许留
+        # 「把 main 同步合并进分支」曾被文档当成替代方案，实测 merge-accountability 必红 → 作废
+        assert "或改用 git merge origin/main" not in text, name
 
 
 def test_rebase_gate_git_subcommand_order_passing(

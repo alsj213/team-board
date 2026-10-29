@@ -59,9 +59,11 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
   一次 ``ls-remote`` 存在性探针，那是合并前的源分支存在闸门，不是本闸门发的）。
 - **谁来做 rebase**（闸门只判「已 rebase 与否」，不做也不建议替你做）：rebase 必须在**这批
   提交作者的 bot 身份 worktree 里**做（``bash scripts/setup-bot-identity.sh <profile>
-  <worktree>``，否则 committer 变成执行者、``commit-audit`` 判「committer 与 author 不一致」）；
-  或改用 ``git merge origin/main`` 把 main 并入分支 —— merge 提交被 ``git log --no-merges``
-  排除，不触 ``commit-identity`` 的 committer≡author 判据（判据③）。
+  <worktree>``），否则 committer 变成执行者、``commit-audit`` 判「committer 与 author 不一致」
+  → ``commit-identity`` 红。**没有第二条路**：卡分支上不许出现没有认账字段的同步合并提交
+  （把 base 同步合并进分支的那种）—— ``merge-audit`` 的 PR 形态（``--rev <head sha>``）把卡分支
+  第一父链上每个合并提交都当「PR 合并提交」要求 ``merged-by`` / ``merge-card`` / ``merge-pr``
+  三字段，同步合并提交没有，``merge-accountability`` 在 PR head 上必红（rc1）。
 - ② 是必需的：预检到合并之间分支被推送时，判的必须是预检看到的那条 sha —— 与
   ``--match-head-commit`` 同一个理由。
 - ③ ``rc=0`` = 已 rebase → ``rebase | PASS``；``rc=1`` = 落后或分叉 → **拒绝**；其它 rc
@@ -1557,9 +1559,9 @@ def rebase_gate(opts: Options, info: Preflight) -> str:
         raise MergeGuardError(
             f"分支 {opts.branch} 落后 {base_text}（{base_text} 不是 head 的祖先，"
             f"git merge-base --is-ancestor rc=1）：合并前必须先 rebase 到 {base_text}"
-            "（在作者的 bot 身份 worktree 里做：bash scripts/setup-bot-identity.sh <profile>"
-            " <worktree>；或改用 git merge origin/main 把 main 并入分支 —— merge 提交被"
-            " git log --no-merges 排除，不触 commit-identity 判据③），拒绝合并"
+            "（必须在作者的 bot 身份 worktree 里做：bash scripts/setup-bot-identity.sh <profile>"
+            " <worktree>，否则 committer≠author 会被 commit-identity 判红；卡分支上不许出现没有"
+            "认账字段的同步合并提交，否则 merge-accountability 必红），拒绝合并"
         )
     if kind == ANCESTOR_ERROR:
         raise MergeGuardError(
