@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from team_board import cli
-from team_board.branches import _parent_count
+from team_board import branches, cli
+from team_board.branches import AuditError, _parent_count
 
 _GIT_ENV = {
     **os.environ,
@@ -205,3 +205,169 @@ def test_parent_count_root_normal_and_merge(repo: Path) -> None:
     git(repo, "merge", "--no-ff", "-m", "Merge branch 'side'", "side")
     merge = git(repo, "rev-parse", "HEAD").strip()
     assert _parent_count(repo, merge) == 2
+
+
+# ============================================================================
+# 返工轮（pm run 178 的 P1 / P2 + 64 层上限兜底）：以下只增不改，上面 6 条原样保留
+# ============================================================================
+
+
+def fork_line(out: str) -> str:
+    """从报告里取出唯一的 C-2 偏差行（全量与 ``--branch`` 逐字比对用）。"""
+
+    lines = [line for line in out.splitlines() if "的第一个提交" in line]
+    assert len(lines) == 1, out
+    return lines[0]
+
+
+# ------------------------------- P1：主分支连续 merge 到 65 层，卡分支仍必须判绿
+
+
+def test_main_with_65_merge_layers_still_green(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """主分支连续 65 层 ``merge --no-ff`` 后从 tip 拉卡分支 → 绿（rc=0）。
+
+    修前这条是 rc=2（「连续 64 层都是 merge 提交」把整次稽核打成环境错误）：
+    R13 规定合并统一走 merge commit，主分支每合一张 PR 就深一层，这是定时炸弹。
+    """
+
+    for index in range(65):
+        git(repo, "checkout", "-q", "-b", f"side-{index}", "main")
+        commit_file(repo, f"side-{index}.txt", f"chore: side {index}")
+        git(repo, "checkout", "-q", "main")
+        git(
+            repo,
+            "merge",
+            "--no-ff",
+            "-m",
+            f"Merge branch 'side-{index}'",
+            f"side-{index}",
+        )
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 第一个卡提交")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert err == ""
+    assert rc == 0, out
+    assert "分支结构偏差（0 处）" in out
+    assert out.rstrip().endswith("结论：无偏差")
+
+
+# --------------------- P2：合进来的是别的卡分支时不许跳（C-2 不得被打穿）
+
+
+def test_merging_other_card_branch_before_first_commit_is_still_red(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卡分支先 ``merge --no-ff`` 别的卡分支再落第一个卡提交 → 全量与 ``--branch`` 都红。
+
+    修前这一跳会把 fork 点一步洗到 main 上（假绿），C-2 这道不可豁免的第二网消失。
+    """
+
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): B 的活")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    git(repo, "merge", "--no-ff", "-m", "Merge branch 'wt/t_bbbbbbbb'", "wt/t_bbbbbbbb")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): A 的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc_full, out_full, err_full = run(["--repo", str(repo)], capsys)
+
+    assert err_full == ""
+    assert rc_full == 1
+    assert "分支结构偏差（1 处）" in out_full
+
+    rc_one, out_one, err_one = run(
+        ["--repo", str(repo), "--branch", "wt/t_aaaaaaaa"], capsys
+    )
+
+    assert err_one == ""
+    assert rc_one == 1
+    assert "分支结构偏差（1 处）" in out_one
+    # 同一事实两种模式同一句文案（归因源已是全仓卡分支）
+    assert fork_line(out_full) == fork_line(out_one)
+
+
+def test_fork_from_other_card_merge_tip_is_still_red_and_named(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """从「别的卡分支 tip（它自己 merge 过 main 的 merge 提交）」拉出 → 仍红且点名。
+
+    非首父是 main 祖先，但跳到首父后落在别的卡的提交上 —— 必须判红并点名它。
+    """
+
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): B 的活")
+    git(repo, "checkout", "-q", "main")
+    commit_file(repo, "m2.txt", "chore: main 前进")
+    git(repo, "checkout", "-q", "wt/t_bbbbbbbb")
+    git(repo, "merge", "--no-ff", "-m", "Merge branch 'main' into wt/t_bbbbbbbb", "main")
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): A 的活")
+    git(repo, "checkout", "-q", "main")
+
+    rc_full, out_full, err_full = run(["--repo", str(repo)], capsys)
+
+    assert err_full == ""
+    assert rc_full == 1
+    assert "分支结构偏差（1 处）" in out_full
+    assert _FROM_CARD in out_full
+
+    rc_one, out_one, err_one = run(
+        ["--repo", str(repo), "--branch", "wt/t_aaaaaaaa"], capsys
+    )
+
+    assert err_one == ""
+    assert rc_one == 1
+    assert _FROM_CARD in out_one
+    assert fork_line(out_full) == fork_line(out_one)
+
+
+# --------------------------------- 64 层上限作为兜底仍必须能测到（AuditError）
+
+
+def test_merge_skip_cap_raises_audit_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """跳过链无限长 → 命中 64 层上限，抛 ``AuditError``（CLI 转 rc2）。
+
+    注：卡面写的是「monkeypatch 让 ``_parents`` 每次都返回 2 个都是 main 祖先的
+    父提交」，但那样循环第一轮就会因为 ``cand = parents[0]`` 本身是 main 祖先而
+    走「先判 main」的出口 break（P1 修好后的正常路径），永远走不到上限。因此这里
+    只 monkeypatch ``_parents``：首父固定成一条**不在 main 上**的真实提交，非首父
+    是 main tip —— 每层都「只是把 main 合进来」但链无限长，正是上限该拦的形状。
+    """
+
+    git(repo, "checkout", "-q", "-b", "wt/t_bbbbbbbb")
+    commit_file(repo, "b.txt", "feat(t_bbbbbbbb): B 的活")
+    off_main = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", "main")
+    # 卡分支先在 main 的旧 tip 上创建，再让 main 前进 —— 否则 `merge main` 是
+    # 「Already up to date」，造不出 merge 提交，循环根本进不去。
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    git(repo, "checkout", "-q", "main")
+    commit_file(repo, "m2.txt", "chore: main 前进")
+    git(repo, "checkout", "-q", "wt/t_aaaaaaaa")
+    git(repo, "merge", "--no-ff", "-m", "Merge branch 'main' into wt/t_aaaaaaaa", "main")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 第一个卡提交")
+    git(repo, "checkout", "-q", "main")
+    main_tip = git(repo, "rev-parse", "refs/heads/main").strip()
+
+    calls: list[str] = []
+
+    def fake_parents(repo_arg: Path | str, sha: str) -> tuple[str, ...]:
+        calls.append(sha)
+        return (off_main, main_tip)
+
+    monkeypatch.setattr(branches, "_parents", fake_parents)
+
+    with pytest.raises(AuditError) as excinfo:
+        branches.audit(repo)
+
+    assert "连续 64 层" in str(excinfo.value)
+    assert len(calls) == 64
+
