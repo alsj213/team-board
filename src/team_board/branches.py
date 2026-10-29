@@ -39,10 +39,12 @@
   都算）即判红。分支名里提取不到卡号的（``main``、``pm/ci-check``、
   ``wt/ci-setup``、``HEAD``）一律跳过。C-1 是**全仓枚举，与 ``--branch`` 无关**。
 - ``fork 点不在 main``（C-2）：只对规则 A 正在稽核的那批卡分支 ref 生效（因此
-  **受 ``--branch`` 影响**）。取 ``<base>..<ref>`` 里第一个提交，其父提交
-  （fork 点）必须落在本地 ``<main_branch>`` 或 ``origin/<main_branch>`` 任一上
-  （本地 ``main`` 可能落后 ``origin/main``，只看本地会造假红）；没有父提交
-  （孤立历史）或只落在别的卡分支上同样判红。
+  **受 ``--branch`` 影响**）。在 ``<base>..<ref>`` 的自有提交（``--no-merges``、
+  时间正序）里取**第一个申报本卡号的提交**（取不到该 ref 即跳过，这些提交由
+  规则 A 判「未声明卡号 / 跨卡提交」），该提交的父提交（fork 点）必须落在本地
+  ``<main_branch>`` 或 ``origin/<main_branch>`` 任一上（本地 ``main`` 可能落后
+  ``origin/main``，只看本地会造假红）；没有父提交（孤立历史）或落在别的卡分支
+  上同样判红，后者会点名属于哪些卡的分支。
 
 退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``，
 含 ``PATH`` 里没有 ``git``、豁免表不是 UTF-8、**git 输出不是 UTF-8**）。
@@ -586,10 +588,15 @@ def _fork_findings(
     base_ref: str,
     refs: list[tuple[str, str]],
 ) -> tuple[ForkPointFinding, ...]:
-    """规则 C-2：卡分支第一个提交的父提交必须落在主分支上。
+    """规则 C-2：卡分支第一个申报本卡号的提交，其父提交必须落在主分支上。
 
     ``refs`` 就是规则 A 正在稽核的 ``[(card, ref), ...]``，因此本规则受
     ``--branch`` 影响。
+
+    取 fork 点的两步（其余全沿用旧逻辑）：先在 ``<base>..<ref>`` 的自有提交
+    （``--no-merges``、时间正序）里找**第一个申报本卡号的提交**；找不到即跳过
+    该 ref（这些提交已被规则 A 判「未声明卡号 / 跨卡提交」）。再取该提交的
+    父提交当 fork 点。
     """
 
     main_refs = [
@@ -604,19 +611,32 @@ def _fork_findings(
     findings: list[ForkPointFinding] = []
     seen: set[tuple[str, str]] = set()
     for card, ref in refs:
-        raw = _must_git(
-            repo,
-            "rev-list",
-            "--reverse",
-            f"{base_ref}..{ref}",
-            what=f"读取提交序列失败（{ref}）",
+        own = _parse_commits(
+            _must_git(
+                repo,
+                "log",
+                "--no-merges",
+                "--reverse",
+                f"--format={_RS}%H{_US}%s",
+                f"{base_ref}..{ref}",
+                what=f"读取提交序列失败（{ref}）",
+            )
         )
-        first = next(
-            (line.strip() for line in raw.splitlines() if line.strip()), ""
-        )
-        if not first:
+        if not own:
             # 该分支没有自有的提交（已并入主分支），不算 fork 点偏差
             continue
+        index = next(
+            (
+                position
+                for position, commit in enumerate(own)
+                if card in _cards_in(commit.subject)
+            ),
+            None,
+        )
+        if index is None:
+            # 这些提交已被规则 A 判「未声明卡号 / 跨卡提交」，C-2 不重复报
+            continue
+        first = own[index].sha
         if (card, first) in seen:
             # 本地与 origin 同名分支会解析出同一个首个提交，只留一条
             continue
@@ -632,25 +652,29 @@ def _fork_findings(
         ):
             continue
 
-        forked_from: tuple[str, ...] = ()
+        claimed: set[str] = set()
+        for commit in own[:index]:
+            if any(
+                _is_ancestor(repo, commit.sha, main_ref) for main_ref in main_refs
+            ):
+                # base 用本地 main 可能落后 origin/main：已在主分支历史上
+                # 的提交不是「别的卡」的提交
+                continue
+            claimed |= _cards_in(commit.subject)
         if fork_point is not None:
-            forked_from = tuple(
-                sorted(
-                    {
-                        other_card
-                        for other_card, other_ref in refs
-                        if other_card != card
-                        and _is_ancestor(repo, fork_point, other_ref)
-                    }
-                )
-            )
+            claimed |= {
+                other_card
+                for other_card, other_ref in refs
+                if other_card != card
+                and _is_ancestor(repo, fork_point, other_ref)
+            }
         findings.append(
             ForkPointFinding(
                 card=card,
                 branch=_strip_ref_prefix(ref),
                 first_commit=first,
                 fork_point=fork_point,
-                forked_from_cards=forked_from,
+                forked_from_cards=tuple(sorted(claimed)),
             )
         )
     return tuple(sorted(findings, key=lambda item: (item.card, item.first_commit)))
@@ -820,7 +844,7 @@ def render_report(report: Report) -> str:
     """把 ``Report`` 渲染成人类可读文本（结尾一行「结论：…」，不含退出码行）。"""
 
     lines: list[str] = [
-        "分支稽核（卡分支提交归属 + checkout 偏移）",
+        "分支稽核（提交归属 + checkout 偏移 + 分支结构）",
         f"仓库: {report.repo}",
         f"主分支: {report.main_branch}",
         "检查的卡分支: "
