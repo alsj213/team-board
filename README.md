@@ -22,8 +22,8 @@ team-board member engineer
 team-board export
 ```
 
-共十个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
-`merge-record` / `commit-audit` / `body-audit` / `serve`（`serve` 见下面「Web 看板」一节，
+共十一个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `serve`（`serve` 见下面「Web 看板」一节，
 `branch-audit` 见「分支稽核」一节，`merge-audit` / `merge-record` 见「合并认账稽核」一节，
 `commit-audit` 见「提交身份稽核」一节）。
 
