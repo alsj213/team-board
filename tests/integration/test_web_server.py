@@ -41,6 +41,7 @@ EXPECTED_SUBCOMMANDS = (
     "branch-audit",
     "merge-audit",
     "commit-audit",
+    "merge-record",
     "serve",
 )
 
