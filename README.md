@@ -22,10 +22,11 @@ team-board member engineer
 team-board export
 ```
 
-共十一个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
-`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `serve`（`serve` 见下面「Web 看板」一节，
-`branch-audit` 见「分支稽核」一节，`merge-audit` / `merge-record` 见「合并认账稽核」一节，
-`commit-audit` 见「提交身份稽核」一节）。
+共十二个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `pr-claim-audit` / `serve`
+（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
+`merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
+`pr-claim-audit` 见「PR 认领唯一性稽核」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -823,6 +824,51 @@ $ echo $?
 
 条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板 +
 实测 719 字节样例）见 [`docs/card-template.md`](docs/card-template.md)。
+
+## PR 认领唯一性稽核（pr-claim-audit）
+
+一张 PR 只许**一张未结卡**认领，否则两张卡各自发 `gh` 写操作，谁在合就说不清了。
+这个子命令把「认领唯一性」做成一条只读闸门（`merge_guard` 合并前直接 import
+同一套纯函数，禁止第二份判定逻辑）。
+
+```
+team-board pr-claim-audit --pr N [--db PATH]
+```
+
+- `--pr N` —— **必填**。ASCII 十进制正整数、上限 999999999；`0` / 负数 / 13 位毫秒
+  （`1793160000000`）/ 空串 / 非 ASCII 数字 / `1_0` / `+34` → rc2。
+- `--db PATH` —— 看板库，默认 `/home/liu/.hermes/kanban/boards/devteam/kanban.db`，
+  以 `mode=ro` 只读打开。
+
+判定口径（逐字照 R17）：
+
+- **认领行** = 卡正文里**顶格**一行 `PR-CLAIM: #<该 PR 号>`；缩进一格、行尾带空格或
+  任何尾随字符（含 CRLF 的 `\r`）、`#0`、`#034` 都不算认领行。
+- **引用行** = 顶格一行 `PR-REF: #<该 PR 号>`，**只回显、不参与判定**；同一张卡既认领
+  又引用时只列 `CLAIM` 一行。
+- 只扫未结卡：`status NOT IN ('done', 'archived')`。已 `done` / `archived` 卡上的认领行
+  不再占位。
+- 一张卡正文里写两行一样的 `PR-CLAIM` 仍算**一张**卡（重复认领按卡数，不按行数）。
+
+输出四段、顺序固定：
+
+```
+未结卡 20 张
+CLAIM t_dd98c031 [running] engineer
+REF t_9f000001 [review] pm
+结论: 认领唯一 → t_dd98c031
+```
+
+末行三种：`结论: 认领唯一 → <卡号>` / `结论: 无未结卡认领该 PR（合并前必须先认领）` /
+`结论: 重复认领 → 只许一张卡对同一 PR 发 gh 写操作，其余改 PR-REF`。
+
+退出码：
+
+- `0` —— 恰好一张未结卡认领该 PR。
+- `1` —— 0 张（无人认领）或 ≥2 张（重复认领）。
+- `2` —— 参数或环境错误（`--pr` 取值非法、`--db` 不存在 / 不是合法 SQLite / 打不开 /
+  读 `tasks` 失败、stdout 编码表示不了中文）；stderr 恰一行以 `错误: ` 开头、stdout
+  为空、不冒 traceback。
 
 ## 通用参数
 

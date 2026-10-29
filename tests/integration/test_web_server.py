@@ -44,11 +44,21 @@ EXPECTED_SUBCOMMANDS = (
     "merge-record",
     "body-audit",
     "push-guard",
+    "pr-claim-audit",
     "serve",
 )
 
 #: 中文数字：README 用汉字写个数（「六个子命令」），断言时由常量长度查表
-CN_DIGITS = {5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十", 11: "十一"}
+CN_DIGITS = {
+    5: "五",
+    6: "六",
+    7: "七",
+    8: "八",
+    9: "九",
+    10: "十",
+    11: "十一",
+    12: "十二",
+}
 
 
 @pytest.fixture()
