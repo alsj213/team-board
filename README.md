@@ -209,7 +209,6 @@ bash scripts/demo-branch-audit.sh
 本机没有这个 checkout（容器 / CI）时用 `TB_REAL_REPO=<别的 checkout>` 指定断言对象，
 都没有就**明确打 skip 提示**而不是假装断言通过。
 
-<<<<<<< HEAD
 ## 合并认账稽核（merge-audit）
 
 事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`Merge-By`）+
@@ -271,13 +270,15 @@ trailer 区），任一条有问题即 rc1。
 ```
 python3 -m team_board.merge_guard \
   --pr <正整数> --branch <PR 的 head 分支名> \
-  --method {merge,squash,rebase} --delete-branch \
+  [--method {merge}=merge] --delete-branch \
   [--repo PATH=. ] [--remote NAME=origin] [--timeout SEC=60] [--interval SEC=2] \
   [--command-timeout SEC=60] [--verify-only]
 ```
 
-- `--pr` / `--branch` / `--method` / `--delete-branch` 四项**必填**。`--method` 不给默认值
-  （合并方式由合并卡决定）；`--delete-branch` 缺了就直接 rc2，且**一个 gh 写操作都不发**，
+- `--pr` / `--branch` / `--delete-branch` 三项**必填**。`--method` **只认 `merge`**，默认值就是
+  `merge`（可省略）；传 `squash` / `rebase` 一律 **rc2**、stdout 空、stderr 一行、**一个 gh
+  调用都不发** —— 合并方式统一定一种（create a merge commit，R13）。`--delete-branch` 缺了就
+  直接 rc2，且**一个 gh 写操作都不发**，
   stderr 固定一行
   `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
 - `--pr` 取值 1–999999999（13 位毫秒这种误用一律 rc2）；`--timeout` / `--interval` /
@@ -319,14 +320,19 @@ python3 -m team_board.merge_guard \
 
 - `0` —— 合并完成且已确认删除（`--verify-only` 时为「远端没有这个 ref」，**不等于**
   「曾经存在并被删」）。
-- `1` —— 未达成：合并失败（gh 非 0 且 PR 状态不是 `MERGED`）、或合并成功但分支仍在、
-  或无法判定。
-- `2` —— 参数或环境错误，含缺 `--delete-branch`。也包含：`--pr` / `--timeout` /
+- `1` —— 未达成：合并失败（gh 非 0 且 PR 状态不是 `MERGED`）、或合并成功但分支仍在；
+  `--verify-only` 时还包括「分支仍在」与「无法判定」（`结论：无法判定（…）`）。合并路径上
+  「判不了」**不是** rc1 而是 rc2（见下条）。
+- `2` —— 参数或环境错误，含缺 `--delete-branch`、`--method` 不是 `merge`（`squash` /
+  `rebase`）。也包含：`--pr` / `--timeout` /
   `--interval` / `--command-timeout` 越界、`--interval > --timeout`、子命令超时、
   **合并前源分支在远端不存在**、`--branch` 是主分支或与 PR 的 `headRefName` 不一致、
   PR 不是 `OPEN`、`PATH` 里没有 `gh` / `git`、gh/git 输出不是 UTF-8、stdout 编码表示
   不了中文，以及**合并已发生但通信持续失败导致判不了**（这一种不算 1：判不了就是未通过，
   `rc2` 一律 stderr 一行 `错误: …`、不冒 traceback，**退出码绝不为 1**）。
+
+**rc2 不保证没发起合并**：合并成功后探针判不了也是 rc2（stderr 会写明合并已完成、请人工
+核对）—— 见到 rc2 先看 stdout 有没有已经打出来的步骤行，别直接把它读成「没合并、可以重跑」。
 
 stdout 只有一处例外：**合并已经发生之后**才出错时（合并后的探针超时、`git` 不可用、
 意外异常、判不了），stdout 仍打印已完成的「分支存在」「预检」「合并」几步 —— 后面的

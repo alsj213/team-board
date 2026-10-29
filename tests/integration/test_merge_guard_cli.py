@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -237,7 +238,7 @@ def test_merge_ok_and_branch_deleted_rc0(
 ) -> None:
     stub.setenv("FAKE_LS_REMOTE_RC", "2")  # 没有这个 ref
 
-    rc, out, err = run(args_for(stub, "--method", "squash"), capsys)
+    rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 0
     assert err == ""
@@ -249,7 +250,7 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[1].startswith(
         "预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName | rc=0 | "
     )
-    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --squash --delete-branch | rc=0 | ")
+    assert lines[2].startswith("合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | ")
     assert lines[3].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
@@ -257,8 +258,59 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
     assert stub.gh_calls() == [
         "gh pr view 9 --json number,state,headRefName,baseRefName",
-        "gh pr merge 9 --squash --delete-branch",
+        "gh pr merge 9 --merge --delete-branch",
     ]
+
+
+# ------------------------------- 3b. --method 只认 merge（R13）：默认值 + 拒绝两值
+
+def test_method_defaults_to_merge_without_flag(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**完全不传 ``--method``**：gh 收到的 argv 里必须是 ``--merge``。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    argv = [
+        "--pr",
+        "9",
+        "--branch",
+        CARD_BRANCH,
+        "--repo",
+        str(stub.repo),
+        "--delete-branch",
+        "--timeout",
+        "1",
+        "--interval",
+        "1",
+    ]
+    assert "--method" not in argv  # 确保真的没传
+
+    rc, out, err = run(argv, capsys)
+
+    assert rc == 0
+    assert err == ""
+    assert "合并 | PASS | gh pr merge 9 --merge --delete-branch | rc=0 | " in out
+    assert stub.gh_calls() == [
+        "gh pr view 9 --json number,state,headRefName,baseRefName",
+        "gh pr merge 9 --merge --delete-branch",
+    ]
+
+
+@pytest.mark.parametrize("method", ["squash", "rebase"])
+def test_squash_and_rebase_rejected_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str], method: str
+) -> None:
+    """R13：squash / rebase 一律 rc2、stdout 空、stderr 恰一行、**零 gh/git 调用**。"""
+
+    rc, out, err = run(args_for(stub, "--method", method), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert err.count("\n") == 1
+    assert method in err  # 说清实际收到的值
+    assert stub.calls() == []  # 连「分支存在」预检都没跑
 
 
 def test_gh_stderr_warning_is_not_a_failure(
@@ -480,8 +532,6 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
             "999999999",
             "--branch",
             CARD_BRANCH,
-            "--method",
-            "rebase",
             "--delete-branch",
             "--repo",
             str(stub.repo),
@@ -494,7 +544,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     )
 
     assert rc == 0
-    assert "gh pr merge 999999999 --rebase --delete-branch" in stub.gh_calls()
+    # 未传 --method → 默认 merge（gh 收到的是 --merge）
+    assert "gh pr merge 999999999 --merge --delete-branch" in stub.gh_calls()
     assert "结论：合并完成" in out
 
 
@@ -719,6 +770,10 @@ def test_help_rc0(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--delete-branch" in captured.out
     assert "--verify-only" in captured.out
     assert "--command-timeout" in captured.out
+    # R13：--method 值域只剩 merge，且默认值要写出来（不再要求调用方必传）
+    assert "--method {merge}" in captured.out
+    assert "默认 merge" in captured.out
+    assert "squash" in captured.out  # 只出现在「一律拒绝」的说明里
     assert captured.err == ""
 
 
@@ -899,3 +954,61 @@ def test_unexpected_exception_before_merge_rc2_stdout_empty(
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
     assert "RuntimeError" in err
+
+
+# --------------------------------- 12. 文档里的命令必须与 CLI 一致（可机器核对）
+
+MERGE_POLICY = Path(__file__).resolve().parents[2] / "docs" / "merge-policy.md"
+
+
+def _documented_merge_commands() -> list[list[str]]:
+    """把 ``docs/merge-policy.md`` 里每行 ``python -m team_board.merge_guard …`` 拆成 argv。
+
+    文档与 CLI 分叉过一次（文档缺 ``--branch`` → 照抄它的合并卡一律 rc2），所以这里
+    不靠人眼对：把文档里的命令原文抠出来直接喂给 ``main()``。
+    """
+
+    argvs: list[list[str]] = []
+    for line in MERGE_POLICY.read_text(encoding="utf-8").splitlines():
+        at = line.find("python -m team_board.merge_guard")
+        if at < 0:
+            continue
+        parts = shlex.split(line[at:].split(";")[0].strip())
+        assert parts[:3] == ["python", "-m", "team_board.merge_guard"], line
+        argvs.append(parts[3:])
+    return argvs
+
+
+def test_documented_commands_carry_required_branch() -> None:
+    """条文 ② 与模板 ⑦ 两条命令都必须带 ``--branch wt/<卡号>``（``--branch`` 必填）。"""
+
+    argvs = _documented_merge_commands()
+
+    assert len(argvs) == 2  # 文档里只有这两条 merge_guard 命令；增删都得跟着改这里
+    for argv in argvs:
+        assert "--branch" in argv, argv
+        assert "wt/<卡号>" in argv, argv
+
+
+def test_documented_command_runs_to_preflight_and_merge(
+    stub: Stub, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """照抄文档那条命令（占位符填掉）→ 跑通到预检并合并，而不是 rc2 于缺参数。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    for index, argv in enumerate(_documented_merge_commands()):
+        # 每次跑都是一个新进程视角：换一份「第几次 git 调用」计数，
+        # 让「分支存在」闸门重新走 FAKE_LS_REMOTE_FIRST_RC=0 那条
+        stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"git-{index}.count"))
+        filled = [arg.replace("<n>", "9").replace("<卡号>", "t_bbeab29f") for arg in argv]
+        rc, out, err = run(
+            [*filled, "--repo", str(stub.repo), "--timeout", "1", "--interval", "1"],
+            capsys,
+        )
+
+        assert rc == 0, (filled, err)
+        assert err == ""
+        assert "分支存在 | PASS | " in out
+        assert "预检 | PASS | " in out
+        assert "gh pr merge 9 --merge --delete-branch" in stub.gh_calls()

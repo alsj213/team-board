@@ -369,6 +369,46 @@ def test_validate_defaults_include_command_timeout() -> None:
     assert (opts.timeout, opts.interval, opts.command_timeout) == (60, 2, 60)
 
 
+def test_methods_only_merge() -> None:
+    """R13：合并方式只此一种，值域里不许留 squash / rebase。"""
+
+    assert mg.METHODS == ("merge",)
+    assert mg.DEFAULT_METHOD == "merge"
+
+
+def test_method_default_is_merge_and_optional() -> None:
+    """不传 ``--method`` 也能解析，取到的就是默认值 merge。"""
+
+    ns = mg.build_parser().parse_args(
+        ["--pr", "9", "--branch", "wt/t_bbeab29f", "--delete-branch"]
+    )
+
+    assert ns.method == mg.DEFAULT_METHOD == "merge"
+    assert mg.validate(ns).method == "merge"
+
+
+@pytest.mark.parametrize("method", ["squash", "rebase"])
+def test_parser_rejects_non_merge_method(method: str) -> None:
+    """argparse 层就拒（``choices``），不是靠后面 validate 兜。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.build_parser().parse_args(
+            ["--pr", "9", "--branch", "wt/t_bbeab29f", "--method", method]
+        )
+
+    assert method in str(excinfo.value)
+    assert "merge" in str(excinfo.value)
+
+
+def test_validate_rejects_forged_method() -> None:
+    """绕过 argparse 直接塞坏值（防御性保留）：validate 仍要拒。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(method="squash"))
+
+    assert "squash" in str(excinfo.value)
+
+
 def test_validate_rejects_interval_greater_than_timeout() -> None:
     with pytest.raises(mg.MergeGuardError) as excinfo:
         mg.validate(_validated_ns(timeout="3", interval="10"))

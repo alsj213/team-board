@@ -15,7 +15,7 @@
 `src/team_board/merge_guard.py`（并行组第 ⑤ 条 `t_40fa5375` 的实现文件），本条只钉它 `--method` 这一维：
 
 ```
-python -m team_board.merge_guard --pr <n> --method merge --delete-branch
+python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch
 ```
 
 `--method` 只允许取 `merge`；`squash` / `rebase` 一律拒绝（该 CLI 落地时按本条写死默认值与合法值域）。
@@ -96,7 +96,7 @@ $ gh pr view <n> -R alsj213/team-board --json headRefName
    B 档另附 R9 夜间五条：CI rc=0 且非 no checks reported / 双问无 P1P2 / nfiles≤10 / 不碰凭据迁移删库且删除≤100 行 / R3 证据齐；夜间自合标 B·night
    C 档（或夜间撞「绝不做」四条）：不合并，标 [night-queue]，写「第 N 条不满足 + 实测输出」
 ⑦ 合并（R13 ②，唯一命令）：
-   有 merge_guard：python -m team_board.merge_guard --pr <n> --method merge --delete-branch; echo rc=$?
+   有 merge_guard：python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch; echo rc=$?
    无 merge_guard（过渡期）：gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
 ⑧ 用的是哪一种（R13 ⑤，判本 PR 的合并提交）：
 $ sha=$(gh pr view <n> -R alsj213/team-board --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid'); echo "sha=$sha"

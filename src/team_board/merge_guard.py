@@ -25,8 +25,12 @@
 「合并失败」。gh 自己的 stderr 警告（如 worktree 里 ``failed to delete local branch``）
 同样不算失败 —— 判定只看远端。
 
-判定器不认识 PR 的「合并方式」（merge / squash / rebase）；本工具要求必传
-``--method`` 但不设默认值，由调用方（合并卡）决定。
+合并方式只认一种
+----------------
+``--method`` 只接受 ``merge``（默认值就是 ``merge``，可省略）。``squash`` / ``rebase``
+一律拒绝：rc2、stdout 空、stderr 一行 ``错误: …``，**一个 gh 调用都不发**。
+依据是 R13（合并方式统一定一种 = create a merge commit，见 ``docs/merge-policy.md``）——
+本工具不再把「用哪种方式」交给调用方决定。
 
 退出码
 ------
@@ -34,7 +38,8 @@
   ref」—— 注意这一档**不能**证明「曾经存在并被删」，它只回答「现在在不在」）。
 - ``1``：未达成 —— gh 合并失败（且 PR 状态不是 ``MERGED``） / 合并成功但源分支仍在
   远端 / ``--verify-only`` 时分支仍在远端或无法判定。
-- ``2``：参数或环境错误：缺 ``--delete-branch``、``--pr`` / ``--timeout`` /
+- ``2``：参数或环境错误：缺 ``--delete-branch``、``--method`` 不是 ``merge``（``squash``
+  / ``rebase`` 一律拒）、``--pr`` / ``--timeout`` /
   ``--interval`` / ``--command-timeout`` 取值越界（``--pr`` 上限 ``MAX_PR``；
   ``--timeout`` / ``--interval`` / ``--command-timeout`` 上限 3600 秒，且
   ``--interval`` 不得大于 ``--timeout``）、``--branch`` 是 ``main`` / ``master``
@@ -63,8 +68,11 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import NoReturn
 
-#: ``gh pr merge`` 接受的三种合并方式（本工具不给默认值，必须由调用方传）
-METHODS: tuple[str, ...] = ("merge", "squash", "rebase")
+#: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
+METHODS: tuple[str, ...] = ("merge",)
+
+#: ``--method`` 的默认值 —— 与 :data:`METHODS` 的唯一取值一致，可省略
+DEFAULT_METHOD = "merge"
 
 #: 永远不许删的主分支名
 MAIN_BRANCHES: frozenset[str] = frozenset({"main", "master"})
@@ -498,9 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--method",
-        required=True,
+        default=DEFAULT_METHOD,
         choices=METHODS,
-        help="合并方式（本工具不设默认值，由合并卡决定）",
+        help=(
+            f"合并方式（只允许 {DEFAULT_METHOD}，默认 {DEFAULT_METHOD}，可省略；"
+            "squash / rebase 一律拒绝）"
+        ),
     )
     parser.add_argument(
         "--delete-branch",
@@ -584,7 +595,8 @@ def validate(args: argparse.Namespace) -> Options:
     method = args.method
     if method not in METHODS:
         raise MergeGuardError(
-            f"--method 只接受 {'/'.join(METHODS)}，实际是 {method!r}"
+            f"--method 只接受 {'/'.join(METHODS)}（R13：合并方式统一定一种），"
+            f"实际是 {method!r}"
         )
     return Options(
         pr=pr,
