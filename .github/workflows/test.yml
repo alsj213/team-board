@@ -171,3 +171,27 @@ jobs:
           BRANCH="${HEAD_REF:-$(git branch --show-current)}"
           bash scripts/ci-commit-identity.sh "$PWD" "$BRANCH" "$AUDIT_REV"
 
+  merge-accountability:
+    name: merge-accountability (合并认账字段)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 为什么要抓全部分支、且不能判 HEAD：
+      # pull_request 事件下 actions/checkout 检出的是 refs/pull/N/merge 这条**合成合并提交**，
+      # 它天然没有认账字段，判 HEAD 会永久假红；所以：
+      #   push 到 main → 判 origin/main（真实合并）
+      #   PR          → 判 github.event.pull_request.head.sha（PR 分支自己的提交，抓演示/违规）
+      - name: Fetch all branches
+        run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      - name: Run merge accountability audit
+        env:
+          PYTHONPATH: src
+          AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
+        run: python -m team_board.cli merge-audit --repo . --rev "$AUDIT_REV"
