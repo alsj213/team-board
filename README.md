@@ -22,8 +22,9 @@ team-board member engineer
 team-board export
 ```
 
-共六个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `serve`
-（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节）。
+共七个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` / `serve`
+（`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，
+`merge-audit` 见「合并认账稽核」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -208,10 +209,59 @@ bash scripts/demo-branch-audit.sh
 本机没有这个 checkout（容器 / CI）时用 `TB_REAL_REPO=<别的 checkout>` 指定断言对象，
 都没有就**明确打 skip 提示**而不是假装断言通过。
 
+## 合并认账稽核（merge-audit）
+
+事后稽核 main 上的**合并提交**有没有写认账三字段 —— 谁按了合并（`Merge-By`）+
+依据哪张卡（`Merge-Card`）+ 合并提交/PR 号（`Merge-PR`）。只读 git，不改分支、
+不碰工作区。三字段写在合并提交 message **末尾的 trailer 块**（每行一条）：
+
+```
+Merge-By: <profile>/run<NNN>       # 例 pm/run137
+Merge-Card: t_[0-9a-f]{8}          # 例 t_ad5e7ff6
+Merge-PR: #<正整数>                 # 例 #1
+```
+
+```
+team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
+                       [--rev REV] [--card CARD] [--require]
+```
+
+- `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
+- `--baseline REV` / `--baseline-file PATH` —— 基线。**判定**的是
+  `<基线>..<rev>` 区间内的合并提交；基线及更早的合并只回显不判定。两者只能给
+  一个（同给 → rc2）。都不给时读默认文件 `<repo>/.team-board/merge-audit-baseline`，
+  **该文件不存在 → rc2（不静默当成「没有基线」）**；内容须是一行 7–40 位小写
+  十六进制 sha（空文件 / 多行 / 非 UTF-8 / 不是 sha 一律 rc2）。
+- `--rev REV` —— 区间终点（默认 `HEAD`）；解析不成提交（含空串）→ rc2。
+- `--card CARD` —— 只列这张卡的合并记录（**同时过滤判定段与历史段**）；形态不是
+  `t_` + 8 位小写十六进制（空串、大写、多字符、缺前缀）→ rc2。它只过滤记录
+  清单，**不隐藏已判出的问题**。
+- `--require` —— 要求 `--card` 指定的卡有认账合并，**必须与 `--card` 同用**
+  （单给 → rc2）：区间内有该卡零问题的合并 → 通过；只有基线之前的合并命中 →
+  rc1 `缺认账字段（历史，基线前）`；两段都没命中 → rc1 `缺认账字段`。
+
+区间内的每条合并提交都走 trailer 解析（缺字段 / 格式非法 / 重复字段 / 字段未落在
+trailer 区），任一条有问题即 rc1。
+
+**历史段口径**：基线之前的合并只回显 PR 号 / 卡号 / sha，`Merge-By` **无法判定**
+（那些提交里没有该字段，也不做历史回填）—— 输出固定写 `by=无法判定`；GitHub
+默认标题认不出卡号的（例如 setup PR 的 `wt/ci-setup`）也保留，卡号位置写 `-`，
+不静默丢条目。
+
+退出码：
+
+- `0` —— 无问题（`--require` 时该卡有零问题的认账合并）。
+- `1` —— 有认账问题（缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区 /
+  `--require` 未满足）。
+- `2` —— 参数或环境错误：仓库路径不存在或不是 git 工作树、基线文件缺失或非法、
+  基线或 `--rev` 解析不成提交、卡号形态非法、`--require` 没带 `--card`、`PATH`
+  里没有 `git`、git 输出不是 UTF-8、stdout/stderr 编码表示不了中文；stderr 以
+  `错误: ` 开头、stdout 为空、不冒 traceback（argparse 级坏参数照旧 rc2）。
+
 ## 通用参数
 
-`list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` 与
-`branch-audit` 各有自己的参数）：
+`list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
+`branch-audit` / `merge-audit` 各有自己的参数）：
 
 - `--db PATH` —— 看板库路径，默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。
@@ -239,7 +289,8 @@ bash scripts/demo-branch-audit.sh
   由 argparse 报错。
 
 `branch-audit` 沿用同一组数字但语义不同：`1` 表示**发现偏差**（不是数据源错误），
-`2` 表示参数或环境错误；详见上面「分支稽核」一节。
+`2` 表示参数或环境错误；详见上面「分支稽核」一节。`merge-audit` 同理：`1` 表示
+**有认账问题**、`2` 表示参数或环境错误；详见上面「合并认账稽核」一节。
 
 ## 口径
 

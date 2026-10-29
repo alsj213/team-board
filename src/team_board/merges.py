@@ -1,8 +1,13 @@
-"""合并认账三字段：解析、校验、生成、渲染（纯逻辑层）。
+"""合并认账三字段：解析、校验、生成、渲染（纯逻辑层）+ 事后稽核取数（``audit``）。
 
-本模块**只做纯函数**：输入是 message 字符串与提交元数据，输出是 ``Problem`` /
-``MergeRecord`` / ``MergeReport`` 与待提交的 message 文本。不调 git、不做文件 IO、
-不读看板库 —— 取数（``git log``）在 ``merge-audit`` 子命令里另做，本模块被它调用。
+本模块的 ``parse_trailers`` / ``record_from_commit`` / ``legacy_record`` /
+``check_message`` / ``build_message`` / ``render_report`` 是**纯函数**：输入是
+message 字符串与提交元数据，输出是 ``Problem`` / ``MergeRecord`` /
+``MergeReport`` 与待提交的 message 文本，不调 git、不做文件 IO。
+
+唯一的取数入口是 :func:`audit`：它调 ``git log`` 扫合并提交、读基线文件，
+再把结果交给上面那些纯函数判定。git 调用层（``_git``）在本模块自写一份，
+**不 import ``team_board.branches``** —— 两个子命令各自封装，谁也不牵连谁。
 
 三字段写在合并提交 message 的**末尾 trailer 块**（每行一条，键名大小写敏感）：
 
@@ -27,12 +32,26 @@
 6. ``build_message`` 参数先校验，非法抛 ``MergeAuditError``（CLI 转 rc2）。
 7. ``legacy_record`` 认 GitHub 默认合并标题，``by`` 一律 ``None`` —— 单账号只记
    ``alsj213``，作者/账号都推不出「谁按了合并」，绝不猜。
+8. ``audit`` 只对 ``<baseline>..<rev>`` 区间内的合并提交走 ``record_from_commit``
+   （判定段）；``<baseline>`` 及其更早的合并另走 ``legacy_record``（历史段），
+   **只回显不判定** —— 历史提交无法回填 trailer，拿 trailer 路径去判它们会让
+   整段假红。历史段里 ``legacy_record`` 认不出的（``Merge branch ...``）也保留，
+   记成 ``card=None`` 的记录，不许静默丢条目。
+9. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
+   merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
+   小写十六进制 → ``MergeAuditError``（**不静默当成「没有基线」**）。
 """
 
 from __future__ import annotations
 
+import os
 import re
+
+# bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git），
+# 调用形式为 argv 列表、shell=False，不拼 shell 字符串
+import subprocess  # nosec B404
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 #: ``Merge-By`` 取值：``<profile>/run<正整数>``，profile 为小写字母开头的短名
 MERGE_BY_RE = re.compile(r"^[a-z][a-z0-9-]*/run[0-9]+$")
@@ -61,6 +80,34 @@ KIND_DUPLICATE = "重复字段"
 KIND_NOT_TRAILER = "字段未落在 trailer 区"
 KIND_MISMATCH = "字段与参数不一致"
 KIND_NOT_MERGE = "不是合并提交"
+
+#: ``audit(require=True)`` 追加的两类「该卡没有可认账的合并」问题
+KIND_MISSING_HISTORY = "缺认账字段（历史，基线前）"
+KIND_NO_MERGE = "缺认账字段"
+
+#: 历史段命中的解释：基线之前的合并无法回填认账字段
+DETAIL_MISSING_HISTORY = (
+    "基线之前的合并无法回填认账字段；卡面只能写 PR/卡号/sha，Merge-By 无法判定"
+)
+
+#: 两段都没命中（区间内没有该卡的合并，历史里也没有）
+DETAIL_NO_MERGE = "历史与区间内都没有该卡的合并提交"
+
+#: 基线文件默认路径（相对仓库根）：``<repo>/.team-board/merge-audit-baseline``
+DEFAULT_BASELINE_FILE = Path(".team-board") / "merge-audit-baseline"
+
+#: 基线文件内容：7–40 位小写十六进制 sha（与 ``branches.SHA_RE`` 同口径）
+BASELINE_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+#: ``git log`` 条目 / 字段分隔符（``--format`` 里用 ``%x1e`` ``%x1f`` 打出来）
+_RS = "\x1e"
+_US = "\x1f"
+
+#: 判定段：sha / parents / subject / message 全文（``maxsplit`` 兜住 message 里的 ``\x1f``）
+_JUDGE_FORMAT = "%x1e%H%x1f%P%x1f%s%x1f%B"
+
+#: 历史段：只要 sha 与 subject（历史段不调 ``record_from_commit``，不取 message）
+_HISTORY_FORMAT = "%x1e%H%x1f%s"
 
 _FORMAT_BY_KEY = {
     "Merge-By": MERGE_BY_RE,
@@ -348,6 +395,259 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
         f"Merge-By: {by}\n"
         f"Merge-Card: {card}\n"
         f"Merge-PR: #{pr}\n"
+    )
+
+
+def _git(repo: str | os.PathLike[str], *args: str) -> subprocess.CompletedProcess[str]:
+    """在 ``repo`` 里跑 git，不抛 ``CalledProcessError``，退出码交给调用方判。
+
+    两类环境级错误一律 ``MergeAuditError``（CLI 转 rc2），不许冒 traceback：
+
+    - ``PATH`` 里没有 ``git``（``FileNotFoundError``）或其它 ``OSError``；
+    - git 输出**不是 UTF-8**：``i18n.logOutputEncoding=GBK`` 下 ``git log``
+      会把提交标题转码输出，``core.quotePath=false`` 下非 UTF-8 提交信息原样
+      出字节，``subprocess`` 的严格解码于是抛 ``UnicodeDecodeError``（``ValueError``
+      系，不是 ``OSError``，会直接逃出去）。rc1 是「有问题」的专用码，崩溃必须
+      与它分开 —— 解码失败说明整轮稽核没法进行，属环境错误。
+
+    解码固定 UTF-8（不随 ``locale`` 漂移），同一仓库在任何机器上得到同样的 rc。
+    """
+
+    try:
+        # bandit B603/B607 假阳性：可执行文件名写死为 "git"（走 PATH 以跨平台一致）；
+        # 参数以 argv 列表传入、shell=False（默认），仓库路径/rev 只作为独立 argv
+        # 元素，不经 shell 解释，无注入面
+        return subprocess.run(  # nosec B603 B607
+            ["git", "-C", os.fspath(repo), *args],
+            capture_output=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise MergeAuditError(
+            "找不到 git 可执行文件（PATH 里没有 git），无法做合并认账稽核"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise MergeAuditError(
+            f"git 输出不是 UTF-8，无法解析（第 {exc.start} 字节起解码失败；"
+            "常见原因：仓库配置 i18n.logOutputEncoding=GBK 或 "
+            "core.quotePath=false 且提交信息含非 UTF-8 字节；"
+            "可执行 git config --unset i18n.logOutputEncoding 后重试）"
+        ) from exc
+    except OSError as exc:
+        raise MergeAuditError(f"无法执行 git: {exc}") from exc
+
+
+def _git_ok(repo: str | os.PathLike[str], *args: str, what: str) -> str:
+    """跑 git，非 0 退出即 ``MergeAuditError``（环境级错误）。"""
+
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = detail[-1] if detail else f"退出码 {proc.returncode}"
+        raise MergeAuditError(f"{what}: {tail}")
+    return proc.stdout
+
+
+def _resolve_repo(repo: str | Path) -> Path:
+    """校验仓库路径并解析成工作树根（空串 / 不存在 / 不是目录 / 不是工作树 → 报错）。"""
+
+    if not isinstance(repo, (str, Path)):
+        raise MergeAuditError(f"仓库路径非法：{repo!r}（应为 str 或 Path）")
+    raw = os.fspath(repo)
+    if not raw.strip():
+        raise MergeAuditError("仓库路径为空，无法稽核")
+    path = Path(raw)
+    if not path.exists():
+        raise MergeAuditError(f"仓库路径不存在：{raw}")
+    if not path.is_dir():
+        raise MergeAuditError(f"仓库路径不是目录：{raw}")
+    toplevel = _git_ok(path, "rev-parse", "--show-toplevel", what=f"不是 git 工作树：{raw}")
+    return Path(toplevel.strip())
+
+
+def _resolve_commit(repo: str | Path, value: str, what: str) -> str:
+    """把 ``value`` 解析成 40 位提交 sha；解析不了（含空串）即 ``MergeAuditError``。"""
+
+    if not isinstance(value, str):
+        raise MergeAuditError(f"{what}非法：{value!r}（应为 str）")
+    proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}")
+    if proc.returncode != 0:
+        raise MergeAuditError(f"{what}无法解析为提交：{value!r}")
+    return proc.stdout.strip()
+
+
+def _read_baseline_file(path: Path) -> str:
+    """读基线文件并校验形态；不存在 / 非 UTF-8 / 空 / 多行 / 格式非法一律报错。
+
+    **不静默**：文件不存在不许当成「没有基线」—— 那会让一条本该红的稽核变绿。
+    """
+
+    if not path.exists():
+        raise MergeAuditError(
+            f"基线文件不存在：{path}（用 --baseline 指定基线提交，"
+            "或先按 CI 的方式写入该文件）"
+        )
+    if not path.is_file():
+        raise MergeAuditError(f"基线文件不是普通文件：{path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise MergeAuditError(
+            f"基线文件 {path} 不是 UTF-8 文本（第 {exc.start} 字节起解码失败）"
+        ) from exc
+    except OSError as exc:  # 权限、路径失效等
+        raise MergeAuditError(f"无法读取基线文件 {path}: {exc}") from exc
+
+    value = text.strip()
+    if not value:
+        raise MergeAuditError(f"基线文件 {path} 是空文件（基线必填，不静默放过）")
+    if "\n" in value or "\r" in value:
+        raise MergeAuditError(f"基线文件 {path} 含多行内容，只允许一行 sha")
+    if BASELINE_SHA_RE.fullmatch(value) is None:
+        raise MergeAuditError(
+            f"基线文件 {path} 的内容不是 7–40 位小写十六进制 sha：{value!r}"
+        )
+    return value
+
+
+def _log_entries(text: str, fields: int, what: str) -> list[list[str]]:
+    """把 ``git log --format`` 输出切成条目（``\\x1e`` 分条、``\\x1f`` 分字段）。"""
+
+    entries: list[list[str]] = []
+    for chunk in text.split(_RS):
+        if not chunk.strip():
+            continue
+        parts = chunk.split(_US, fields - 1)
+        if len(parts) != fields:
+            raise MergeAuditError(
+                f"{what}：git log 输出格式不符（期望 {fields} 段，实际 {len(parts)} 段）"
+            )
+        entries.append(parts)
+    return entries
+
+
+def audit(
+    repo: str | Path = ".",
+    *,
+    baseline: str | None = None,
+    baseline_file: str | Path | None = None,
+    rev: str = "HEAD",
+    only_card: str | None = None,
+    require: bool = False,
+) -> MergeReport:
+    """稽核 ``<baseline>..<rev>`` 区间内合并提交的认账三字段。
+
+    判定段（区间内）走 :func:`record_from_commit`，逐条出 ``Problem``；
+    历史段（``<baseline>`` 及更早）只走 :func:`legacy_record` 回显，**不判定**。
+
+    参数/环境级错误一律抛 :class:`MergeAuditError`（CLI 转 rc2），检查顺序：
+    仓库 → ``baseline``/``baseline_file`` 互斥 → ``only_card`` 形态 →
+    ``require`` 依赖 → 基线取值与解析 → ``rev`` 解析。
+
+    ``only_card`` 只过滤两段的**记录清单**，不吞掉已判出的问题（有问题的合并
+    即使不属于该卡也照样红）。``require=True`` 时：区间内有该卡零问题的
+    ``source="trailer"`` 记录 → 通过；只有历史段命中 → 追加
+    ``缺认账字段（历史，基线前）``；两段都没命中 → 追加 ``缺认账字段``。
+    """
+
+    root = _resolve_repo(repo)
+
+    if baseline is not None and baseline_file is not None:
+        raise MergeAuditError("--baseline 与 --baseline-file 只能给一个（基线来源必须唯一）")
+    if only_card is not None and (
+        not isinstance(only_card, str) or MERGE_CARD_RE.fullmatch(only_card) is None
+    ):
+        raise MergeAuditError(f"卡号非法：{only_card!r}（应形如 t_1234abcd）")
+    if require and only_card is None:
+        raise MergeAuditError(
+            "--require 必须与 --card 同用（要判定「某张卡有没有认账合并」）"
+        )
+
+    if baseline is None:
+        source = (
+            Path(baseline_file)
+            if baseline_file is not None
+            else root / DEFAULT_BASELINE_FILE
+        )
+        baseline = _read_baseline_file(source)
+    baseline_sha = _resolve_commit(root, baseline, "基线")
+    rev_sha = _resolve_commit(root, rev, "区间终点")
+
+    judged: list[MergeRecord] = []
+    problems: list[Problem] = []
+    judged_text = _git_ok(
+        root,
+        "log",
+        "--merges",
+        f"--format={_JUDGE_FORMAT}",
+        f"{baseline_sha}..{rev_sha}",
+        what="无法读取区间内的合并提交",
+    )
+    for sha, parents_raw, subject, message in _log_entries(judged_text, 4, "判定段"):
+        # parents 必须由 "%P" 的字符串 split 出来：传裸 40 字符字符串会被当成
+        # 40 个单字符父提交，单父提交就会被静默当成合并提交收下
+        record, record_problems = record_from_commit(
+            sha, subject, tuple(parents_raw.split()), message
+        )
+        judged.append(record)
+        problems.extend(record_problems)
+
+    history: list[MergeRecord] = []
+    history_text = _git_ok(
+        root,
+        "log",
+        "--merges",
+        f"--format={_HISTORY_FORMAT}",
+        baseline_sha,
+        what="无法读取基线之前的合并提交",
+    )
+    for sha, subject in _log_entries(history_text, 2, "历史段"):
+        legacy = legacy_record(sha, subject)
+        if legacy is None:
+            # 认不出的历史合并（如 "Merge branch ..."）也要保留，历史段必须完整
+            legacy = MergeRecord(
+                sha=sha,
+                subject=subject,
+                parents=(),
+                by=None,
+                card=None,
+                pr=None,
+                source="legacy",
+            )
+        history.append(legacy)
+
+    if only_card is not None:
+        judged = [record for record in judged if record.card == only_card]
+        history = [record for record in history if record.card == only_card]
+
+    if require:
+        bad_shas = {problem.sha for problem in problems}
+        clean_trailer = [
+            record
+            for record in judged
+            if record.source == "trailer" and record.sha not in bad_shas
+        ]
+        if not clean_trailer:
+            if history:
+                problems.append(
+                    Problem(
+                        KIND_MISSING_HISTORY,
+                        history[0].sha,
+                        DETAIL_MISSING_HISTORY,
+                    )
+                )
+            else:
+                problems.append(Problem(KIND_NO_MERGE, "", DETAIL_NO_MERGE))
+
+    return MergeReport(
+        repo=str(root),
+        baseline=baseline_sha,
+        rev=rev_sha,
+        records=tuple(judged),
+        problems=tuple(problems),
+        history=tuple(history),
     )
 
 

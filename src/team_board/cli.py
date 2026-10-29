@@ -13,6 +13,14 @@
   ``git``、豁免表不是 UTF-8 文本、git 输出不是 UTF-8（``i18n.logOutputEncoding``
   设成 GBK、``core.quotePath=false`` + 非 UTF-8 文件名）、stdout/stderr 编码
   表示不了中文（``PYTHONIOENCODING=ascii``）
+
+``merge-audit`` 子命令沿用同一组数字但语义是「认账问题」：
+- 0：区间内合并提交都有认账三字段（``--require`` 时该卡有零问题的合并）
+- 1：发现问题（缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区 /
+  ``--require`` 只有历史命中或两段都没命中）
+- 2：参数或环境错误（``merges.MergeAuditError`` → stderr ``错误: …``、stdout 空；
+  含仓库不是工作树、基线文件不存在 / 非 UTF-8 / 空 / 多行、``PATH`` 里没有
+  ``git``、git 输出不是 UTF-8、stdout 编码表示不了中文）
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import sys
 import time
 from datetime import date, datetime
 
-from . import branches, commands, db, web
+from . import branches, commands, db, merges, web
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -95,10 +103,16 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**五个**子命令。
+    """建 CLI 前端：prog=team-board，共**七个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
+    - ``branch-audit``：稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 /
+      2 参数或环境错误），吃 ``--repo`` / ``--main-branch`` / ``--branch`` /
+      ``--allow-file``；
+    - ``merge-audit``：稽核合并提交的认账三字段（0 无问题 / 1 有问题 / 2 参数或
+      环境错误），吃 ``--repo`` / ``--baseline`` / ``--baseline-file`` / ``--rev`` /
+      ``--card`` / ``--require``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -166,6 +180,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="豁免表路径（默认 <repo>/.team-board/branch-audit-allow.txt）",
+    )
+
+    merge_cmd = subparsers.add_parser(
+        "merge-audit",
+        help="稽核合并提交的认账三字段（0 无问题 / 1 有问题 / 2 参数或环境错误）",
+    )
+    merge_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要稽核的 git 仓库路径（默认当前目录）",
+    )
+    merge_cmd.add_argument(
+        "--baseline",
+        default=None,
+        metavar="REV",
+        help="基线提交（判定 <基线>..<rev> 区间；与 --baseline-file 只能给一个）",
+    )
+    merge_cmd.add_argument(
+        "--baseline-file",
+        default=None,
+        metavar="PATH",
+        help="基线文件路径（默认 <repo>/.team-board/merge-audit-baseline）",
+    )
+    merge_cmd.add_argument(
+        "--rev",
+        default="HEAD",
+        metavar="REV",
+        help="区间终点（默认 HEAD）",
+    )
+    merge_cmd.add_argument(
+        "--card",
+        default=None,
+        metavar="CARD",
+        help="只列这张卡的合并记录（同时过滤判定段与历史段）",
+    )
+    merge_cmd.add_argument(
+        "--require",
+        action="store_true",
+        help="要求 --card 指定的卡有认账合并（必须与 --card 同用）",
     )
 
     serve = subparsers.add_parser(
@@ -293,12 +347,51 @@ def _run_branch_audit(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _run_merge_audit(args: argparse.Namespace) -> int:
+    """``merge-audit`` 子命令：MergeAuditError → stderr ``错误: …`` + rc2，不冒 traceback。
+
+    报告整块生成后再一次性写出：stdout 编码表示不了中文（如
+    ``PYTHONIOENCODING=ascii``）属于环境级错误 → rc2、stderr ``错误: …``，
+    不许退化成 rc1 + traceback（rc1 是「有问题」的专用码）。
+    """
+
+    try:
+        report = merges.audit(
+            args.repo,
+            baseline=args.baseline,
+            baseline_file=args.baseline_file,
+            rev=args.rev,
+            only_card=args.card,
+            require=args.require,
+        )
+    except merges.MergeAuditError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    text = merges.render_report(report)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # TextIOWrapper 先整体编码再写出：编码失败时 stdout 里一个字节都没落
+        _write_stderr_error(
+            "当前 stdout 编码 "
+            f"{getattr(sys.stdout, 'encoding', None)!r} 无法表示稽核报告里的中文，"
+            "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
+        )
+        return 2
+    return 0 if report.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.command == "branch-audit":
         return _run_branch_audit(args)
+
+    if args.command == "merge-audit":
+        return _run_merge_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)
