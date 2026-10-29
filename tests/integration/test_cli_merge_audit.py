@@ -15,6 +15,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,27 @@ def run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, 
     rc = cli.main(["merge-audit", *args])
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
+
+
+def non_repo_dir(tmp_path: Path) -> Path:
+    """一个确定「不在任何 git 仓库里」的目录（``tmp_path`` 可能整个落在某个仓库里）。"""
+
+    for root in (tmp_path, Path(tempfile.gettempdir()), Path("/tmp")):
+        try:
+            candidate = root / "t_11ef8cf3-nr"
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:  # 该 root 不可写 / 不存在
+            continue
+        proc = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return candidate
+    raise AssertionError("找不到不在任何 git 仓库里的目录，无法验证「非仓库 → 报错」")
 
 
 # --------------------------------------------------- 判定段：绿（三字段齐全）
@@ -910,6 +932,29 @@ def test_rc2_when_git_missing(
     assert err.startswith("错误: ")
     assert "git" in err
     assert "Traceback" not in err
+
+
+def test_rc2_when_inherited_git_dir_points_to_another_repo(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``GIT_DIR`` 指向别处 + ``--repo`` 指向非仓库 → rc2、stdout 空、无 traceback。
+
+    修前：``git -C <非仓库> rev-parse --show-toplevel`` 因继承 ``GIT_DIR`` 而成功，
+    报头写 ``--repo``，实际审的是 ``GIT_DIR`` 那个仓 → rc0 假绿（卡 t_11ef8cf3）。
+    """
+
+    not_a_repo = non_repo_dir(tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+
+    rc, out, err = run(["--repo", str(not_a_repo), "--baseline", head(repo)], capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.startswith("错误: 不是 git 工作树")
+    assert str(not_a_repo) in err
+    assert "Traceback" not in err
+    assert len(err.strip().splitlines()) == 1
 
 
 def test_rc2_when_git_output_not_utf8(repo: Path, capsys: pytest.CaptureFixture[str]) -> None:

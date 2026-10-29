@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -571,4 +574,164 @@ def test_render_report_multi_then_forks_numbering_is_continuous() -> None:
     assert "分支结构偏差（2 处）:" in text
     assert "  1. 卡 t_aaaaaaaa 有第二条分支" in text
     assert "  2. 分支 wt/t_dddddddd 的第一个提交 ddddddd 没有父提交" in text
+
+
+# ------------------------------ git 调用层的环境隔离（继承来的 GIT_DIR 不许劫持）
+#
+# 本文件其余部分不碰真 git；这一节是例外，且必须造真仓库：只有真 git 才验得出
+# 「``git -C <path>`` 只切目录、不隔离 ``GIT_DIR``」。期望值来自卡 t_11ef8cf3：
+# ``--repo`` 指向非仓库目录时必须报错（CLI 转 rc2），而不是去审 ``GIT_DIR`` 指的
+# 那个仓库、报头却写 ``--repo`` 并给出假绿。
+
+#: 会被子进程继承、把 git 指向别处的定位类变量。造仓库时一并剔掉：否则宿主自己
+#: 带着 GIT_DIR 跑 pytest 时，fixture 仓库也会被造到别处去。
+_LOCATION_ENV_KEYS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+
+
+def _clean_env() -> dict[str, str]:
+    """造测试仓库用的环境：剔掉 git 定位类变量，固定作者/提交者。"""
+
+    env = {
+        key: value for key, value in os.environ.items() if key not in _LOCATION_ENV_KEYS
+    }
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "branches-env-test",
+            "GIT_AUTHOR_EMAIL": "branches-env@example.com",
+            "GIT_COMMITTER_NAME": "branches-env-test",
+            "GIT_COMMITTER_EMAIL": "branches-env@example.com",
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+    )
+    return env
+
+
+def _real_git(repo: Path, *args: str) -> str:
+    """在 ``repo`` 里跑 git，失败即测试失败。"""
+
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        env=_clean_env(),
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _make_repo(path: Path) -> Path:
+    """造一个 ``main`` 上有一条提交的真仓库，返回路径。"""
+
+    path.mkdir(parents=True, exist_ok=True)
+    _real_git(path, "init", "-q", "-b", "main")
+    (path / "README.md").write_text("hello\n", encoding="utf-8")
+    _real_git(path, "add", "-A")
+    _real_git(path, "commit", "-q", "-m", "chore: init")
+    return path
+
+
+def _non_repo_dir(tmp_path: Path) -> Path:
+    """一个确定「不在任何 git 仓库里」的目录。
+
+    ``tmp_path`` 可能整个落在某个仓库里（本机 ``/home/liu`` 就是个人仓），那样
+    ``rev-parse --show-toplevel`` 会成功，用例根本测不到「非仓库 → 报错」这一支。
+    所以这里用 git 自己探一次，落在仓库里就退到系统临时目录再探。
+    """
+
+    for root in (tmp_path, Path(tempfile.gettempdir()), Path("/tmp")):
+        try:
+            candidate = root / "t_11ef8cf3-nr"
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:  # 该 root 不可写 / 不存在
+            continue
+        proc = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            env=_clean_env(),
+            check=False,
+        )
+        if proc.returncode != 0:
+            return candidate
+    raise AssertionError("找不到不在任何 git 仓库里的目录，无法验证「非仓库 → 报错」")
+
+
+def test_git_dir_pointing_elsewhere_cannot_make_non_repo_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """用例 B：``GIT_DIR`` 指向真仓库 + ``--repo`` 指向非仓库 → ``AuditError``。"""
+
+    other = _make_repo(tmp_path / "other")
+    not_a_repo = _non_repo_dir(tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+
+    with pytest.raises(branches.AuditError) as excinfo:
+        branches.audit(repo=not_a_repo)
+
+    message = str(excinfo.value)
+    assert "不是 git 工作树" in message
+    assert str(not_a_repo) in message
+
+
+def test_git_work_tree_pointing_elsewhere_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GIT_WORK_TREE`` 同样不许生效（与 ``GIT_DIR`` 成对设置才是完整劫持）。"""
+
+    other = _make_repo(tmp_path / "other")
+    not_a_repo = _non_repo_dir(tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    with pytest.raises(branches.AuditError):
+        branches.audit(repo=not_a_repo)
+
+
+def test_git_dir_cannot_supply_branches_from_another_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """真仓对真仓：``GIT_DIR`` 指向 B 时，不许把 B 的卡分支算进 A 的稽核结果。
+
+    修前 ``for-each-ref`` 会去读 B 的 refs —— 报头写 A，偏差来自 B。
+    """
+
+    target = _make_repo(tmp_path / "target")
+    other = _make_repo(tmp_path / "other")
+    _real_git(other, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    (other / "w.txt").write_text("x\n", encoding="utf-8")
+    _real_git(other, "add", "-A")
+    _real_git(other, "commit", "-q", "-m", "feat: t_bbbbbbbb 的活跑到 aaaaaaaa 分支")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+
+    report = branches.audit(repo=target)
+
+    assert Path(report.repo).resolve() == target.resolve()
+    assert report.checked_branches == ()
+    assert report.ok
+
+
+def test_clean_env_still_audits_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """用例 C/D：不设 ``GIT_DIR``、``PATH`` 正常时照常跑通（env 没把 PATH 抹掉）。"""
+
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.delenv("GIT_DIR", raising=False)
+
+    report = branches.audit(repo=repo)
+
+    assert Path(report.repo).resolve() == repo.resolve()
+    assert report.ok
 
