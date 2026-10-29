@@ -74,10 +74,16 @@ jobs:
         run: |
           ALLOW_FILE="$RUNNER_TEMP/pr-src/.team-board/branch-audit-allow.txt"
           if [ -n "$HEAD_REF" ]; then
+            # PR：规则 A（提交归属）+ 规则 B（checkout 偏移）全量 —— 不许减少检查项
             python -m team_board.cli branch-audit --branch "$HEAD_REF" \
               --allow-file "$ALLOW_FILE"
           else
-            python -m team_board.cli branch-audit --allow-file "$ALLOW_FILE"
+            # push 到 main：只跑规则 B（checkout 偏移）。走 CLI 既有契约：指定的分支存在
+            # 但不是卡分支 →「… 不是卡分支，跳过提交归属检查」，只做 checkout 检查
+            # （README 164–168 行；集成测试 test_branch_main_is_not_a_card_branch）。
+            # 老板 2026-10-29 原话「总之就是合入主分支前必须 ci 检验」；决策卡 t_6fab0d6e
+            # 选第 3 条：证据分支 wt/t_589cc33a 需长期存在，push 扫全部分支必然天天红。
+            python -m team_board.cli branch-audit --branch main --allow-file "$ALLOW_FILE"
           fi
 
   ruff:
