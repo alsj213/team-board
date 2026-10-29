@@ -19,7 +19,9 @@
    此时若块内也没有该键，**不再**报 ``缺字段``（否则同一件事报两次）。
 3. 同一键在块内出现多次 → ``重复字段``，值取最后一条。
 4. ``record_from_commit`` 在 ``parents`` 少于 2 时追加 ``不是合并提交``（不抛异常）；
-   其余按 1–3 判定，三键齐且格式合法即零问题、``source="trailer"``。
+   其余按 1–3 判定，三键齐且格式合法即零问题、``source="trailer"``。它返回的
+   每一条 ``Problem.sha`` 都是入参 ``sha``（结构类问题也改写，不是 ``""``）；
+   ``parse_trailers`` 无提交上下文，仍按 ``""`` 报。
 5. ``check_message`` 判 message 本身（不判 ``parents``），传参且与 message 里的值
    不一致时追加 ``字段与参数不一致``；传参自身的格式由调用方先判，这里不重复判。
 6. ``build_message`` 参数先校验，非法抛 ``MergeAuditError``（CLI 转 rc2）。
@@ -30,7 +32,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 #: ``Merge-By`` 取值：``<profile>/run<正整数>``，profile 为小写字母开头的短名
 MERGE_BY_RE = re.compile(r"^[a-z][a-z0-9-]*/run[0-9]+$")
@@ -218,6 +220,11 @@ def record_from_commit(
     ``parents`` 少于 2 时追加一条 ``不是合并提交``；``source`` 恒为 ``"trailer"``
     —— 本函数走的是「提交 message 里有/该有认账块」这条路，legacy 标题另由
     :func:`legacy_record` 判。
+
+    ``_scan_message`` 出来的结构类问题（``重复字段`` / ``字段未落在 trailer 区``）
+    本身不带提交上下文，``sha`` 是其构造时的 ``""``；这里统一改写成入参 ``sha``，
+    否则渲染出来这一行会是以 ``-`` 开头的「候选 message」口径，
+    与同一次调用里「缺字段 / 格式非法」带真 sha 的两种口径并存。
     """
 
     scan = _scan_message(message)
@@ -226,7 +233,7 @@ def record_from_commit(
         problems.append(
             Problem(KIND_NOT_MERGE, sha, f"parents={len(parents)}，合并提交应至少 2 个父提交")
         )
-    problems.extend(scan.problems)
+    problems.extend(replace(problem, sha=sha) for problem in scan.problems)
     values, field_problems = _fields(scan, sha)
     problems.extend(field_problems)
 
@@ -243,10 +250,17 @@ def record_from_commit(
 
 
 def legacy_record(sha: str, subject: str) -> MergeRecord | None:
-    """GitHub 默认合并标题 → legacy 记录（``by=None``，绝不猜执行者）。"""
+    """GitHub 默认合并标题 → legacy 记录（``by=None``，绝不猜执行者）。
+
+    PR 号 < 1（``#0``）返回 ``None``：trailer 路径的 ``MERGE_PR_RE`` 要求
+    ``#[1-9][0-9]*``，两条口径必须一致。
+    """
 
     match = LEGACY_SUBJECT_RE.match(subject)
     if match is None:
+        return None
+    raw_pr = match.group("pr")
+    if int(raw_pr) < 1:
         return None
     return MergeRecord(
         sha=sha,
@@ -254,7 +268,7 @@ def legacy_record(sha: str, subject: str) -> MergeRecord | None:
         parents=(),
         by=None,
         card=match.group("card"),
-        pr="#" + match.group("pr"),
+        pr="#" + raw_pr,
         source="legacy",
     )
 
@@ -295,16 +309,39 @@ def check_message(
 
 
 def build_message(*, card: str, by: str, pr: int, subject: str | None = None) -> str:
-    """生成带认账块的合并提交 message（恰好三段：标题 / 空行 / 三行 trailer）。"""
+    """生成带认账块的合并提交 message（恰好三段：标题 / 空行 / 三行 trailer）。
 
-    if MERGE_CARD_RE.match(card) is None:
+    参数先校验，非法一律抛 :class:`MergeAuditError`（CLI 转 rc2），不把原生
+    ``TypeError`` / ``AttributeError`` 漏给调用方。类型与形态分开判：非 ``str``
+    先挡（``None`` / ``int`` 直接进正则会抛 ``TypeError``），再用 ``fullmatch``
+    判形态 —— ``re.match`` + ``$`` 会放过结尾多一个 ``\\n`` 的值，生成出来的
+    message 再喂 :func:`check_message` 就报「字段未落在 trailer 区」，闭环断掉。
+
+    ``subject`` 去首尾空白后为空同样抛错：那样第一行是空行，git 的 ``%s`` 会把
+    ``Merge-By:`` 当提交标题。``subject=None`` 走契约默认标题。
+    """
+
+    if not isinstance(card, str):
+        raise MergeAuditError(f"卡号非法：{card!r}（应为 str，形如 t_1234abcd）")
+    if MERGE_CARD_RE.fullmatch(card) is None:
         raise MergeAuditError(f"卡号非法：{card!r}（应形如 t_1234abcd）")
-    if MERGE_BY_RE.match(by) is None:
+    if not isinstance(by, str):
+        raise MergeAuditError(f"执行者标识非法：{by!r}（应为 str，形如 pm/run137）")
+    if MERGE_BY_RE.fullmatch(by) is None:
         raise MergeAuditError(f"执行者标识非法：{by!r}（应形如 pm/run137）")
     if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
         raise MergeAuditError(f"PR 号非法：{pr!r}（应为正整数）")
 
-    title = subject if subject is not None else f"Merge PR #{pr}（{card}）"
+    if subject is None:
+        title = f"Merge PR #{pr}（{card}）"
+    elif not isinstance(subject, str):
+        raise MergeAuditError(f"提交标题非法：{subject!r}（应为 str 或 None）")
+    elif not subject.strip():
+        raise MergeAuditError(
+            f"提交标题非法：{subject!r}（去首尾空白后为空，git 会把 Merge-By 行当标题）"
+        )
+    else:
+        title = subject
     return (
         f"{title}\n"
         "\n"

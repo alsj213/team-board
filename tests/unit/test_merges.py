@@ -369,3 +369,146 @@ class TestRenderReport:
     def test_ok_property(self):
         assert self._report((), ()).ok is True
         assert self._report((), (Problem(KIND_MISSING, "", "-"),)).ok is False
+
+
+#: 同一键在 trailer 块里出现两次（结构类问题：重复字段）
+DUP_MESSAGE = (
+    "Merge PR #15（t_c9f5866a）\n"
+    "\n"
+    "Merge-By: pm/run1\n"
+    "Merge-Card: t_c9f5866a\n"
+    "Merge-PR: #15\n"
+    "Merge-By: pm/run2\n"
+)
+
+#: 键写在正文里、末尾块里没有（结构类问题：字段未落在 trailer 区）
+MISPLACED_MESSAGE = (
+    "Merge-Card: t_c9f5866a\n"
+    "正文第二行\n"
+    "\n"
+    "Merge-By: pm/run1\n"
+    "Merge-PR: #15\n"
+)
+
+STRUCTURAL_CASES = pytest.mark.parametrize(
+    ("message", "kind"),
+    [(DUP_MESSAGE, KIND_DUPLICATE), (MISPLACED_MESSAGE, KIND_NOT_TRAILER)],
+    ids=["重复字段", "字段未落在 trailer 区"],
+)
+
+
+class TestRecordFromCommitCarriesSha:
+    """F1：``record_from_commit`` 的结构类问题必须带提交 sha，不能是 ``""``。"""
+
+    @STRUCTURAL_CASES
+    def test_every_problem_carries_the_commit_sha(self, message, kind):
+        _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
+        assert [problem.kind for problem in problems] == [kind]
+        # 每一条都是入参 sha —— 不是只有「缺字段 / 格式非法」那两条路才带
+        assert [problem.sha for problem in problems] == [SHA]
+
+    @STRUCTURAL_CASES
+    def test_render_report_line_starts_with_short_sha_not_dash(self, message, kind):
+        record, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), message)
+        text = render_report(
+            MergeReport(
+                repo="/repo/team-board",
+                baseline="origin/main",
+                rev="HEAD",
+                records=(record,),
+                problems=problems,
+                history=(),
+            )
+        )
+        lines = [line for line in text.split("\n") if kind in line]
+        assert len(lines) == 1
+        assert lines[0].startswith(f"  1. {SHA[:7]} ")
+        assert f"  1. - {kind}" not in text
+
+    @STRUCTURAL_CASES
+    def test_parse_trailers_keeps_empty_sha_for_candidate_message(self, message, kind):
+        # 对照：候选 message 没有提交上下文，口径仍是 ""
+        _, problems = parse_trailers(message)
+        assert [problem.kind for problem in problems] == [kind]
+        assert [problem.sha for problem in problems] == [""]
+
+
+class TestBuildMessageParameterValidation:
+    """F2：三参数非法一律 ``MergeAuditError``（不漏 ``TypeError``、不放过尾随换行）。"""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"card": None, "by": BY, "pr": 15},
+            {"card": CARD, "by": 123, "pr": 15},
+            {"card": CARD, "by": BY, "pr": "15"},
+            {"card": CARD, "by": BY, "pr": 0},
+            {"card": CARD, "by": BY, "pr": -1},
+            {"card": CARD + "\n", "by": BY, "pr": 15},
+            {"card": CARD, "by": BY + "\n", "pr": 15},
+        ],
+        ids=[
+            "card=None",
+            "by=int",
+            "pr=str",
+            "pr=0",
+            "pr=-1",
+            "card 尾随换行",
+            "by 尾随换行",
+        ],
+    )
+    def test_illegal_arguments_raise_merge_audit_error(self, kwargs):
+        with pytest.raises(MergeAuditError):
+            build_message(**kwargs)
+
+    def test_trailing_newline_never_yields_a_message_that_fails_check(self):
+        # 修前：放行尾随换行 → build 出的 message 喂 check_message 报 2 条「字段未落在 trailer 区」
+        with pytest.raises(MergeAuditError):
+            message = build_message(card=CARD + "\n", by=BY, pr=15)
+            assert check_message(message) == ()  # 若能产出，也必须闭环为零问题
+
+
+class TestBuildMessageSubject:
+    """F3：``subject`` 去首尾空白后为空 → 抛错；``None`` 走契约默认标题。"""
+
+    @pytest.mark.parametrize(
+        "subject",
+        ["", "   ", "\n", "\t \n "],
+        ids=["empty", "spaces", "newline", "mixed"],
+    )
+    def test_blank_subject_raises(self, subject):
+        with pytest.raises(MergeAuditError):
+            build_message(card=CARD, by=BY, pr=15, subject=subject)
+
+    def test_none_subject_uses_contract_default_title(self):
+        message = build_message(card=CARD, by=BY, pr=15, subject=None)
+        assert message.splitlines()[0] == f"Merge PR #15（{CARD}）"
+        assert message.split("\n\n")[0] == f"Merge PR #15（{CARD}）"
+
+    def test_explicit_subject_is_kept_verbatim(self):
+        message = build_message(card=CARD, by=BY, pr=15, subject="Merge PR #15")
+        assert message.splitlines()[0] == "Merge PR #15"
+
+
+class TestLegacyRecordZeroPr:
+    """F4：``#0`` 与 trailer 路径的 ``MERGE_PR_RE`` 口径对齐。"""
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            "Merge pull request #0 from alsj213/wt/t_c9f5866a",
+            "Merge pull request #00 from alsj213/wt/t_c9f5866a",
+        ],
+        ids=["#0", "#00"],
+    )
+    def test_non_positive_pr_returns_none(self, subject):
+        assert legacy_record(SHA, subject) is None
+
+    def test_normal_pr_keeps_contract_unchanged(self):
+        record = legacy_record(SHA, "Merge pull request #15 from alsj213/wt/t_c9f5866a")
+        assert record is not None
+        assert record.pr == "#15"
+        assert record.by is None
+        assert record.parents == ()
+        assert record.card == "t_c9f5866a"
+        assert record.source == "legacy"
