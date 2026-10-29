@@ -42,17 +42,21 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
    ``alsj213``，作者/账号都推不出「谁按了合并」，绝不猜。
 8. ``audit`` 只对 ``<baseline>..<rev>`` 区间内的合并提交走 ``record_from_commit``
    （判定段）；``<baseline>`` 及其更早的合并另走 ``legacy_record``（历史段），
-   **只回显不判定** —— 历史提交无法回填 trailer，拿 trailer 路径去判它们会让
-   整段假红。历史段里 ``legacy_record`` 认不出的（``Merge branch ...``）也保留，
-   记成 ``card=None`` 的记录，不许静默丢条目。
+   **只回显不判定** —— 历史提交无法回填 trailer，拿 trailer 路径去判它们会让整段
+   假红。两段都只取 **first-parent 链上**的提交（起点见第 9 条）。历史段里
+   ``legacy_record`` 认不出的（``Merge branch ...``）也保留，记成 ``card=None``
+   的记录，**链上不许静默丢条目**（链外的合并不进历史段，是第 9 条的判定对象口径
+   决定的，不是「静默丢弃」）。
 9. **判定对象 = first-parent 链上的合并提交**（两段取数都带 ``--first-parent``）。
    真正的认账事件只有一种：**把卡分支合进 main** 的那个合并提交 —— 它在 main 的
-   first-parent 链上。**在被审 ``rev`` 落在 main 线上时**，分支侧 ``git merge
-   origin/main`` 产生的同步合并（把 main 并回卡分支）落在 second-parent 链上，
-   它既不合任何 PR、也本来就不该有 ``merge-card`` / ``merge-pr``，于是既不进
-   records / problems，也不进历史段。
-   但**这不等于「同步合并一律免判」**：判什么只取决于**被审 ``rev`` 的 first-parent
-   链**，不取决于某条提交是不是同步合并。``--rev`` 给的是**卡分支尖端**时，该分支
+   first-parent 链上。两段各自沿**自己的起点**取数：判定段沿被审 ``rev`` 的
+   first-parent 链，历史段沿 ``baseline`` 的 first-parent 链（含 baseline 自身）。
+   分支侧 ``git merge origin/main`` 产生的同步合并（把 main 并回卡分支）落到哪一段，
+   只取决于**起点落在哪条线上**：被审 ``rev`` 在 main 线上时它落在 second-parent
+   侧、两段都不进；``baseline`` 给成卡分支侧提交时，它反而会作为历史段的条目出现
+   （那是卡分支视角，仍按第 8 条「不丢条目」保留）。
+   两种情形都**不等于「同步合并一律免判」**：判什么只取决于起点自己的 first-parent
+   链，不取决于某条提交是不是同步合并。``--rev`` 给的是**卡分支尖端**时，该分支
    自己的同步合并正落在它自己的 first-parent 链上，照旧被判（缺三字段即 rc1）——
    这正是 CI ``pull_request`` 事件（``--rev`` = ``head.sha``）的现状。
    不加 ``--all-merges`` 之类的反向开关 —— 判定对象是口径，不是可选项。
@@ -701,9 +705,11 @@ def audit(
 
     判定段（区间内、**first-parent 链上**）走 :func:`record_from_commit`，逐条出 ``Problem``；
     历史段（``<baseline>`` 及更早，同样只取 first-parent 链）只走
-    :func:`legacy_record` 回显，**不判定**。两段都只沿**被审 ``rev`` / ``baseline``
-    自己的 first-parent 链**取数：``rev`` 落在 main 线上时，分支侧「把 main 同步回
-    卡分支」的内部合并落在 second-parent 侧、两段都不进；``rev`` 给的是卡分支尖端
+    :func:`legacy_record` 回显，**不判定**。两段各自沿**自己的起点**取数：判定段沿
+    被审 ``rev`` 的 first-parent 链，历史段沿 ``baseline`` 的 first-parent 链。于是
+    「分支侧把 main 同步回卡分支」的内部合并落到哪一段，只取决于起点在哪条线上 ——
+    ``rev`` 在 main 线上时它落在 second-parent 侧、两段都不进；``baseline`` 给成卡
+    分支侧提交时它会作为历史段条目出现（卡分支视角）；而 ``rev`` 给的是卡分支尖端
     时，该分支自己的同步合并就在它自己的 first-parent 链上，照旧**被判**（这不是
     豁免口径，CI ``pull_request`` 事件即如此）。
 

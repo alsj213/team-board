@@ -350,7 +350,9 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
 
 - `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
 - `--baseline REV` / `--baseline-file PATH` —— 基线。**判定**的是
-  `<基线>..<rev>` 区间内的合并提交；基线及更早的合并只回显不判定。两者只能给
+  `<基线>..<rev>` 区间内的合并提交；基线及更早的合并只回显不判定。**两段都只取
+  first-parent 链上的合并**（判定段沿 `rev`、历史段沿 `baseline`，历史段含基线自身）——
+  细则见 `docs/merge-accountability.md` 甲层。两者只能给
   一个（同给 → rc2）。都不给时读默认文件 `<repo>/.team-board/merge-audit-baseline`，
   **该文件不存在 → rc2（不静默当成「没有基线」）**；内容须是一行 7–40 位小写
   十六进制 sha（空文件 / 多行 / 非 UTF-8 / 不是 sha 一律 rc2）。
@@ -365,8 +367,10 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
   （单给 → rc2）：区间内有该卡零问题的合并 → 通过；只有基线之前的合并命中 →
   rc1 `缺认账字段（历史，基线前）`；两段都没命中 → rc1 `缺认账字段`。
 
-区间内的每条合并提交都走 trailer 解析（缺字段 / 格式非法 / 重复字段 / 字段未落在
-trailer 区），任一条有问题即 rc1。
+区间内、**first-parent 链上**的每条合并提交都走 trailer 解析（缺字段 / 格式非法 /
+重复字段 / 字段未落在 trailer 区），任一条有问题即 rc1。落在 second-parent 侧的合并
+（分支侧把 main 同步回卡分支）不在链上、不判 —— 但 `--rev` 给卡分支尖端时，该分支
+自己的同步合并就在链上，照旧判（与 CI `pull_request` 事件同口径）。
 
 **判据①（`merged-by` == 该卡 assignee）**：给了 `--card` 时，`merged-by` 值里
 `/` 之前的 profile 必须**严格等于**该卡在看板库里的 `tasks.assignee`（只读
@@ -383,10 +387,11 @@ trailer 区），任一条有问题即 rc1。
 合法 SQLite / 没有 `tasks` 表 / 卡不存在 / 卡没有 assignee 一律 rc2（**不静默
 跳过判据**）。
 
-**历史段口径**：基线之前的合并只回显 PR 号 / 卡号 / sha，`merged-by` **无法判定**
+**历史段口径**：基线及其更早（同一条 first-parent 链上）的合并只回显 PR 号 / 卡号 / sha，
+`merged-by` **无法判定**
 （那些提交里没有该字段，也不做历史回填）—— 输出固定写 `by=无法判定`；GitHub
 默认标题认不出卡号的（例如 setup PR 的 `wt/ci-setup`）也保留，卡号位置写 `-`，
-不静默丢条目。
+链上不静默丢条目（链外的合并不进历史段，见上面 first-parent 口径）。
 
 退出码：
 
