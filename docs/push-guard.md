@@ -48,10 +48,22 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 - `0` —— 放行（stdout 恰一行；`--check-install` 时表示钩子已装好）；
 - `1` —— 拦下（stdout 空，stderr 每处一行以 `拒绝：` 开头）；
 - `2` —— 参数或环境错误（`--repo` 不存在 / 不是工作树、`--main-branch` 为空或该
-  分支不存在、stdin 每行字段数 ≠ 4、stdin 为空、编码失败）；stderr 一行 `错误: …`。
+  分支不存在、stdin 每行字段数 ≠ 4、stdin 为空、编码失败、stdout 写不进去）；
+  stderr 一行 `错误: …`。
+
+  两种「写 stdout 出问题」**分得很开**，别混：管道断开（`BrokenPipeError` / `EPIPE`）
+  ＝没人要输出了，判定码照旧（本来 rc0 仍 0）；而 `ENOSPC` / `EIO` 这类非 EPIPE 的
+  `OSError` ＝输出**真的丢了** → rc2（stderr `错误: stdout 写不进去（errno=…）`）。
+  合并成一个宽 catch 会把「判定结果没打印出来」吞成 rc0，钩子那边就成了假的放行。
 
 钩子层（`git push` 看到的那一层）—— **只有 `0` / `1` 两个码**，而且这条是**设计保证**
 （钩子不落临时文件、自己判 stdin），不是「按理说只有」：
+
+**例外（一个）**：**调用方把钩子的 fd1 关掉**（例如 `git push >&-`）时钩子拿不到可写的
+stdout，`exec 3>&1` 直接失败 —— 实测（2026-10-30）dash **rc=2**（只吐一句
+`1: Bad file descriptor` 即退，没有任何人话）、bash **rc=1**（吐 `3: Bad file descriptor`
+后继续跑到判定红那档，还打了两行提示）。这是调用方用法的问题，不是钩子自己的判定：
+正常 `git push` 一定有 stdout，`0` / `1` 的保证只在这个前提下成立。
 
 | 情形 | push-guard rc | 钩子 rc | 钩子说什么 |
 | --- | --- | --- | --- |
@@ -69,8 +81,10 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 [pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红
 ```
 
-worktree 落点统一写 `/home/liu/project/tb-wt/`（本机现存约定：26 个 worktree 里 20 个
-在这个前缀下），push-guard 的 P-2 文案与钩子提示用的是同一个前缀。
+worktree 落点统一写 `/home/liu/project/tb-wt/`（本机现存约定：**多数** worktree 落在这个
+前缀下；准确条数现数现取，别写死在文档里 ——
+`git worktree list | awk '{print $1}' | grep -c '^/home/liu/project/tb-wt/'`），
+push-guard 的 P-2 文案与钩子提示用的是同一个前缀。
 
 ## 怎么装、怎么自查
 

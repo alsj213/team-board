@@ -33,6 +33,14 @@
   「判定红」，还补了 ``--no-verify`` 绕过提示；现在环境错误单独一套文案；
 - l) 缺 ``push-guard`` 子命令（版本偏斜，argparse ``invalid choice``）：同样归环境错误，
   且**不把 argparse usage 原样泄给用户**。
+
+用例 m 是合并后收口卡 ``t_fc31145f`` 补的：下游提前关管道（``git push … | head -1``）时
+``cli._write_stdout`` 抛 ``BrokenPipeError`` → stderr 出 traceback → 钩子判「跑不起来」
+fail-closed，把**合法**推送挡掉。现在「输出没人要」不算错误，判定码照旧。
+
+用例 n 是同一张卡 round 2 打回后补的：调用方在 exec 之前就把 fd1 关掉（``1>&-``）时
+``sys.stdout`` 是 ``None``（不是「写的时候 EPIPE」），旧版在这一支抛 ``AttributeError``，
+同样是 traceback → fail-closed。现在连流都没有 → 判定码照旧。
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -421,4 +430,108 @@ def test_l_missing_push_guard_subcommand_is_env_error(tmp_path: Path) -> None:
     assert "usage:" not in proc.stderr
     assert "invalid choice" not in proc.stderr
     assert "--no-verify" not in proc.stderr
+
+
+# ------------------------------------- 下游关管道（收口 t_fc31145f，用例 m）
+
+def run_hook_with_closed_stdout(cwd: Path, stdin_text: str) -> subprocess.CompletedProcess[str]:
+    """跑真钩子，但把它的 **stdout 接到「读端已关」的管道**（等价 `git push … | head -1`）。
+
+    读端在起进程之前就关掉：钩子/``push-guard`` 往 stdout 写任何东西都是 EPIPE。
+    所以这个用例只可能因为「写 stdout 失败」而失败 —— 判定路径本身是放行。
+    """
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        return subprocess.run(
+            ["/bin/sh", str(_HOOK)],
+            cwd=str(cwd),
+            input=stdin_text,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_ENV,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+
+
+def test_m_closed_stdout_pipe_is_not_a_failure(tmp_path: Path, repo: Path) -> None:
+    """m) 下游提前关管道 → stdout 写不出去，不许被判成 fail-closed（合法推送被拦）。
+
+    旧版 ``cli._write_stdout`` 只 catch ``UnicodeEncodeError``：``BrokenPipeError``
+    一路冒到 ``main`` 外面，stderr 出 ``Traceback (most recent call last)``，而钩子
+    正是按这行文本判「跑不起来」→ fail-closed 拦下**合法**推送。现在「输出没人要」
+    不算错误：判定结果照旧（放行 rc0）。
+    """
+
+    worktree = tmp_path / "t_deadbeef"
+    must_git(repo, "worktree", "add", "-q", "-b", "wt/t_deadbeef", str(worktree), "main")
+
+    allowed = run_hook_with_closed_stdout(worktree, ref_line("refs/heads/wt/t_deadbeef"))
+
+    assert allowed.returncode == 0, allowed.stderr
+    assert "Traceback" not in allowed.stderr
+    assert "fail-closed" not in allowed.stderr
+    assert allowed.stderr == ""
+
+    # 判定红那档同样不受影响：rc 仍是 1、人话照旧（stdout 本来就没东西可写）。
+    blocked = run_hook_with_closed_stdout(worktree, ref_line("refs/heads/main"))
+
+    assert blocked.returncode == 1, blocked.stderr
+    assert "拒绝：不允许直接 push 到 main" in blocked.stderr
+    assert "Traceback" not in blocked.stderr
+
+
+# ------------------------------------- 调用方 exec 时关掉 fd1（收口 t_fc31145f，用例 n）
+
+
+def run_push_guard_with_fd1_closed(
+    cwd: Path, stdin_text: str
+) -> subprocess.CompletedProcess[str]:
+    """真跑 ``python -m team_board.cli push-guard``，但在 exec **之前**关掉 fd 1。
+
+    与 m 的区别：m 是「管道读端没了」（写的时候 EPIPE），这里是「fd1 根本不存在」
+    （``git push >&-`` 一类调用方，或 hook 在 fd1 已关的 shell 里被拉起）。后者的
+    表现是 CPython 起解释器时把 ``sys.stdout`` 设成 ``None``，不是写的时候才炸。
+    """
+
+    env = {**_ENV, "PYTHONPATH": str(_SRC)}
+    return subprocess.run(
+        [sys.executable, "-m", "team_board.cli", "push-guard", "--repo", str(cwd)],
+        cwd=str(cwd),
+        input=stdin_text,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+        preexec_fn=lambda: os.close(1),
+    )
+
+
+def test_n_fd1_closed_is_not_a_failure(tmp_path: Path, repo: Path) -> None:
+    """n) 调用方关掉 fd1（``1>&-``）→ ``sys.stdout is None``，不许抛也没 traceback。
+
+    旧版 ``cli._write_stdout`` 直接 ``sys.stdout.write(...)``：``None`` 上取 ``write``
+    抛 ``AttributeError``，stderr 出 ``Traceback``，钩子判「跑不起来」fail-closed。
+    ``1>&-`` 下 stdout 本来就没人要，判定结果照旧（放行 rc0、stderr 空）。
+    """
+
+    worktree = tmp_path / "t_deadbeef"
+    must_git(repo, "worktree", "add", "-q", "-b", "wt/t_deadbeef", str(worktree), "main")
+
+    allowed = run_push_guard_with_fd1_closed(worktree, ref_line("refs/heads/wt/t_deadbeef"))
+
+    assert allowed.returncode == 0, allowed.stderr
+    assert allowed.stderr == ""
+    assert "Traceback" not in allowed.stderr
+
+    # 判定红档：rc 仍是 1、人话仍走 stderr（fd2 没被碰）。
+    blocked = run_push_guard_with_fd1_closed(worktree, ref_line("refs/heads/main"))
+
+    assert blocked.returncode == 1, blocked.stderr
+    assert "拒绝：不允许直接 push 到 main" in blocked.stderr
+    assert "Traceback" not in blocked.stderr
 

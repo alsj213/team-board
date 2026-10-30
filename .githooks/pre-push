@@ -16,6 +16,8 @@
 #      直接失效，零传输的 push 被误拦）。
 #   3. **钩子层退出码只有 0 / 1** —— 环境错误（push-guard rc2）也是 1，但**单独一套
 #      文案**，不打 worktree add / `--no-verify` 两行：误火时把绕过口子递给用户是错的。
+#      （唯一例外：调用方关掉本钩子 fd1 —— `git push >&-` —— 时 dash rc=2 / bash rc=1，
+#       见 .githooks/README.md「三档文案」那节。）
 #
 # 起因：私有仓免费计划下开不了分支保护（`gh api repos/<owner>/<repo>/branches/main/protection`
 # → 403 Upgrade to GitHub Pro），护栏只能放在客户端。判定权仍在 CI 的
