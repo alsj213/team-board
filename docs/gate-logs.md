@@ -19,6 +19,18 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 
 `--` 之后为空 → rc2（`错误: 缺少要执行的命令（-- 之后至少一个）`）。
 
+### 前置：在含 `gate` 的 checkout 里跑，解释器写绝对路径
+
+两个前置条件，缺一条样例都跑不通：
+
+1. **`gate` 子命令得在那个 checkout 里**。合入 `main` 之前（2026-10-31 CST 时 `main` 上还是
+   `invalid choice: 'gate'`，rc=2），只有 `gate` 实现卡 `t_eaa81611` 的 worktree
+   `/home/liu/project/tb-wt/t_eaa81611` 有它；合入后任何 checkout 都行。
+2. **解释器写绝对路径**。卡 worktree 根目录**没有** `.venv`（`/home/liu/project/tb-wt/t_*` 下一律没有），
+   所以下面外层跑 `gate` 与 `--` 之后跑检查器，都用
+   `/home/liu/project/team-board/.venv/bin/python`。照抄 `.venv/bin/python` 会得到
+   `No such file or directory`、rc=127（2026-10-31 实测）。
+
 ### 三个可复制样例（pytest / ruff / mypy）
 
 把 `t_facc5c45` 换成自己的卡号即可原样执行。下面是 2026-10-31 CST 的本机实跑原文，
@@ -27,7 +39,8 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 通过的 `pytest`：
 
 ```
-$ PYTHONPATH=src .venv/bin/python -m team_board.cli gate --gate pytest --card t_facc5c45 -- .venv/bin/python -m pytest tests/unit/test_gatelog.py -q
+$ cd /home/liu/project/tb-wt/t_eaa81611
+$ PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python -m team_board.cli gate --gate pytest --card t_facc5c45 -- /home/liu/project/team-board/.venv/bin/python -m pytest tests/unit/test_gatelog.py -q
 gate: pytest
 card: t_facc5c45
 exit: 0
@@ -35,14 +48,14 @@ counts: passed=49 failed=0 error=0 skipped=0
 失败行（0/0，≤20）:
 末尾行（2/2，≤20）:
   .................................................                        [100%]
-  49 passed in 0.07s
+  49 passed in 7.39s
 log: /home/liu/project/tb-wt/t_eaa81611/evidence/pytest-t_facc5c45.log
 ```
 
 通过的 `ruff`（没有 pytest 风格计数行 → `counts: 未解析`，其余照常）：
 
 ```
-$ PYTHONPATH=src .venv/bin/python -m team_board.cli gate --gate ruff --card t_facc5c45 -- .venv/bin/python -m ruff check src tests
+$ PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python -m team_board.cli gate --gate ruff --card t_facc5c45 -- /home/liu/project/team-board/.venv/bin/python -m ruff check src tests
 gate: ruff
 card: t_facc5c45
 exit: 0
@@ -56,7 +69,7 @@ log: /home/liu/project/tb-wt/t_eaa81611/evidence/ruff-t_facc5c45.log
 通过的 `mypy`：
 
 ```
-$ PYTHONPATH=src .venv/bin/python -m team_board.cli gate --gate mypy --card t_facc5c45 -- .venv/bin/python -m mypy src
+$ PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python -m team_board.cli gate --gate mypy --card t_facc5c45 -- /home/liu/project/team-board/.venv/bin/python -m mypy src
 gate: mypy
 card: t_facc5c45
 exit: 0
@@ -147,7 +160,9 @@ log: <日志文件的绝对路径>
 2. 要更多行就贴路径 + `sed -n '<a>,<b>p' <日志>` 取段，而不是把全文搬进上下文；
 3. 摘要里的 `exit:` / `counts:` 就是可直接复述给验收方的判定值（R3 要的退出码 + 命令原文）；
 4. 单条评论 / `tasks.result` 的 UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
-   全文贴法一超就违规（`output-audit` 判 rc1）。
+   全文贴法一超就违规。判这一条的 `output-audit` 子命令**尚未落地**（已排卡 `t_e3d410c8`，
+   2026-10-31 CST 时 `-m team_board.cli output-audit --help` 仍是 `invalid choice` rc=2），
+   上线前先按本仓库「工作方式 · 文件即上下文」第 3 条自查同一个上限。
 
 ## 5. 边界
 
@@ -162,8 +177,11 @@ log: <日志文件的绝对路径>
 
 ## 6. 本机实跑记录
 
-2026-10-31 01:17–01:20 CST，worktree `/home/liu/project/tb-wt/t_eaa81611`（分支
-`wt/t_eaa81611`，含 `gate` 子命令），Python `.venv/bin/python`（3.14.7）：
+2026-10-31 01:17–01:20 CST 首轮实跑、01:33 CST 用同一绝对路径解释器复核全表；
+worktree `/home/liu/project/tb-wt/t_eaa81611`（分支
+`wt/t_eaa81611`，含 `gate` 子命令）；解释器为绝对路径
+`/home/liu/project/team-board/.venv/bin/python`（3.14.7）—— **该 worktree 根目录没有 `.venv`**，
+所以外层 `gate` 与 `--` 之后的检查器用的是同一个绝对路径解释器：
 
 | 场景 | 命令里的 `--gate` | rc |
 | --- | --- | --- |
