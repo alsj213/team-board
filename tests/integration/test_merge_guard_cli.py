@@ -59,6 +59,12 @@ def merge_call(
     )
 
 
+def mark_body(sha: str, kind: str) -> str:
+    """一条带结构化双问标记的评审正文（``REVIEW-HEAD`` + ``REVIEW-KIND``，顶格）。"""
+
+    return f"REVIEW-HEAD: {sha}\nREVIEW-KIND: {kind}\n"
+
+
 def rebase_call(stub: Stub) -> str:
     """rebase 闸门的判定命令原文（私有 ref 命名空间 ``refs/merge-guard/<pr>/*``）。"""
 
@@ -77,8 +83,43 @@ def rebase_line(stub: Stub) -> str:
     )
 
 
+#: 双问绑定闸门的两条只读调用（顺序固定：``reviews`` 先、``comments`` 后）
+API_CALLS = [
+    "gh api repos/alsj213/team-board/pulls/9/reviews --paginate",
+    "gh api repos/alsj213/team-board/issues/9/comments --paginate",
+]
+
+
+def claim_line(stub: Stub) -> str:
+    """认领唯一性闸门通过时的那一行证据（判据是本地只读库 + 纯函数，没有外部命令）。"""
+
+    return (
+        f"认领唯一性 | PASS | prclaim.audit(看板库 {stub.board_db}（未结卡，mode=ro）, pr=#9)"
+        f" | rc=0 | 认领唯一 → {MERGE_CARD}（与 --card 逐字一致）"
+    )
+
+
+def review_line(stub: Stub) -> str:
+    """双问绑定闸门通过时的那一行证据（默认 fixture：两个端点各一条标记）。"""
+
+    return (
+        f"双问绑定 | PASS | {API_CALLS[0]} + {API_CALLS[1]} | rc=0 | "
+        f"head {HEAD_OID[:12]} 上 defect + regression 各 >=1 条"
+        "（扫描正文 2 条、带标记 2 条）"
+    )
+
+
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+if [ "$1" = "api" ]; then
+  # 双问绑定闸门只发两条 GET（pulls/<n>/reviews + issues/<n>/comments）——按端点分开给
+  case "$2" in
+    */pulls/*/reviews) printf '%s' "$FAKE_REVIEWS_JSON" ;;
+    */issues/*/comments) printf '%s' "$FAKE_COMMENTS_JSON" ;;
+    *) printf 'fake gh: unexpected api endpoint: %s\\n' "$2" >&2; exit 9 ;;
+  esac
+  exit "${FAKE_API_RC:-0}"
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   # 合并之后（marker 存在）的反查走另一份固定输出：合并前必须报 OPEN，
   # 合并后要能报 MERGED（gh 非 0 时的 state 反查用例）
@@ -155,15 +196,39 @@ def _write_exe(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def make_board_db(path: Path, cards: list[tuple[str, str, str]]) -> Path:
+    """造一个最小看板库（``tasks`` 只有认领闸门要的四列）。
+
+    ``cards`` 是 ``(卡号, status, body)``；``assignee`` 一律写 ``engineer``（认领闸门不
+    看它）。表结构照真库的子集：``db.iter_claim_rows`` 只读
+    ``id, status, assignee, body`` + ``status NOT IN ('done','archived')``。
+    """
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, body TEXT)")
+        conn.executemany(
+            "INSERT INTO tasks (id, status, assignee, body) VALUES (?, ?, ?, ?)",
+            [(card, status, "engineer", body) for card, status, body in cards],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 @dataclass
 class Stub:
-    """一次性环境：假 gh / 假 git + 调用日志 + 空仓库目录。"""
+    """一次性环境：假 gh / 假 git + 调用日志 + 空仓库目录 + 认领闸门用的看板库。"""
 
     bindir: Path
     log: Path
     repo: Path
     body_file: Path
     setenv: Callable[[str, str], None]
+    #: 认领唯一性闸门读的看板库（各用例按需换成本地 fixture；缺省用真库——手搭 argv 的
+    #: 用例可以显式给 ``--db``，也可以换掉这个字段）
+    board_db: Path = Path(mg.DEFAULT_DB)
 
     def set_body(self, text: str) -> None:
         """改 body 文件内容（坏输入用例复用同一路径，``--body-file`` 不必变）。"""
@@ -177,6 +242,23 @@ class Stub:
 
     def gh_calls(self) -> list[str]:
         return [call for call in self.calls() if call.startswith("gh ")]
+
+    def api_calls(self) -> list[str]:
+        return [call for call in self.gh_calls() if call.startswith("gh api ")]
+
+    def set_review_bodies(self, reviews: list[str], comments: list[str]) -> None:
+        """喂给假 ``gh api`` 的两份正文（双问绑定闸门只看 body）。"""
+
+        self.setenv("FAKE_REVIEWS_JSON", json.dumps([{"body": b} for b in reviews]))
+        self.setenv("FAKE_COMMENTS_JSON", json.dumps([{"body": b} for b in comments]))
+
+    def set_claims(self, cards: list[tuple[str, str]]) -> None:
+        """重写 fixture 看板库里的未结卡（``(卡号, 正文)``，status 一律 ``running``）。"""
+
+        self.board_db.unlink(missing_ok=True)
+        make_board_db(
+            self.board_db, [(card, "running", body) for card, body in cards]
+        )
 
     def git_calls(self) -> list[str]:
         return [call for call in self.calls() if call.startswith("git ")]
@@ -218,6 +300,10 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     # 认账 body：合并模式必填，内容恰好是合法三行 trailer（坏输入用例用 Stub.set_body 覆盖）
     body_file = tmp_path / "merge-body.txt"
     body_file.write_text(BODY_TEXT, encoding="utf-8")
+    # 认领闸门的 fixture 库：恰好一张未结卡认领 PR #9，且卡号就是 --card
+    board_db = make_board_db(
+        tmp_path / "board.db", [(MERGE_CARD, "running", "PR-CLAIM: #9\n")]
+    )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
@@ -233,8 +319,20 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     monkeypatch.setenv("FAKE_REV_PARSE_OUT", HEAD_OID)
     monkeypatch.setenv("FAKE_REV_PARSE_BASE_OUT", BASE_OID)
     monkeypatch.setenv("FAKE_MERGE_BASE_RC", "0")
-    out = Stub(bindir=bindir, log=log, repo=repo, body_file=body_file, setenv=monkeypatch.setenv)
+    monkeypatch.setenv("FAKE_API_RC", "0")
+    out = Stub(
+        bindir=bindir,
+        log=log,
+        repo=repo,
+        body_file=body_file,
+        setenv=monkeypatch.setenv,
+        board_db=board_db,
+    )
     out.view()
+    # 默认：双问绑定闸门通过 —— 两个端点各一条标记，都绑在预检的 head sha 上
+    out.set_review_bodies(
+        [mark_body(HEAD_OID, "defect")], [mark_body(HEAD_OID, "regression")]
+    )
     return out
 
 
@@ -255,6 +353,8 @@ def args_for(stub: Stub, *extra: str, delete_branch: bool = True) -> list[str]:
         "merge",
         "--repo",
         str(stub.repo),
+        "--db",
+        str(stub.board_db),
         "--timeout",
         "1",
         "--interval",
@@ -459,16 +559,20 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[1].startswith(f"预检 | PASS | {VIEW_CALL} | rc=0 | ")
     # 预检钉到提交：新增一行 head sha 证据（值是假 gh 报的 headRefOid）
     assert lines[2] == f"head sha | PASS | {HEAD_OID}"
-    # 预检之后、合并之前：rebase 闸门（base 必须是 head 的祖先）
-    assert lines[3] == rebase_line(stub)
-    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
-    assert lines[5].startswith(
+    # 预检之后、rebase 之前：两道证据闸门（认领唯一性 → 双问绑定 head sha）
+    assert lines[3] == claim_line(stub)
+    assert lines[4] == review_line(stub)
+    # 然后才是 rebase 闸门（base 必须是 head 的祖先）
+    assert lines[5] == rebase_line(stub)
+    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
+    assert lines[7].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
     )
     assert lines[-1] == f"结论：合并完成，源分支 {CARD_BRANCH} 已从 origin 删除"
     assert stub.gh_calls() == [
         VIEW_CALL,
+        *API_CALLS,
         merge_call(stub),
     ]
 
@@ -635,6 +739,8 @@ def test_method_defaults_to_merge_without_flag(
         CARD_BRANCH,
         "--repo",
         str(stub.repo),
+        "--db",
+        str(stub.board_db),
         "--delete-branch",
         "--timeout",
         "1",
@@ -651,6 +757,7 @@ def test_method_defaults_to_merge_without_flag(
     assert f"合并 | PASS | {merge_call(stub)} | rc=0 | " in out
     assert stub.gh_calls() == [
         VIEW_CALL,
+        *API_CALLS,
         merge_call(stub),
     ]
 
@@ -931,6 +1038,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     stub.set_body(
         f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #999999999\n"
     )
+    # 认领闸门要读到「恰好一张卡认领 #999999999，且就是 --card」
+    stub.set_claims([(MERGE_CARD, "PR-CLAIM: #999999999\n")])
 
     rc, out, _err = run(
         [
@@ -941,6 +1050,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
             "--delete-branch",
             "--repo",
             str(stub.repo),
+            "--db",
+            str(stub.board_db),
             "--timeout",
             "1",
             "--interval",
@@ -1016,7 +1127,7 @@ def test_branch_equals_base_ref_rejected(
     assert rc == 2
     assert out == ""
     assert "baseRefName" in err
-    # 只跑了 preflight，没有发起合并
+    # 只跑了 preflight，没有发起合并（认领闸门在 head/branch 校验之后才跑，这里轮不到）
     assert stub.gh_calls() == [VIEW_CALL]
 
 
@@ -1057,32 +1168,24 @@ def test_missing_gh_rc2(
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "calls.log"))
     monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
     monkeypatch.setenv("FAKE_LS_REMOTE_FIRST_RC", "0")  # 分支存在闸门先过
+    monkeypatch.setenv("FAKE_FETCH_RC", "0")
+    monkeypatch.setenv("FAKE_REV_PARSE_OUT", HEAD_OID)
     repo = tmp_path / "repo"
     repo.mkdir()
-
-    rc = mg.main(
-        [
-            "--pr",
-            "9",
-            "--branch",
-            CARD_BRANCH,
-            "--method",
-            "merge",
-            "--delete-branch",
-            "--repo",
-            str(repo),
-            "--timeout",
-            "1",
-            "--interval",
-            "1",
-        ]
+    body_file = tmp_path / "merge-body.txt"
+    body_file.write_text(BODY_TEXT, encoding="utf-8")
+    # 认领闸门先过（只读本地库，不需要 gh），才会走到「取评审正文时 gh 不见了」
+    board_db = make_board_db(
+        tmp_path / "board.db", [(MERGE_CARD, "running", "PR-CLAIM: #9\n")]
     )
-    captured = capsys.readouterr()
+    stub = Stub(bindir, tmp_path / "calls.log", repo, body_file, monkeypatch.setenv, board_db)
+
+    rc, out, err = run(args_for(stub), capsys)
 
     assert rc == 2
-    assert captured.out == ""
-    assert captured.err.startswith("错误: ")
-    assert "gh" in captured.err
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "gh" in err
 
 
 def test_missing_git_rc2_before_any_gh_call(
@@ -1148,8 +1251,10 @@ def test_git_vanishes_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
+    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
@@ -1170,8 +1275,10 @@ def test_merge_ok_but_undetermined_rc2(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)}")
+    assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
+    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)}")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -1346,8 +1453,10 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     lines = out.splitlines()
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
-    assert lines[3] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[4].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
+    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
@@ -1437,7 +1546,18 @@ def test_documented_command_runs_to_preflight_and_merge(
         stub.setenv("FAKE_GIT_COUNT", str(tmp_path / f"git-{index}.count"))
         filled = _fill_documented(argv, stub)
         rc, out, err = run(
-            [*filled, "--repo", str(stub.repo), "--timeout", "1", "--interval", "1"],
+            [
+                *filled,
+                "--repo",
+                str(stub.repo),
+                # 认领闸门读的库：文档命令走默认（真库），测试里换成 fixture 库
+                "--db",
+                str(stub.board_db),
+                "--timeout",
+                "1",
+                "--interval",
+                "1",
+            ],
             capsys,
         )
 
@@ -1627,7 +1747,7 @@ def test_broken_pipe_keeps_true_rc(
     rc = mg.main(args_for(stub))  # 不抛
 
     assert rc == expected
-    assert len(stub.gh_calls()) == 2  # 预检 + 合并都照常发生
+    assert len(stub.gh_calls()) == 4  # 预检 + 两条只读 api + 合并都照常发生
     assert merge_call(stub) in stub.gh_calls()
 
 
@@ -1809,8 +1929,8 @@ def test_merge_argv_forwards_accounting_verbatim(
 
     assert rc == 0
     assert err == ""
-    assert stub.gh_calls() == [VIEW_CALL, merge_call(stub)]
-    call = stub.gh_calls()[1]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS, merge_call(stub)]
+    call = stub.gh_calls()[3]
     assert call.startswith(
         f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
     )
@@ -1995,6 +2115,18 @@ def git(*args):
     return proc
 
 
+if argv[:1] == ["api"]:
+    endpoint = argv[1]
+    sha = git("rev-parse", "origin/" + BRANCH).stdout.strip()
+    if "/pulls/" in endpoint:
+        print(json.dumps([{"body": "REVIEW-HEAD: " + sha + "\\nREVIEW-KIND: defect\\n"}]))
+        raise SystemExit(0)
+    if "/issues/" in endpoint:
+        print(json.dumps([{"body": "REVIEW-HEAD: " + sha + "\\nREVIEW-KIND: regression\\n"}]))
+        raise SystemExit(0)
+    sys.stderr.write("fake gh: unexpected api endpoint " + endpoint + "\\n")
+    raise SystemExit(9)
+
 if argv[:2] == ["pr", "view"]:
     if os.path.exists(MARK):
         print(json.dumps({"state": "MERGED"}))
@@ -2096,10 +2228,16 @@ def test_merge_guard_commit_passes_merge_audit_require(
     )
     # 判据①（merged-by 的 profile == 该卡 tasks.assignee）要读看板库：造一份最小库，
     # 探针卡 assignee=pm，与 merged-by: pm/run200 的 profile 严格一致。
+    # 同一份库也给 merge_guard 的认领闸门用：探针卡正文认领 PR #PROBE_PR。
     board = tmp_path / "board.db"
     with sqlite3.connect(board) as conn:
-        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT)")
-        conn.execute("INSERT INTO tasks (id, assignee) VALUES (?, ?)", (PROBE_CARD, "pm"))
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT, status TEXT, body TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, assignee, status, body) VALUES (?, ?, ?, ?)",
+            (PROBE_CARD, "pm", "running", f"PR-CLAIM: #{PROBE_PR}\n"),
+        )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_REAL_GIT", REAL_GIT)
     monkeypatch.setenv("FAKE_WORK", str(work))
@@ -2127,6 +2265,9 @@ def test_merge_guard_commit_passes_merge_audit_require(
             str(body),
             "--repo",
             str(work),
+            # 认领闸门读的库：探针库（探针卡认领 PR #PROBE_PR）
+            "--db",
+            str(board),
             "--timeout",
             "1",
             "--interval",
@@ -2204,7 +2345,7 @@ def test_rebase_gate_rejects_stale_branch_rc2(
     assert "merge-accountability" in err
     assert "git merge origin/main" not in err
     # gh 只调过那一次预检：一个 `gh pr merge` 都没发
-    assert stub.gh_calls() == [VIEW_CALL]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
     assert not any(call.startswith("gh pr merge") for call in stub.gh_calls())
 
 
@@ -2224,7 +2365,7 @@ def test_rebase_gate_fetch_failure_rc2(
     assert "取远端提交失败（git fetch rc=128）" in err
     assert "could not read from remote repository" in err
     assert "无法判定 head 是否已 rebase 到 main" in err
-    assert stub.gh_calls() == [VIEW_CALL]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
     assert not [c for c in stub.git_calls() if " rev-parse " in c or " merge-base " in c]
 
 
@@ -2245,7 +2386,7 @@ def test_rebase_gate_head_pushed_after_preflight_rc2(
     assert "预检之后分支被推送" in err
     # 判了「不一致」就不许再往下判祖先关系
     assert not [c for c in stub.git_calls() if " merge-base " in c]
-    assert stub.gh_calls() == [VIEW_CALL]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
 
 
 def test_rebase_gate_undetermined_rc2(
@@ -2263,7 +2404,7 @@ def test_rebase_gate_undetermined_rc2(
     assert err.count("\n") == 1
     assert "无法判定 main 是否为 head 的祖先（git merge-base rc=128）" in err
     assert "bad object refs/merge-guard/9/base" in err
-    assert stub.gh_calls() == [VIEW_CALL]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
 
 
 @pytest.mark.parametrize(
@@ -2297,7 +2438,7 @@ def test_rebase_gate_rejects_malformed_base_ref_name(
         if " fetch " in c or " rev-parse " in c or " merge-base " in c
     ]
     assert len([c for c in stub.git_calls() if " ls-remote " in c]) == 1
-    assert stub.gh_calls() == [VIEW_CALL]
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
 
 
 def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
@@ -2360,3 +2501,238 @@ def test_verify_only_never_emits_rebase_step(
     assert stub.gh_calls() == []
     assert not [c for c in stub.git_calls() if " fetch " in c or " merge-base " in c]
 
+
+
+# ============================================================================
+# 16. 合并前的两道证据闸门（R17⑤ 认领唯一性 / R18④ 双问绑定 head sha）
+#
+# 顺序固定：预检（拿到 headRefOid）→ ① 认领 → ② 双问 → ③ rebase → gh pr merge。
+# 五种拒绝态都要求：rc2、stdout **0 字节**、stderr 恰一行、**零 gh 写操作**；
+# 文案必须一眼分清「无认领 / 重复认领 / 认领卡≠--card / 双问缺证 / 双问陈旧 / 双问缺类」。
+# ============================================================================
+
+#: 另一个合法卡号（用来造「重复认领」与「认领卡≠--card」）
+OTHER_CARD = "t_aaaa0001"
+#: 另一条 sha（用来造「双问陈旧」：标记绑在别的 head 上）
+STALE_OID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00a1b2c3d"
+
+
+def merged(stub: Stub) -> bool:
+    """假 gh 有没有收到过 ``pr merge``（= 有没有发出 gh 写操作）。"""
+
+    return any(call.startswith("gh pr merge") for call in stub.gh_calls())
+
+
+def assert_rejected(rc: int, out: str, err: str, *, text: str) -> None:
+    """拒绝态的公共断言：rc2、stdout 0 字节、stderr 恰一行且包含 ``text``。"""
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""  # 合并没发生 → 一个字节的证据都不该有
+    assert err.startswith("错误: "), err
+    assert err.count("\n") == 1, err  # stderr 严格一行
+    assert text in err, err
+
+
+# ---------------------------- 16a. 没有跳过开关（照抄卡面「无跳过开关」）
+def test_no_skip_switches_for_gates(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """``--skip-claim`` / ``--skip-review-head`` 一律不存在：给了就 rc2、零外部调用。"""
+
+    for flag in ("--skip-claim", "--skip-review-head", "--allow-unclaimed", "--skip-gates"):
+        rc, out, err = run(args_for(stub, flag), capsys)
+        assert rc == 2, flag
+        assert out == "", flag
+        assert err.startswith("错误: "), flag
+    assert stub.calls() == []
+
+
+# ---------------------------- 16b. 认领唯一性：三种拒绝态
+def test_claim_gate_no_claim_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """0 张卡认领 → rc2「无未结卡认领该 PR」，且一个 gh 写操作都不发。"""
+
+    stub.set_claims([])
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="无未结卡认领该 PR")
+    assert "PR #9" in err
+    # 认领闸门只读本地库：一次 gh api 都不发，更不会有 gh pr merge
+    assert stub.api_calls() == []
+    assert not merged(stub)
+    assert stub.gh_calls() == [VIEW_CALL]  # 只跑了预检
+
+
+def test_claim_gate_dupe_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """≥2 张卡认领同一 PR → rc2「重复认领」并把两张卡号都点出来。"""
+
+    stub.set_claims(
+        [
+            (MERGE_CARD, "PR-CLAIM: #9\n"),
+            (OTHER_CARD, "PR-CLAIM: #9\n"),
+        ]
+    )
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="重复认领")
+    assert MERGE_CARD in err and OTHER_CARD in err
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not merged(stub)
+
+
+def test_claim_gate_card_mismatch_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """恰好一张卡认领，但卡号 ≠ ``--card`` → rc2，文案点明两侧卡号。"""
+
+    stub.set_claims([(OTHER_CARD, "PR-CLAIM: #9\n")])
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="≠ --card")
+    assert OTHER_CARD in err and MERGE_CARD in err
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not merged(stub)
+
+
+def test_claim_gate_ignores_done_cards_and_reference_lines(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """已结卡与 ``PR-REF:`` 行都不算认领：判定口径与 ``pr-claim-audit`` 同源。"""
+
+    # 未结卡：认领 #9 + 引用 #8（引用行不参与唯一性判定）
+    stub.set_claims([(MERGE_CARD, "PR-CLAIM: #9\nPR-REF: #8\n")])
+    # 已结卡也认领 #9 —— 已结卡不参与判定，所以这里仍然只有一张未结卡认领
+    conn = sqlite3.connect(str(stub.board_db))
+    try:
+        conn.execute(
+            "INSERT INTO tasks (id, status, assignee, body) VALUES (?, ?, ?, ?)",
+            ("t_done0001", "done", "engineer", "PR-CLAIM: #9\n"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert claim_line(stub) in out.splitlines()
+
+
+def test_claim_gate_db_unreadable_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """看板库读不到 → rc2 且 points 出原因：绝不当成「没有卡认领」。"""
+
+    rc, out, err = run(
+        args_for(stub, "--db", str(stub.board_db.with_name("nope.db"))), capsys
+    )
+
+    assert_rejected(rc, out, err, text="读看板库失败")
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not merged(stub)
+
+
+# ---------------------------- 16c. 双问绑定：三种拒绝态（认领一律先通过）
+def test_review_head_gate_missing_kind_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """当前 head 上只有 defect → rc2「双问缺类」并点出缺 regression。"""
+
+    stub.set_review_bodies([mark_body(HEAD_OID, "defect")], [])
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="双问缺类")
+    assert "regression" in err
+    assert stub.api_calls() == API_CALLS  # 两条只读 GET 都发了
+    assert not merged(stub)
+
+
+def test_review_head_gate_stale_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """标记绑在别的 sha 上（head 变了没重跑双问）→ rc2「双问陈旧」。"""
+
+    stub.set_review_bodies(
+        [mark_body(STALE_OID, "defect")], [mark_body(STALE_OID, "regression")]
+    )
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="双问陈旧")
+    assert HEAD_OID[:12] in err
+    assert not merged(stub)
+
+
+def test_review_head_gate_no_mark_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """一条结构化标记都没有 → rc2「双问缺证」（不是「陈旧」「缺类」）。"""
+
+    stub.set_review_bodies([], [])
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="双问缺证")
+    assert "双问陈旧" not in err and "双问缺类" not in err
+    assert not merged(stub)
+
+
+def test_review_head_gate_gh_api_failure_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``gh api`` 非 0（取不到评审正文）→ rc2；不许读成「双问没做」。"""
+
+    stub.setenv("FAKE_API_RC", "1")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="取 PR #9 的评审正文失败")
+    assert "拒绝合并" in err
+    assert not merged(stub)
+
+
+def test_gates_run_before_rebase_gate(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """顺序固定：认领在最前（拒了就不发 gh api），双问在 rebase 之前。"""
+
+    stub.set_claims([])  # 认领就拒
+    stub.setenv("FAKE_FETCH_RC", "128")  # rebase 闸门本来也会红
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="无未结卡认领该 PR")
+    assert stub.api_calls() == []
+    assert not [c for c in stub.git_calls() if " fetch " in c or " merge-base " in c]
+
+
+# ---------------------------- 16d. rc0 正路：两道闸门放行后 argv 逐字不变
+def test_gates_pass_keeps_merge_argv_verbatim(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """闸门放行后，``gh pr merge`` 的 argv 与加闸门之前**逐字一致**（不多一个 flag）。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert err == ""
+    merge_calls = [c for c in stub.gh_calls() if c.startswith("gh pr merge")]
+    assert merge_calls == [
+        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID}"
+        f" --subject {MERGE_SUBJECT} --body-file {stub.body_file}"
+    ]
+    # 两道闸门的证据行都在，顺序 = 认领 → 双问 → rebase
+    lines = out.splitlines()
+    assert lines[3] == claim_line(stub)
+    assert lines[4] == review_line(stub)
+    assert lines[5] == rebase_line(stub)
+
+
+def test_verify_only_never_runs_gates(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """``--verify-only`` 不跑这两道闸门：不读库（没有认领也照样 rc0）、不发 gh api。"""
+
+    stub.set_claims([])  # 未结卡里没有一张认领 #9
+    stub.set_review_bodies([], [])
+    stub.setenv("FAKE_LS_REMOTE_FIRST_RC", "")
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for_verify(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert "认领唯一性 |" not in out
+    assert "双问绑定 |" not in out
+    assert stub.api_calls() == []
+    assert not merged(stub)

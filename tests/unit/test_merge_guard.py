@@ -731,6 +731,7 @@ def _opts(**overrides: object) -> mg.Options:
         "method": "merge",
         "repo": ".",
         "remote": "origin",
+        "db_path": mg.DEFAULT_DB,
         "timeout": 60,
         "interval": 2,
         "command_timeout": 60,
