@@ -441,6 +441,110 @@ def test_rc2_when_baseline_unresolvable(
     assert "基线无法解析为提交" in err
 
 
+# --------------------------------------- --baseline-file：base 侧基线（t_daba51a7）
+
+
+def test_baseline_file_takes_value_from_ancestor(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """``--baseline-file`` 给 base 侧（祖先）提交 → rc0，且判定的是区间内的合并。"""
+
+    base = head(repo)
+    sha = merge_in(repo, GOOD_MESSAGE, branch="feature", name="feat.txt")
+    baseline = tmp_path / "baseline"
+    baseline.write_text(base + "\n", encoding="utf-8")
+
+    rc, out, err = run(
+        ["--repo", str(repo), "--rev", sha, "--baseline-file", str(baseline)], capsys
+    )
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert f"基线: {base}" in out
+    assert "判定（1 条）" in out
+    assert f"{sha[:7]} t_ad5e7ff6 #1 by=pm/run137" in out
+    assert "结论：无问题" in out
+
+
+def test_rc2_when_explicit_baseline_file_missing(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """显式 ``--baseline-file`` 指向不存在的路径 → rc2（不静默当成「没有基线」）。"""
+
+    missing = tmp_path / "no-such-dir" / "baseline"
+
+    rc, out, err = run(["--repo", str(repo), "--baseline-file", str(missing)], capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "基线文件不存在" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("via", ["flag", "file"])
+def test_rc2_when_baseline_not_ancestor_of_rev(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    via: str,
+) -> None:
+    """基线不是被审 ``rev`` 的祖先（方向反了）→ rc2，拒绝「空区间 = 假绿」。
+
+    旧行为：``git log <基线>..<rev>`` 退化成空区间，输出「判定（0 条）/ 结论：无问题」
+    并 rc0，与「真的没有合并」不可区分（t_daba51a7 P2-3）。
+    """
+
+    base = head(repo)
+    merged = merge_in(repo, GOOD_MESSAGE, branch="feature", name="feat.txt")
+    args = ["--repo", str(repo), "--rev", base]
+    if via == "flag":
+        args += ["--baseline", merged]
+    else:
+        baseline = tmp_path / "baseline"
+        baseline.write_text(merged + "\n", encoding="utf-8")
+        args += ["--baseline-file", str(baseline)]
+
+    rc, out, err = run(args, capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "基线不是被审 rev 的祖先" in err
+    assert merged[:7] in err or merged in err
+    assert "Traceback" not in err
+
+
+def test_baseline_file_wins_over_checked_out_baseline(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """判定只跟 ``--baseline-file`` 走，不跟工作区/检出树里的默认基线文件走。
+
+    这就是 P2-4 的机器证明：被审方把自己那份基线改成「尖端」也缩不小判定区间。
+    """
+
+    base = head(repo)
+    sha = merge_in(repo, GOOD_MESSAGE, branch="feature", name="feat.txt")
+    checked_out = repo / ".team-board" / "merge-audit-baseline"
+    checked_out.parent.mkdir(parents=True)
+    checked_out.write_text(sha + "\n", encoding="utf-8")  # 检出树里的那份 = 尖端
+
+    # 不给 --baseline-file：读检出树里那份 → 区间空、0 条（旧漏洞的形状）
+    rc_tree, out_tree, err_tree = run(["--repo", str(repo)], capsys)
+    assert rc_tree == 0, (rc_tree, out_tree, err_tree)
+    assert "判定（0 条）" in out_tree
+
+    # 给 --baseline-file 指向 base 侧那份 → 区间恢复，照旧判 1 条
+    baseline = tmp_path / "baseline"
+    baseline.write_text(base + "\n", encoding="utf-8")
+    rc_file, out_file, err_file = run(
+        ["--repo", str(repo), "--baseline-file", str(baseline)], capsys
+    )
+
+    assert rc_file == 0, (rc_file, out_file, err_file)
+    assert f"基线: {base}" in out_file
+    assert "判定（1 条）" in out_file
+    assert f"{sha[:7]} t_ad5e7ff6 #1 by=pm/run137" in out_file
+
+
 # --------------------------------------------------------- --rev / --card 校验
 
 

@@ -186,12 +186,31 @@ jobs:
       # 为什么要抓全部分支、且不能判 HEAD：
       # pull_request 事件下 actions/checkout 检出的是 refs/pull/N/merge 这条**合成合并提交**，
       # 它天然没有认账字段，判 HEAD 会永久假红；所以：
-      #   push 到 main → 判 origin/main（真实合并）
+      #   push 到 main → 判 github.sha（**不是** origin/main：并发合并时 fetch 到的
+      #                  origin/main 可能已经前进到别人的提交上，红会记错提交）
       #   PR          → 判 github.event.pull_request.head.sha（PR 分支自己的提交，抓演示/违规）
+      #
+      # 基线**只认 base 侧那份文件**（P2-4）：checkout 出来的是 PR 的合并树，读检出树里的
+      # .team-board/merge-audit-baseline 等于让被审 PR 自己决定判定区间（它能改成 main
+      # 尖端 → 区间变空 → 永远绿）。所以先用 BASE_REF 把 **base 侧**那份 `git show` 到一个
+      # 临时文件，再 --baseline-file 喂给工具；工具只认这个参数，不读检出树。
+      #   pull_request → BASE_REF = origin/<base_ref>（基线文件由 main 侧提供）
+      #   push         → BASE_REF = github.event.before（上一个 main 尖端；新分支全 0 或
+      #                  读不到该文件时 **rc=2 红**，属预期 fail-closed）
       - name: Fetch all branches
         run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+      - name: Read base-side baseline file
+        env:
+          BASE_REF: ${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref) }}
+        run: |
+          echo "BASE_REF=$BASE_REF"
+          git show "$BASE_REF:.team-board/merge-audit-baseline" > "$RUNNER_TEMP/baseline" || exit 2
+          echo "基线（base 侧）: $(cat "$RUNNER_TEMP/baseline")"
       - name: Run merge accountability audit
         env:
           PYTHONPATH: src
-          AUDIT_REV: ${{ github.event_name == 'push' && 'origin/main' || github.event.pull_request.head.sha }}
-        run: python -m team_board.cli merge-audit --repo . --rev "$AUDIT_REV"
+          AUDIT_REV: ${{ github.event_name == 'push' && github.sha || github.event.pull_request.head.sha }}
+        run: |
+          echo "AUDIT_REV=$AUDIT_REV"
+          python -m team_board.cli merge-audit --repo . --rev "$AUDIT_REV" \
+            --baseline-file "$RUNNER_TEMP/baseline"
