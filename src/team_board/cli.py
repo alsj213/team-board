@@ -664,10 +664,18 @@ def _run_commit_audit(args: argparse.Namespace) -> int:
 
 
 def _write_stdout(text: str) -> bool:
-    """整块写 stdout；编码表示不了中文 → stderr ``错误: …`` 并返回 ``False``。
+    """整块写 stdout；写不出去时**绝不冒 traceback**，且区分「没人要」与「环境坏」。
 
     ``TextIOWrapper`` 先整体编码再写出：编码失败时 stdout 里一个字节都没落，
     所以这里是「要么全出、要么不出」，码必须是 rc2（环境错误）而不是 rc1。
+
+    下游提前关管道（`git push … | head -1`、调用方直接关掉 fd1）会让写 stdout 抛
+    ``BrokenPipeError``。旧版只 catch ``UnicodeEncodeError``，于是异常一路冒到
+    ``main`` 外面：stderr 出 traceback、进程以非 0 非 1/2 的码退出，``.githooks/pre-push``
+    把「Traceback」当成「跑不起来」fail-closed —— **合法推送被挡**。现在这类「输出没人
+    要了」不再算错误：判定结果本身是好的，照旧返回 ``True``（rc 仍是判定码），并把
+    stdout 接到 ``/dev/null``，免得解释器退出时再 flush 一次又炸出
+    ``Exception ignored … BrokenPipeError``。
     """
 
     try:
@@ -680,7 +688,33 @@ def _write_stdout(text: str) -> bool:
             "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
         )
         return False
+    except (BrokenPipeError, OSError):
+        # 管道对端已关 / 写不进去：输出目标没了，不是判定错误，也不是可修复的环境
+        # 错误（报 rc2 会让钩子按「环境错误」误拦）。把 fd 挪到 /dev/null 后返回 True。
+        _detach_stdout()
+        return True
     return True
+
+
+def _detach_stdout() -> None:
+    """把 ``sys.stdout`` 底下那个 fd 接到 ``os.devnull``（失败就安静放弃）。
+
+    只为了压掉「退出时最后一次 flush」的 ``Exception ignored … BrokenPipeError``：
+    那行会进钩子的 stderr 捕获变量，而钩子按文本判「跑不起来」。没有 ``fileno``
+    的替身对象（pytest ``capsys`` 一类）直接跳过。
+    """
+
+    try:
+        fileno = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        os.dup2(devnull, fileno)
+    except OSError:  # pragma: no cover - 极端环境（fd 已被关掉）
+        pass
+    finally:
+        os.close(devnull)
 
 
 def _parse_merge_pr(value: str) -> int:

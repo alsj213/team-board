@@ -33,6 +33,10 @@
   「判定红」，还补了 ``--no-verify`` 绕过提示；现在环境错误单独一套文案；
 - l) 缺 ``push-guard`` 子命令（版本偏斜，argparse ``invalid choice``）：同样归环境错误，
   且**不把 argparse usage 原样泄给用户**。
+
+用例 m 是合并后收口卡 ``t_fc31145f`` 补的：下游提前关管道（``git push … | head -1``）时
+``cli._write_stdout`` 抛 ``BrokenPipeError`` → stderr 出 traceback → 钩子判「跑不起来」
+fail-closed，把**合法**推送挡掉。现在「输出没人要」不算错误，判定码照旧。
 """
 
 from __future__ import annotations
@@ -421,4 +425,57 @@ def test_l_missing_push_guard_subcommand_is_env_error(tmp_path: Path) -> None:
     assert "usage:" not in proc.stderr
     assert "invalid choice" not in proc.stderr
     assert "--no-verify" not in proc.stderr
+
+
+# ------------------------------------- 下游关管道（收口 t_fc31145f，用例 m）
+
+def run_hook_with_closed_stdout(cwd: Path, stdin_text: str) -> subprocess.CompletedProcess[str]:
+    """跑真钩子，但把它的 **stdout 接到「读端已关」的管道**（等价 `git push … | head -1`）。
+
+    读端在起进程之前就关掉：钩子/``push-guard`` 往 stdout 写任何东西都是 EPIPE。
+    所以这个用例只可能因为「写 stdout 失败」而失败 —— 判定路径本身是放行。
+    """
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        return subprocess.run(
+            ["/bin/sh", str(_HOOK)],
+            cwd=str(cwd),
+            input=stdin_text,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_ENV,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+
+
+def test_m_closed_stdout_pipe_is_not_a_failure(tmp_path: Path, repo: Path) -> None:
+    """m) 下游提前关管道 → stdout 写不出去，不许被判成 fail-closed（合法推送被拦）。
+
+    旧版 ``cli._write_stdout`` 只 catch ``UnicodeEncodeError``：``BrokenPipeError``
+    一路冒到 ``main`` 外面，stderr 出 ``Traceback (most recent call last)``，而钩子
+    正是按这行文本判「跑不起来」→ fail-closed 拦下**合法**推送。现在「输出没人要」
+    不算错误：判定结果照旧（放行 rc0）。
+    """
+
+    worktree = tmp_path / "t_deadbeef"
+    must_git(repo, "worktree", "add", "-q", "-b", "wt/t_deadbeef", str(worktree), "main")
+
+    allowed = run_hook_with_closed_stdout(worktree, ref_line("refs/heads/wt/t_deadbeef"))
+
+    assert allowed.returncode == 0, allowed.stderr
+    assert "Traceback" not in allowed.stderr
+    assert "fail-closed" not in allowed.stderr
+    assert allowed.stderr == ""
+
+    # 判定红那档同样不受影响：rc 仍是 1、人话照旧（stdout 本来就没东西可写）。
+    blocked = run_hook_with_closed_stdout(worktree, ref_line("refs/heads/main"))
+
+    assert blocked.returncode == 1, blocked.stderr
+    assert "拒绝：不允许直接 push 到 main" in blocked.stderr
+    assert "Traceback" not in blocked.stderr
 

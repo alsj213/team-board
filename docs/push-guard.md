@@ -53,6 +53,12 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 钩子层（`git push` 看到的那一层）—— **只有 `0` / `1` 两个码**，而且这条是**设计保证**
 （钩子不落临时文件、自己判 stdin），不是「按理说只有」：
 
+**例外（一个）**：**调用方把钩子的 fd1 关掉**（例如 `git push >&-`）时钩子拿不到可写的
+stdout，`exec 3>&1` 直接失败 —— 实测（2026-10-30）dash **rc=2**（`.githooks/pre-push: 56:
+1: Bad file descriptor` 即退，一句人话都没有）、bash **rc=1**（`3: Bad file descriptor`
+后继续跑到判定红那档，还打了两行提示）。这是调用方用法的问题，不是钩子自己的判定：
+正常 `git push` 一定有 stdout，`0` / `1` 的保证只在这个前提下成立。
+
 | 情形 | push-guard rc | 钩子 rc | 钩子说什么 |
 | --- | --- | --- | --- |
 | 放行 | 0 | 0 | 原样回放 push-guard 的 stdout |
@@ -69,8 +75,10 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 [pre-push] 免检通道：git push --no-verify 能绕过本钩子，但 CI 的 branch-audit (卡分支/checkout) 仍会判红
 ```
 
-worktree 落点统一写 `/home/liu/project/tb-wt/`（本机现存约定：26 个 worktree 里 20 个
-在这个前缀下），push-guard 的 P-2 文案与钩子提示用的是同一个前缀。
+worktree 落点统一写 `/home/liu/project/tb-wt/`（本机现存约定：**多数** worktree 落在这个
+前缀下；准确条数现数现取，别写死在文档里 ——
+`git worktree list | awk '{print $1}' | grep -c '^/home/liu/project/tb-wt/'`），
+push-guard 的 P-2 文案与钩子提示用的是同一个前缀。
 
 ## 怎么装、怎么自查
 

@@ -29,7 +29,7 @@
 
 - 写什么：worktree 路径 / 分支名 / 推送命令 / PR 目标分支 / **不合并**（merge 归 pm）/
   交卡口径（`kanban_request_review(reviewer="pm")`）。
-- 示例：`worktree /home/liu/tb-wt/<卡号>、分支 wt/<卡号>、git push origin HEAD:refs/heads/wt/<卡号>、
+- 示例：`worktree /home/liu/project/tb-wt/<卡号>、分支 wt/<卡号>、git push origin HEAD:refs/heads/wt/<卡号>、
   PR base=main 不合并、交卡 request_review(reviewer="pm")。`（默认全同模板时直接写「见模板」）
 
 ## 5. 验收三段式
