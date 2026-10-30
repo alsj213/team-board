@@ -805,3 +805,148 @@ def test_branch_card_id_resolves_wt_branch_when_it_exists(
     assert rc == 0
     assert err == ""
     assert "检查的卡分支: t_aaaaaaaa" in out
+
+
+# ------------------------------------------ 证据分支命名空间（R11，evidence/*）
+# ``evidence/<单段名>`` 不占卡分支命名空间：单列一段、不进规则 A/B、不改 rc；
+# 卡分支口径一字不放宽（同一提交搬到 ``wt/<不存在的卡号>`` 照旧判红）。
+
+
+def test_evidence_branch_with_unclaimed_commit_is_green(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    git(repo, "checkout", "-q", "-b", "evidence/t_deadbeef")
+    commit_file(repo, "e.txt", "chore: 证据留档")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "检查的卡分支: （无）" in out
+    assert "证据分支（1 条，不占卡分支命名空间、不计入提交归属检查）:" in out
+    assert "  evidence/t_deadbeef" in out
+    assert "结论：无偏差" in out
+
+
+def test_same_commit_under_wt_branch_is_still_red(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """同一条提交搬到 ``wt/t_deadbeef``（此卡不存在）→ 照旧「未声明卡号」rc1。"""
+
+    git(repo, "checkout", "-q", "-b", "evidence/t_deadbeef")
+    commit_file(repo, "e.txt", "chore: 证据留档")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "checkout", "-q", "main")
+    git(repo, "branch", "wt/t_deadbeef", sha)
+    git(repo, "update-ref", "-d", "refs/heads/evidence/t_deadbeef")
+
+    rc, out, _ = run(["--repo", str(repo)], capsys)
+
+    assert rc == 1
+    assert "未声明卡号" in out
+    assert "证据分支（0 条" in out
+
+
+def test_evidence_local_and_origin_same_name_count_as_one(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """本地与 origin 同名证据分支只算一条（真造远端 ref，不用桩）。"""
+
+    git(repo, "checkout", "-q", "-b", "evidence/t_aaaaaaaa")
+    commit_file(repo, "e.txt", "chore: 证据留档")
+    git(repo, "checkout", "-q", "main")
+    sha = git(repo, "rev-parse", "evidence/t_aaaaaaaa").strip()
+    git(repo, "update-ref", "refs/remotes/origin/evidence/t_aaaaaaaa", sha)
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "证据分支（1 条，不占卡分支命名空间、不计入提交归属检查）:" in out
+    assert out.count("evidence/t_aaaaaaaa") == 1
+
+
+def test_odd_evidence_names_get_hint_and_stay_green(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``evidence/a/b``、``evidence/-x``：给提示、不进证据段、rc 不变。"""
+
+    for name in ("evidence/a/b", "evidence/-x"):
+        git(repo, "branch", name, "main")
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    lines = out.splitlines()
+    index = next(
+        i for i, line in enumerate(lines) if line.startswith("证据分支（0 条")
+    )
+    assert lines[index + 1] == "  （无）"
+    for name in ("evidence/a/b", "evidence/-x"):
+        assert (
+            f"提示: {name} 不符合证据分支命名"
+            f"（应为 evidence/<字母数字开头的单段名>），按普通分支跳过"
+        ) in out
+
+
+def test_branch_evidence_name_returns_zero(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    git(repo, "checkout", "-q", "-b", "evidence/t_deadbeef")
+    commit_file(repo, "e.txt", "chore: 证据留档")
+    git(repo, "checkout", "-q", "main")
+
+    rc, out, err = run(
+        ["--repo", str(repo), "--branch", "evidence/t_deadbeef"], capsys
+    )
+
+    assert rc == 0, out
+    assert err == ""
+    assert (
+        "evidence/t_deadbeef 是证据分支，不占卡分支命名空间，跳过提交归属检查" in out
+    )
+    assert "证据分支（1 条" in out
+    assert "结论：无偏差" in out
+
+
+def test_branch_odd_evidence_name_keeps_plain_note(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--branch evidence/a/b`` 走既有「不是卡分支」文案，不额外加。"""
+
+    git(repo, "branch", "evidence/a/b", "main")
+
+    rc, out, err = run(["--repo", str(repo), "--branch", "evidence/a/b"], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "evidence/a/b 不是卡分支，跳过提交归属检查" in out
+    assert "是证据分支" not in out
+    assert "证据分支（0 条" in out
+
+
+def test_branch_evidence_nonexistent_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, out, err = run(
+        ["--repo", str(repo), "--branch", "evidence/nonexistent"], capsys
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "evidence/nonexistent" in err
+    assert "Traceback" not in err
+
+
+def test_branch_evidence_empty_name_returns_two(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, out, err = run(["--repo", str(repo), "--branch", "evidence/"], capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.startswith("错误: ")
+    assert "Traceback" not in err

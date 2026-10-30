@@ -735,3 +735,121 @@ def test_clean_env_still_audits_normally(
     assert Path(report.repo).resolve() == repo.resolve()
     assert report.ok
 
+
+# ---------------------------------------------------------------- 证据分支（R11）
+# ``evidence/<单段名>`` 是独立命名空间：单列一段、不进 findings/drifts、不改 rc；
+# 卡分支口径（BRANCH_RE）一字不放宽。
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("evidence/t_589cc33a", True),
+        ("evidence/t_589cc33a-ci", True),
+        ("evidence/perf-2026-10", True),
+        ("evidence/A", True),
+        ("evidence/", False),  # 空名
+        ("evidence/a/b", False),  # 多段
+        ("evidence/-x", False),  # 非字母数字开头
+        ("evidence", False),
+        ("wt/t_589cc33a", False),
+        ("EV/t_589cc33a", False),
+        ("evidenceX/t_589cc33a", False),
+    ],
+)
+def test_evidence_re_requires_single_segment(name: str, expected: bool) -> None:
+    assert branches._is_evidence_branch(name) is expected
+
+
+def _report_with_evidence(names: tuple[str, ...]) -> Report:
+    return Report(
+        repo="/tmp/repo",
+        main_branch="main",
+        checked_branches=(),
+        findings=(),
+        drifts=(),
+        suppressed=(),
+        evidence_branches=names,
+    )
+
+
+def test_render_report_evidence_section_empty_follows_checked_line() -> None:
+    lines = render_report(_report_with_evidence(())).splitlines()
+    index = next(
+        i for i, line in enumerate(lines) if line.startswith("检查的卡分支: ")
+    )
+    assert lines[index + 1] == "证据分支（0 条，不占卡分支命名空间、不计入提交归属检查）:"
+    assert lines[index + 2] == "  （无）"
+
+
+def test_render_report_evidence_section_lists_names_joined() -> None:
+    text = render_report(
+        _report_with_evidence(("evidence/t_589cc33a", "evidence/t_589cc33a-ci"))
+    )
+
+    assert "证据分支（2 条，不占卡分支命名空间、不计入提交归属检查）:" in text
+    assert "  evidence/t_589cc33a、evidence/t_589cc33a-ci" in text
+    # 证据分支不进任何偏差段，结论行不变
+    assert text.endswith("结论：无偏差")
+
+
+def test_report_evidence_branches_does_not_change_ok() -> None:
+    """``ok`` 只看 findings / drifts / multi / forks —— 证据分支不加也不减。"""
+
+    assert _report_with_evidence(("evidence/t_aaaaaaaa",)).ok is True
+
+
+def test_audit_lists_evidence_branch_and_stays_green(tmp_path: Path) -> None:
+    """真仓：证据分支上的无卡号提交不判红，且被单列出来。"""
+
+    repo = _make_repo(tmp_path / "repo")
+    _real_git(repo, "checkout", "-q", "-b", "evidence/t_deadbeef")
+    (repo / "e.txt").write_text("x\n", encoding="utf-8")
+    _real_git(repo, "add", "-A")
+    _real_git(repo, "commit", "-q", "-m", "chore: 证据留档")
+    _real_git(repo, "checkout", "-q", "main")
+
+    report = branches.audit(repo=repo)
+
+    assert report.evidence_branches == ("evidence/t_deadbeef",)
+    assert report.checked_branches == ()  # 证据分支不进规则 A 的卡分支集合
+    assert report.notes == ()
+    assert report.ok
+
+
+def test_audit_notes_odd_evidence_names_without_failing(tmp_path: Path) -> None:
+    """``evidence/a/b``、``evidence/-x`` 按普通分支跳过：给提示、不进证据段、不改 rc。"""
+
+    repo = _make_repo(tmp_path / "repo")
+    for name in ("evidence/a/b", "evidence/-x"):
+        _real_git(repo, "branch", name, "main")
+
+    report = branches.audit(repo=repo)
+
+    assert report.evidence_branches == ()
+    assert report.ok
+    joined = "\n".join(report.notes)
+    for name in ("evidence/a/b", "evidence/-x"):
+        assert (
+            f"{name} 不符合证据分支命名（应为 evidence/<字母数字开头的单段名>），"
+            f"按普通分支跳过"
+        ) in joined
+
+
+def test_evidence_names_dedupe_across_all_remotes(tmp_path: Path) -> None:
+    """同名本地 + 各远端按名字去重成一条（覆盖 ``refs/remotes/*`` 不只 origin）。"""
+
+    repo = _make_repo(tmp_path / "repo")
+    sha = _real_git(repo, "rev-parse", "main").strip()
+    _real_git(repo, "update-ref", "refs/remotes/origin/evidence/t_aaaaaaaa", sha)
+    _real_git(repo, "update-ref", "refs/remotes/upstream/evidence/t_aaaaaaaa", sha)
+    _real_git(repo, "update-ref", "refs/remotes/upstream/evidence/t_bbbbbbbb", sha)
+
+    report = branches.audit(repo=repo)
+
+    assert report.evidence_branches == (
+        "evidence/t_aaaaaaaa",
+        "evidence/t_bbbbbbbb",
+    )
+    assert report.ok
+

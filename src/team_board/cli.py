@@ -279,7 +279,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch",
         default=None,
         metavar="NAME",
-        help="只稽核这一条分支（接受 wt/t_xxx 或 t_xxx；默认查全部卡分支）",
+        help=(
+            "只稽核这一条分支（接受 wt/t_xxx 或 t_xxx，也接受 evidence/xxx"
+            "（证据分支，见 README）；默认查全部卡分支）"
+        ),
     )
     audit_cmd.add_argument(
         "--allow-file",

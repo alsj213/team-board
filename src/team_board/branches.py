@@ -60,15 +60,34 @@
   归因（``forked_from_cards``）的来源是**全仓卡分支**（不只本次稽核的 refs），
   因此全量模式与 ``--branch`` 模式给出的文案一致 —— CI 恒走 ``--branch`` 那条。
 
+证据分支（R11）—— 独立命名空间，不占卡分支空间
+------------------------------------------------
+``evidence/<单段名>``（``evidence/`` 之后**只许一段**，字符集
+``[A-Za-z0-9][A-Za-z0-9._-]*``）是长期留证专用的分支命名空间，判据见
+:data:`_EVIDENCE_RE`。它**不占卡分支命名空间**：
+
+- 不进规则 A 的（卡号, ref）集合 —— 不跑 ``git log``，不产 findings / drifts；
+- 不进规则 B 的 worktree 判定、不参与 C-1；
+- 报告里**单列一段** ``证据分支（N 条，不占卡分支命名空间、不计入提交归属检查）:``，
+  来源是 ``refs/heads/evidence/*`` 与 ``refs/remotes/*/evidence/*``，按名字去重、
+  排序；退出码不受它影响；
+- ``--branch evidence/<名>``（分支存在）→ 输出 ``<名> 是证据分支，不占卡分支命名
+  空间，跳过提交归属检查`` 并 rc0；
+- 名字不合规的（``evidence/a/b`` 多段、``evidence/-x`` 非字母数字开头）按**普通
+  分支**跳过，输出里给一行 ``提示: … 不符合证据分支命名（应为 evidence/<字母数字
+  开头的单段名>），按普通分支跳过``。
+
+``BRANCH_RE`` 与规则 A/B/C 的判定一字未改：卡分支仍然只认
+``wt/t_<8 位小写十六进制>``。证据分支不是给卡分支「放宽」出来的豁免，而是另一条
+命名空间 —— 把同一条提交放到 ``wt/<不存在的卡号>`` 上仍照旧判「未声明卡号」。
+
 已知限制（本版本明确不做）：
 
 - 豁免表对规则 C 不生效；「分支上先落一条跨卡提交、再落本卡提交」仍按
   「本卡第一个提交的父提交不在 main 上」判红，只是不再把前置提交的卡号算进
   归因；
 - 浅克隆（``--depth`` 边界）下 ``merge-base --is-ancestor`` 会假红，CI 用
-  ``fetch-depth: 0`` 不受影响；
-- ``证据分支（N 条…）:`` 单列段与 ``--branch evidence/<名>`` 直接 rc0 归
-  ``t_3e2a3582``，本模块只做「不判红」这一半。
+  ``fetch-depth: 0`` 不受影响。
 
 退出码（由 CLI 落）：0 无偏差 / 1 发现偏差 / 2 参数或环境错误（``AuditError``，
 含 ``PATH`` 里没有 ``git``、豁免表不是 UTF-8、**git 输出不是 UTF-8**）。
@@ -93,6 +112,9 @@ BRANCH_RE = re.compile(r"^wt/(t_[0-9a-f]{8})$")
 
 #: R11 证据分支命名空间：``evidence/`` + **单段**名
 _EVIDENCE_RE = re.compile(r"^evidence/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+#: 证据分支 ref → 去掉 ``refs/heads/`` 或 ``refs/remotes/<remote>/`` 前缀后的名字
+_EVIDENCE_REF_RE = re.compile(r"^refs/(?:heads/|remotes/[^/]+/)(evidence/.*)$")
 
 #: allowlist 里的 sha 字段：7–40 位小写十六进制
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -194,6 +216,9 @@ class Report:
     notes: tuple[str, ...] = field(default=())
     multi: tuple[BranchSetFinding, ...] = field(default=())
     forks: tuple[ForkPointFinding, ...] = field(default=())
+    #: R11 证据分支（``evidence/<单段名>``）：单列一段，不进 findings / drifts，
+    #: 也不改 ``ok`` 与退出码。放在字段列表最后且给默认值 —— 既有 Report 构造不破。
+    evidence_branches: tuple[str, ...] = field(default=())
 
     @property
     def ok(self) -> bool:
@@ -666,6 +691,37 @@ def _is_evidence_branch(name: str) -> bool:
     return _EVIDENCE_RE.match(name) is not None
 
 
+def _evidence_branch_scan(
+    repo: str | Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """枚举证据分支：返回 ``(合规名, 不合规名)``，两者都按名字去重并排序。
+
+    只收 ``refs/heads/evidence/*`` 与 ``refs/remotes/*/evidence/*``（**所有**远端，
+    与规则 C-1 只看 ``origin`` 不同 —— 证据分支是为了「留证在别处」而存在的，
+    其它远端上的同名证据 branch 也该被认出来）。同名本地 + 远端按名字合并成一条。
+    名字不合规的（``evidence/a/b``、``evidence/-x``）单独返回，由调用方给提示，
+    不按证据分支处理。
+    """
+
+    raw = _must_git(
+        repo,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/evidence",
+        "refs/remotes",
+        what="枚举证据分支失败",
+    )
+    good: set[str] = set()
+    odd: set[str] = set()
+    for ref in raw.splitlines():
+        match = _EVIDENCE_REF_RE.match(ref.strip())
+        if match is None:
+            continue
+        name = match.group(1)
+        (good if _is_evidence_branch(name) else odd).add(name)
+    return tuple(sorted(good)), tuple(sorted(odd))
+
+
 def _branch_set_findings(
     names: dict[str, tuple[str, ...]],
 ) -> tuple[BranchSetFinding, ...]:
@@ -937,6 +993,7 @@ def audit(
 
     notes: list[str] = []
     refs: list[tuple[str, str]] = []  # (card, ref)
+    evidence: list[str] = []  # R11 证据分支（单列一段，不进 refs）
     if only_branch is not None:
         requested = only_branch.strip()
         if not requested:
@@ -963,7 +1020,15 @@ def audit(
         if not existing:
             raise AuditError(f"分支不存在（本地与 origin 都没有）: {requested}")
         if card is None:
-            notes.append(f"{requested} 不是卡分支，跳过提交归属检查")
+            if _is_evidence_branch(requested):
+                # R11：证据分支不占卡分支命名空间 —— rc0，单列一段，不跑规则 A
+                notes.append(
+                    f"{requested} 是证据分支，不占卡分支命名空间，"
+                    f"跳过提交归属检查"
+                )
+                evidence.append(requested)
+            else:
+                notes.append(f"{requested} 不是卡分支，跳过提交归属检查")
         else:
             card_refs = [ref for ref in existing if "/wt/" in ref]
             if not card_refs:
@@ -1001,6 +1066,15 @@ def audit(
             if not match:
                 continue
             refs.append((match.group(1), ref))
+
+        # R11：证据分支单独扫一遍 —— 它们不进 refs、不跑 git log，只在报告里单列
+        evidence_names, odd_names = _evidence_branch_scan(top)
+        evidence.extend(evidence_names)
+        notes.extend(
+            f"{name} 不符合证据分支命名"
+            f"（应为 evidence/<字母数字开头的单段名>），按普通分支跳过"
+            for name in odd_names
+        )
 
     if allow_file is None:
         allow_path: Path | None = top / ".team-board" / "branch-audit-allow.txt"
@@ -1060,6 +1134,7 @@ def audit(
         notes=tuple(notes),
         multi=multi,
         forks=forks,
+        evidence_branches=tuple(sorted(set(evidence))),
     )
 
 
@@ -1073,6 +1148,14 @@ def render_report(report: Report) -> str:
         "检查的卡分支: "
         + ("、".join(report.checked_branches) if report.checked_branches else "（无）"),
     ]
+    # R11：证据分支单列一段，紧接「检查的卡分支」之后（下游按这一行 grep）
+    lines.append(
+        f"证据分支（{len(report.evidence_branches)} 条，"
+        f"不占卡分支命名空间、不计入提交归属检查）:"
+    )
+    lines.append(
+        "  " + ("、".join(report.evidence_branches) if report.evidence_branches else "（无）")
+    )
     for note in report.notes:
         lines.append(f"提示: {note}")
 
