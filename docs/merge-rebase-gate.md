@@ -113,7 +113,9 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base 
 解析出的 `owner/name` 同时钉进预检 / 合并 / 状态反查三条 gh 调用的 `-R`
 （核对对象 = 操作对象；不钉时 gh 按 `GH_REPO` / cwd 选仓，可与核对对象不同仓）。
 拒绝文案里的 URL 已把 userinfo 脱敏成 `***`：带 `x-access-token:<token>@` 的 remote
-不会把凭据写进 stderr。
+不会把凭据写进 stderr。脱敏判据按位置算：`://` 之后到该串**最后一个** `@` 之前的整段
+一律换成 `***`，所以 userinfo 里含 `/` 或 `@`（密码里带分隔符、多个 `@`）同样整体脱敏，
+host / path 不动。
 
 
 ### 3. 为什么不放在 branch-audit（`branches.py` 规则 C-2）

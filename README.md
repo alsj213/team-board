@@ -600,7 +600,9 @@ python3 -m team_board.merge_guard \
      读不到 / 不是 GitHub 形态一律 rc2 拒绝 —— 跨仓时不许拿别的仓库同号 PR 的评审当证据。
      解析出的这个 `owner/name` 同时就是预检 / 合并 / 状态反查三条 gh 调用钉的 `-R` 值
      （核对对象 = 操作对象）；报错文案里的 URL 已把 userinfo 脱敏成 `***`，
-     带 `x-access-token:<token>@` 的 remote 不会把凭据写进 stderr。
+     带 `x-access-token:<token>@` 的 remote 不会把凭据写进 stderr。脱敏判据按位置算：
+     `://` 之后到该串**最后一个** `@` 之前的整段一律换成 `***`，所以 userinfo 里含 `/`
+     或 `@`（密码里带分隔符、多个 `@`）同样整体脱敏，host / path 不动。
 - `--db` 默认取看板库路径（认领闸门的数据源，只读打开）；库打不开 / 不是合法 SQLite /
   读 `tasks` 失败一律 rc2 且说清原因（错误文案点出 `--db <路径>` 与缺省值）——
   **不许**读成「没有卡认领」。

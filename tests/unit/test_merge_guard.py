@@ -1567,6 +1567,26 @@ def test_parse_github_slug_rejects(url: str) -> None:
             "https://oauth2:tok@gitlab.com/o/n.git",
             "https://***@gitlab.com/o/n.git",
         ),
+        # 密码里含 `/`：旧判据（`[^@/]*`）整段不匹配 → 原样回显（PR #46 复验 P2，现场 2）
+        (
+            "https://x-access-token:a55w/0rdTOKEN@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 密码里含 `@`：旧判据只换掉首个 `@` 前的部分 → 尾部 `ssword9` 残留（现场 3）
+        (
+            "https://user:p@ssword9@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 多个 `@` 混合（用户名 + 密码各带一个）：按最后一个 `@` 切，全部吃掉
+        (
+            "https://us@er:p@ss/word@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 只有用户名没有密码同样整段脱敏
+        (
+            "https://x-access-token@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
         # scp 形态的 userinfo 同样脱敏
         ("git@github.com:alsj213/team-board.git", "***@github.com:alsj213/team-board.git"),
         # 没有 userinfo 的 URL 原样返回（本函数不判形态）
@@ -1582,13 +1602,19 @@ def test_redact_url_strips_userinfo(url: str, expected: str) -> None:
 
 
 def test_redact_url_never_leaves_token() -> None:
-    """回归钉子：任一形态下 token 子串都不许留在脱敏结果里。"""
+    """回归钉子：任一形态下凭据子串都不许留在脱敏结果里（含密码带 `/`、`@` 的形态）。"""
 
     token = "ghp_SECRET123"
-    for url in (
-        f"https://x-access-token:{token}@github.com/alsj213/team-board.git",
-        f"https://x-access-token:{token}@github.com/alsj213/team-board",
-        f"x-access-token:{token}@github.com:alsj213/team-board.git",
-    ):
-        assert token not in mg.redact_url(url), url
-
+    cases = [
+        (f"https://x-access-token:{token}@github.com/alsj213/team-board.git", token),
+        (f"https://x-access-token:{token}@gitlab.com/o/n.git", token),
+        (f"x-access-token:{token}@github.com:alsj213/team-board.git", token),
+        # 现场 2 / 3：密码含 `/`、含 `@`（旧判据在这两条上把凭据留在正文里）
+        ("https://x-access-token:a55w/0rdTOKEN@github.com/alsj213/team-board.git", "a55w/0rdTOKEN"),
+        ("https://user:p@ssword9@github.com/alsj213/team-board.git", "ssword9"),
+        ("https://usr9:p@ss/wo@rd88@github.com/alsj213/team-board.git", "rd88"),
+    ]
+    for url, secret in cases:
+        redacted = mg.redact_url(url)
+        assert secret not in redacted, (url, redacted)
+        assert "***" in redacted, (url, redacted)

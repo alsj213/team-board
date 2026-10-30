@@ -1305,27 +1305,38 @@ def parse_github_slug(url: str) -> str | None:
 #: remote URL 里的 userinfo 段（``user:token@`` / ``user@``）。报错正文只许说「不是
 #: GitHub 形态」，**不许**把凭据回显出去：stderr 会进卡片、CI 日志、终端 scrollback，
 #: 一次回显就等于把 token 抄了一遍（PR #46 双问缺陷 P2-1，实测报错正文含 token）。
-_URL_USERINFO_RE = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^@/]*@")
+#:
+#: 判据按**位置**而不按字符集：``://`` 之后到该串**最后一个** ``@`` 之前的全部内容都是
+#: userinfo。用字符集（旧版 ``[^@/]*``）会漏两种真实现场（PR #46 复验 P2，head
+#: ``edb3c2c8`` 实测）：密码含 ``/``（``a55w/0rdTOKEN`` → 整段不匹配、原样回显）与密码
+#: / 用户名含 ``@``（``p@ssword9@`` → 只换掉首个 ``@`` 前的部分，尾部 ``ssword9`` 残留）。
+_SCHEME_PREFIX_RE = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)")
 _SCP_USERINFO_RE = re.compile(r"^(?P<user>[^@/\s]+)@(?=[A-Za-z0-9.-]+:)")
 
 
 def redact_url(url: str) -> str:
     """把 URL 的 userinfo 段换成 ``***``（纯函数，不碰文件系统、不调外部命令）。
 
-    两种形态都脱敏：``https://user:token@github.com/o/n.git`` → ``https://***@github.com/o/n.git``，
-    ``user@github.com:o/n.git`` → ``***@github.com:o/n.git``。
-    没认出 userinfo 的 URL 原样返回 —— 本函数只负责「别把凭据抄出去」，不负责判定形态。
+    两种形态都脱敏：
+
+    - 带 scheme 的：``://`` 之后到该串**最后一个** ``@`` 之前的整段 → ``***``，
+      所以 ``https://user:token@github.com/o/n.git`` → ``https://***@github.com/o/n.git``，
+      密码里含 ``/`` 或 ``@``（``a55w/0rdTOKEN`` / ``p@ssword9``）、多个 ``@`` 混合同样整段
+      换成 ``***``；没有 ``@`` 的 URL 原样返回，host / path 不动。
+    - scp 形态：``user@github.com:o/n.git`` → ``***@github.com:o/n.git``。
+
+    本函数只负责「别把凭据抄出去」，不负责判定形态。
     """
 
     text = (url or "").strip()
-    for pattern, replacement in (
-        (_URL_USERINFO_RE, r"\g<scheme>***@"),
-        (_SCP_USERINFO_RE, "***@"),
-    ):
-        redacted = pattern.sub(replacement, text, count=1)
-        if redacted != text:
-            return redacted
-    return text
+    prefix = _SCHEME_PREFIX_RE.match(text)
+    if prefix is not None:
+        rest = text[prefix.end() :]
+        at = rest.rfind("@")
+        if at < 0:
+            return text
+        return f"{prefix.group('scheme')}***{rest[at:]}"
+    return _SCP_USERINFO_RE.sub("***@", text, count=1)
 
 
 def remote_repo_slug(opts: Options) -> str:
