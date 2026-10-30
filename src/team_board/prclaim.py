@@ -6,7 +6,10 @@
   ``pr-claim-audit`` 与 ``merge-record`` 都调它；
 - ``audit``：把 ``db.iter_claim_rows`` 的行判成 :class:`Report`
   （未结卡里恰好一张卡认领该 PR = 唯一认领）；
-- ``render``：把 :class:`Report` 渲染成 ``pr-claim-audit`` 的整块文本。
+- ``render``：把 :class:`Report` 渲染成 ``pr-claim-audit`` 的整块文本；
+- ``needs_claim`` / ``first_claim_pr`` / ``audit_gaps`` / ``render_gaps``：
+  ``pr-claim-audit --gaps`` 的缺口判据（标题命中合并语义、正文首行却不是
+  ``PR-CLAIM: #<N>``），与内核建卡闸门同一份谓词，见 ``docs/pr-claim-gate.md``。
 
 判定口径（照 R17 原文，一个字都不放宽）：
 
@@ -32,6 +35,21 @@ CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$", re.MULTILINE)
 
 #: 引用行的唯一形态（同样顶格；只回显，不参与判定）
 REF_RE = re.compile(r"^PR-REF: #([1-9][0-9]*)$", re.MULTILINE)
+
+#: 合并语义触发（只看标题前缀；正文关键词版实测误中 60 张返工/文档卡）。
+#: 与内核建卡闸门（``hermes_cli/kanban_db.py`` 的 ``_PR_CLAIM_TRIGGER_RE``）
+#: **必须逐字相同**：改动时两边一起改，详见 ``docs/pr-claim-gate.md``。
+TRIGGER_RE = re.compile(r"^(?:合并卡|收口卡|合并\s*PR\s*#\s*\d+|收口[：:（(])")
+
+#: 正文首行认领行（与 :data:`CLAIM_RE` 同形态，但**只判首行**且不做 MULTILINE）
+FIRST_CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$")
+
+#: ``audit_gaps`` 的末行两种文案（``{count}`` 由 :func:`render_gaps` 填）
+VERDICT_GAPS_NONE = "结论: 无缺口（合并类卡都带 PR-CLAIM）"
+VERDICT_GAPS_SOME = "结论: 缺口 {count} 张（逐张把 PR-CLAIM: #<n> 放到正文首行）"
+
+#: ``GapRow.first`` 的截断长度（整行太长会把一行报告撑爆）
+FIRST_LINE_LIMIT = 40
 
 #: ``--pr`` 的上限（PR 号池只有一个口径，``merge-record`` 也用它）。GitHub 的
 #: PR 号是仓库内递增计数，9 位（< 2**31）已经远超任何真实仓库；13 位毫秒
@@ -131,6 +149,47 @@ def references(body: str | None, pr: int) -> bool:
     return pr in referenced_prs(body)
 
 
+def first_line(body: str | None) -> str:
+    """正文第一个非空行（原样返回，不改写空白）；没有正文/全空行时是空串。
+
+    只判空用 ``strip()``，返回值不 strip：``"  PR-CLAIM: #34"`` 与
+    ``"PR-CLAIM: #34\\r"`` 都要保持原样，交给 :func:`first_claim_pr` 判死。
+    按 ``"\\n"`` 切而不是 ``str.splitlines()`` —— 后者会吞掉 ``\\r``，让
+    ``\\r\\n`` 行尾的卡在缺口稽核里「通过」而 :data:`CLAIM_RE` 却不认它。
+    """
+    if not body:
+        return ""
+    for line in body.split("\n"):
+        if line.strip():
+            return line
+    return ""
+
+
+def needs_claim(title: str | None) -> bool:
+    """标题是否命中合并语义（只看**标题前缀**，理由见 ``docs/pr-claim-gate.md``）。"""
+    if not title:
+        return False
+    return TRIGGER_RE.match(title) is not None
+
+
+def trigger_hit(title: str | None) -> str:
+    """命中合并语义的标题片段（如 ``合并卡``）；不命中时是空串。"""
+    if not title:
+        return ""
+    match = TRIGGER_RE.match(title)
+    return "" if match is None else match.group(0)
+
+
+def first_claim_pr(body: str | None) -> int | None:
+    """正文**首行**认领的 PR 号；首行不是 ``PR-CLAIM: #<N>`` 时是 ``None``。
+
+    首行 = 第一个非空行（见 :func:`first_line`）；认领行必须在首行，且与
+    :data:`CLAIM_RE` 同一形态（顶格、行尾无尾随字符）—— 比它更严，不会更宽。
+    """
+    match = FIRST_CLAIM_RE.fullmatch(first_line(body))
+    return None if match is None else int(match.group(1))
+
+
 def audit(rows: Iterable[tuple[str, str, str, str]], pr: int) -> Report:
     """把 ``(id, status, assignee, body)`` 行判成 :class:`Report`。
 
@@ -176,4 +235,86 @@ def render(report: Report) -> str:
         lines.append(VERDICT_NONE)
     else:
         lines.append(VERDICT_DUPE)
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class GapRow:
+    """一张「标题命中合并语义、正文首行却无 PR-CLAIM」的未结卡。
+
+    - ``hit``：命中的标题片段（如 ``合并卡``）；
+    - ``first``：正文第一个非空行，截 :data:`FIRST_LINE_LIMIT` 字符（控行宽）。
+    """
+
+    id: str
+    status: str
+    assignee: str
+    hit: str
+    first: str
+
+
+@dataclass(frozen=True)
+class GapReport:
+    """一次 ``pr-claim-audit --gaps`` 的全部判据数据。
+
+    - ``pending``：扫描了多少张未结卡；
+    - ``gaps``：缺口卡（按调用方 SQL 的 id 升序）。
+    """
+
+    pending: int
+    gaps: tuple[GapRow, ...]
+
+    @property
+    def ok(self) -> bool:
+        """没有缺口 = 所有合并类卡的首行都带了 ``PR-CLAIM``。"""
+        return not self.gaps
+
+
+def audit_gaps(rows: Iterable[tuple[str, str, str, str, str]]) -> GapReport:
+    """把 ``(id, status, assignee, title, body)`` 行判成 :class:`GapReport`。
+
+    缺口判据两条同时成立：:func:`needs_claim` 为真（标题命中合并语义）且
+    :func:`first_claim_pr` 为 ``None``（首行没有认领行）。两条都用本模块的
+    纯函数，不重复写第三份判定逻辑。
+    """
+    gaps: list[GapRow] = []
+    pending = 0
+    for id_, status, assignee, title, body in rows:
+        pending += 1
+        if not needs_claim(title):
+            continue
+        if first_claim_pr(body) is not None:
+            continue
+        gaps.append(
+            GapRow(
+                id=id_,
+                status=status,
+                assignee=assignee,
+                hit=trigger_hit(title),
+                first=first_line(body)[:FIRST_LINE_LIMIT],
+            )
+        )
+    return GapReport(pending=pending, gaps=tuple(gaps))
+
+
+def exit_code_gaps(report: GapReport) -> int:
+    """0 = 无缺口；1 = 有缺口（逐张把认领行放到正文首行）。"""
+    return 0 if report.ok else 1
+
+
+def render_gaps(report: GapReport) -> str:
+    """渲染 ``--gaps`` 的整块报告（不带尾随换行）。
+
+    三段、顺序固定：``未结卡 N 张`` → 逐张
+    ``GAP <卡号> [status] assignee 触发=<hit> 首行=<first>`` → 末行结论。
+    """
+    lines = [f"未结卡 {report.pending} 张"]
+    lines.extend(
+        f"GAP {row.id} [{row.status}] {row.assignee} 触发={row.hit} 首行={row.first}"
+        for row in report.gaps
+    )
+    if report.ok:
+        lines.append(VERDICT_GAPS_NONE)
+    else:
+        lines.append(VERDICT_GAPS_SOME.format(count=len(report.gaps)))
     return "\n".join(lines)

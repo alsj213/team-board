@@ -195,6 +195,40 @@ def iter_claim_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]
     ]
 
 
+_BODY_COLUMNS_CARD = "id, status, assignee, title, body"
+
+
+def iter_pending_cards(conn: sqlite3.Connection) -> list[tuple[str, str, str, str, str]]:
+    """``(id, status, assignee, title, body)`` 的未结卡，按 id 升序。
+
+    口径与 :func:`iter_claim_rows` 完全相同（:data:`_BODY_SCOPE_PENDING`，
+    ``status NOT IN ('done','archived')``）；只是多取一列 ``title`` 给
+    ``pr-claim-audit --gaps`` 判「标题是否命中合并语义」用。
+    ``body`` / ``status`` / ``assignee`` / ``title`` 的 NULL 一律归成空串，
+    渲染层不必再判空。
+    """
+    # where 来自模块常量（无外部输入，不是注入面）→ bandit B608 假阳性
+    sql = (
+        f"SELECT {_BODY_COLUMNS_CARD} FROM tasks "  # nosec B608
+        f"WHERE {_BODY_SCOPE_PENDING} ORDER BY id"
+    )
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.title/body 失败: {exc}") from exc
+
+    return [
+        (
+            str(row[0]),
+            "" if row[1] is None else str(row[1]),
+            "" if row[2] is None else str(row[2]),
+            "" if row[3] is None else str(row[3]),
+            "" if row[4] is None else str(row[4]),
+        )
+        for row in rows
+    ]
+
+
 def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """task_id -> 'changes_requested' 事件数；0 次的不进字典。"""
     sql = (
