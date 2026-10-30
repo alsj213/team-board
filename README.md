@@ -22,8 +22,9 @@ team-board member engineer
 team-board export
 ```
 
-共十二个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
-`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `pr-claim-audit` / `serve`
+共十三个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `pr-claim-audit` /
+`pr-review-head-audit` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节）。
@@ -907,6 +908,9 @@ REF t_9f000001 [review] pm
 「提交身份稽核」一节。
 `body-audit` 另有一套：`0` 无超限 / `1` **发现**超限卡 / `2` 数据源或参数错误
 （注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
+`pr-review-head-audit` 同理：`1` 表示**该 head 上双问不齐**
+（缺一类 / 两类都缺 / 只有别的 sha 的标记 = head 变过没重跑）、`2` 表示参数或环境
+错误（`--head` 非 40/64 位小写十六进制、`--pr` 非正整数、`gh api` 调用失败）。
 
 ## 口径
 

@@ -45,6 +45,7 @@ EXPECTED_SUBCOMMANDS = (
     "body-audit",
     "push-guard",
     "pr-claim-audit",
+    "pr-review-head-audit",
     "serve",
 )
 
@@ -58,6 +59,7 @@ CN_DIGITS = {
     10: "十",
     11: "十一",
     12: "十二",
+    13: "十三",
 }
 
 
