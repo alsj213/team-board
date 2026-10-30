@@ -36,6 +36,18 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
+def git_bytes(repo: Path, *args: bytes) -> None:
+    """在 ``repo`` 里跑 git，参数按原始字节传（用来造非 UTF-8 的 refname）。"""
+
+    proc = subprocess.run(
+        [b"git", b"-C", os.fsencode(str(repo)), *args],
+        capture_output=True,
+        env=_GIT_ENV,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
 def commit_file(repo: Path, name: str, message: str, content: str = "x\n") -> None:
     """写一个文件并提交（不动工作区其它内容）。"""
 
@@ -911,10 +923,14 @@ def test_branch_evidence_name_returns_zero(
     assert "结论：无偏差" in out
 
 
-def test_branch_odd_evidence_name_keeps_plain_note(
+def test_branch_odd_evidence_name_gets_naming_hint(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--branch evidence/a/b`` 走既有「不是卡分支」文案，不额外加。"""
+    """``--branch evidence/a/b`` 既给「不是卡分支」也给「不符合证据分支命名」。
+
+    卡 t_57648b82 P3-4：修前只给前者，本 diff 承诺的命名提示在 ``--branch`` 形态下
+    缺失。
+    """
 
     git(repo, "branch", "evidence/a/b", "main")
 
@@ -924,7 +940,87 @@ def test_branch_odd_evidence_name_keeps_plain_note(
     assert err == ""
     assert "evidence/a/b 不是卡分支，跳过提交归属检查" in out
     assert "是证据分支" not in out
+    assert (
+        "提示: evidence/a/b 不符合证据分支命名"
+        "（应为 evidence/<字母数字开头的单段名>），按普通分支跳过"
+    ) in out
     assert "证据分支（0 条" in out
+
+
+def test_branch_mode_still_lists_evidence_branches(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卡 t_57648b82 P2-1：CI 只跑 ``--branch``，证据段在那种模式下也必须是真数。
+
+    修前：``--branch`` 模式不跑证据段枚举，恒打印「（0 条）/（无）」而仓库里明明
+    有 2 条 —— CI 上唯一可见的形态是假 0。
+    """
+
+    git(repo, "checkout", "-q", "-b", "wt/t_aaaaaaaa")
+    commit_file(repo, "a.txt", "feat(t_aaaaaaaa): 本卡的活")
+    git(repo, "checkout", "-q", "main")
+    for name in ("evidence/t_589cc33a", "evidence/t_aaaaaaaa-perf"):
+        git(repo, "branch", name, "main")
+
+    rc, out, err = run(["--repo", str(repo), "--branch", "wt/t_aaaaaaaa"], capsys)
+
+    assert rc == 0, out
+    assert err == ""
+    assert "证据分支（2 条，不占卡分支命名空间、不计入提交归属检查）:" in out
+    assert "  evidence/t_589cc33a、evidence/t_aaaaaaaa-perf" in out
+    assert "结论：无偏差" in out
+
+
+def test_evidence_branch_only_on_other_remote_is_consistent(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卡 t_57648b82 P2-2：只在非 ``origin`` 远端存在的证据分支，两种模式口径一致。
+
+    修前：全量模式列它，``--branch evidence/<名>`` 却报「分支不存在」rc2 —— 同一
+    条 ref 两种答案。
+    """
+
+    sha = git(repo, "rev-parse", "main").strip()
+    # 故意不 ``git remote add``：远端没配进 ``git remote`` 也要认
+    git(repo, "update-ref", "refs/remotes/upstream/evidence/t_bbbbbbbb", sha)
+
+    rc_all, out_all, err_all = run(["--repo", str(repo)], capsys)
+
+    assert rc_all == 0, out_all
+    assert err_all == ""
+    assert "证据分支（1 条，不占卡分支命名空间、不计入提交归属检查）:" in out_all
+    assert "  evidence/t_bbbbbbbb" in out_all
+
+    rc, out, err = run(
+        ["--repo", str(repo), "--branch", "evidence/t_bbbbbbbb"], capsys
+    )
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert (
+        "evidence/t_bbbbbbbb 是证据分支，不占卡分支命名空间，跳过提交归属检查" in out
+    )
+    assert "证据分支（1 条" in out
+    assert "结论：无偏差" in out
+
+
+def test_non_utf8_ref_outside_evidence_stays_green(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """卡 t_57648b82 P3-5：``refs/remotes/upstream/br-<非 UTF-8>`` → 不读、不 rc2。
+
+    修前：证据段枚举整个 ``refs/remotes``，非 UTF-8 refname 让整轮稽核 rc0 变 rc2。
+    """
+
+    sha = git(repo, "rev-parse", "main").strip()
+    git_bytes(repo, b"update-ref", b"refs/remotes/upstream/br-\xff\xfe", sha.encode())
+
+    rc, out, err = run(["--repo", str(repo)], capsys)
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert "证据分支（0 条" in out
+    assert "结论：无偏差" in out
 
 
 def test_branch_evidence_nonexistent_returns_two(

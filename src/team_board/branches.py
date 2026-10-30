@@ -66,16 +66,22 @@
 ``[A-Za-z0-9][A-Za-z0-9._-]*``）是长期留证专用的分支命名空间，判据见
 :data:`_EVIDENCE_RE`。它**不占卡分支命名空间**：
 
-- 不进规则 A 的（卡号, ref）集合 —— 不跑 ``git log``，不产 findings / drifts；
-- 不进规则 B 的 worktree 判定、不参与 C-1；
+- 不进规则 A 的（卡号, ref）集合 —— 不跑 ``git log``，不产 findings；不参与 C-1；
+- **规则 B 不豁免**：证据分支只是「留证的 ref」，某个 worktree 里**签出**了证据分支
+  时，规则 B 仍按「其它分支不属于任何卡」判 checkout 偏移（判定一字未改）；
 - 报告里**单列一段** ``证据分支（N 条，不占卡分支命名空间、不计入提交归属检查）:``，
-  来源是 ``refs/heads/evidence/*`` 与 ``refs/remotes/*/evidence/*``，按名字去重、
-  排序；退出码不受它影响；
-- ``--branch evidence/<名>``（分支存在）→ 输出 ``<名> 是证据分支，不占卡分支命名
-  空间，跳过提交归属检查`` 并 rc0；
+  来源是 ``refs/heads/evidence/*`` 与 ``refs/remotes/<任何远端>/evidence/*``，按名字
+  去重、排序；退出码不受它影响；**全量模式与 ``--branch`` 模式都扫**（CI 的
+  ``branch-audit`` job 只走 ``--branch``，不扫就等于恒报 0 条）；
+  枚举只取名字里带 ``evidence/`` 的 ref（``for-each-ref`` 的 pattern 见
+  :func:`_evidence_ref_patterns`），因此其它名字下的非 UTF-8 refname 不再把整轮
+  稽核打成 rc2；
+- ``--branch evidence/<名>``（分支存在，本地或**任何**远端，口径与上面那段枚举一致）
+  → 输出 ``<名> 是证据分支，不占卡分支命名空间，跳过提交归属检查`` 并 rc0；
+  两处口径必须一致，否则全量模式列出来的证据分支在 ``--branch`` 下会误报 rc2；
 - 名字不合规的（``evidence/a/b`` 多段、``evidence/-x`` 非字母数字开头）按**普通
   分支**跳过，输出里给一行 ``提示: … 不符合证据分支命名（应为 evidence/<字母数字
-  开头的单段名>），按普通分支跳过``。
+  开头的单段名>），按普通分支跳过``（两种模式都给）。
 
 ``BRANCH_RE`` 与规则 A/B/C 的判定一字未改：卡分支仍然只认
 ``wt/t_<8 位小写十六进制>``。证据分支不是给卡分支「放宽」出来的豁免，而是另一条
@@ -691,24 +697,52 @@ def _is_evidence_branch(name: str) -> bool:
     return _EVIDENCE_RE.match(name) is not None
 
 
+def _remote_names(repo: str | Path) -> tuple[str, ...]:
+    """``git remote`` 列出的远端名（去空行、排序）。"""
+
+    raw = _must_git(repo, "remote", what="枚举远端失败")
+    return tuple(sorted({line.strip() for line in raw.splitlines() if line.strip()}))
+
+
+def _evidence_ref_patterns(repo: str | Path) -> tuple[str, ...]:
+    """``for-each-ref`` 的 pattern 集：只让名字里带 ``evidence/`` 的 ref 进输出。
+
+    - ``refs/heads/evidence``（前缀匹配，多段名 ``evidence/a/b`` 也算）—— 本地；
+    - ``refs/remotes/*/evidence/*``（fnmatch，``*`` 不跨 ``/``）—— 任何远端上
+      单段名的证据分支，**远端没配进 ``git remote`` 也认**（``update-ref`` 造出来的
+      ``refs/remotes/upstream/evidence/…`` 同样要列出来）；
+    - ``refs/remotes/<远端>/evidence``（前缀匹配）—— 已配置远端上的多段名。
+
+    不再用 ``refs/remotes`` 这种「整个远端命名空间」的 pattern：那样
+    ``refs/remotes/upstream/br-\\xff\\xfe`` 这类非 UTF-8 refname 会被读进来，整轮
+    稽核从 rc0 变 rc2（卡 t_57648b82 P3-5）。
+    """
+
+    patterns = ["refs/heads/evidence", "refs/remotes/*/evidence/*"]
+    patterns.extend(f"refs/remotes/{name}/evidence" for name in _remote_names(repo))
+    return tuple(patterns)
+
+
 def _evidence_branch_scan(
     repo: str | Path,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """枚举证据分支：返回 ``(合规名, 不合规名)``，两者都按名字去重并排序。
 
-    只收 ``refs/heads/evidence/*`` 与 ``refs/remotes/*/evidence/*``（**所有**远端，
-    与规则 C-1 只看 ``origin`` 不同 —— 证据分支是为了「留证在别处」而存在的，
+    只收 ``refs/heads/evidence/*`` 与 ``refs/remotes/<任何远端>/evidence/*``（**所有**
+    远端，与规则 C-1 只看 ``origin`` 不同 —— 证据分支是为了「留证在别处」而存在的，
     其它远端上的同名证据 branch 也该被认出来）。同名本地 + 远端按名字合并成一条。
     名字不合规的（``evidence/a/b``、``evidence/-x``）单独返回，由调用方给提示，
     不按证据分支处理。
+
+    枚举面的收窄见 :func:`_evidence_ref_patterns`：名字里没有 ``evidence/`` 的 ref
+    一律不读，非 UTF-8 的 refname 因此不会把整轮稽核打成 rc2。
     """
 
     raw = _must_git(
         repo,
         "for-each-ref",
         "--format=%(refname)",
-        "refs/heads/evidence",
-        "refs/remotes",
+        *_evidence_ref_patterns(repo),
         what="枚举证据分支失败",
     )
     good: set[str] = set()
@@ -994,55 +1028,78 @@ def audit(
     notes: list[str] = []
     refs: list[tuple[str, str]] = []  # (card, ref)
     evidence: list[str] = []  # R11 证据分支（单列一段，不进 refs）
+
+    # R11：证据分支**两种模式都扫**。CI 的 branch-audit job 只走 ``--branch``
+    # （.github/workflows/test.yml 的 PR / push 两条都带 --branch），若只在全量模式
+    # 扫，那一行在唯一的自动化路径上永远是「（0 条）／（无）」—— 假 0（卡 t_57648b82 P2-1）。
+    evidence_names, odd_names = _evidence_branch_scan(top)
+    evidence.extend(evidence_names)
+    notes.extend(
+        f"{name} 不符合证据分支命名"
+        f"（应为 evidence/<字母数字开头的单段名>），按普通分支跳过"
+        for name in odd_names
+    )
+
     if only_branch is not None:
         requested = only_branch.strip()
         if not requested:
             raise AuditError("--branch 不能为空")
-        card_match = BRANCH_RE.match(
-            requested if requested.startswith("wt/") else f"wt/{requested}"
-        )
-        card = card_match.group(1) if card_match else None
-        if requested.startswith("wt/"):
-            candidates = [
-                f"refs/heads/{requested}",
-                f"refs/remotes/origin/{requested}",
-            ]
-        else:
-            candidates = [
-                f"refs/heads/{requested}",
-                f"refs/remotes/origin/{requested}",
-                f"refs/heads/wt/{requested}",
-                f"refs/remotes/origin/wt/{requested}",
-            ]
-        existing = [
-            candidate for candidate in candidates if _ref_exists(top, candidate)
-        ]
-        if not existing:
-            raise AuditError(f"分支不存在（本地与 origin 都没有）: {requested}")
-        if card is None:
+        if requested.startswith("evidence/"):
+            # 证据分支的存在性检查与上面那次枚举**同一口径**（本地 + 任何远端）：
+            # 两套口径会让「全量模式列出来的证据分支」在 --branch 下报「不存在」rc2
+            #（卡 t_57648b82 P2-2）。证据分支到此为止，不解析成卡分支、不进规则 A/B/C。
+            if requested not in evidence_names and requested not in odd_names:
+                raise AuditError(
+                    f"分支不存在（本地与任何远端都没有）: {requested}"
+                )
             if _is_evidence_branch(requested):
-                # R11：证据分支不占卡分支命名空间 —— rc0，单列一段，不跑规则 A
+                # R11：证据分支不占卡分支命名空间 —— rc0，不跑规则 A
                 notes.append(
                     f"{requested} 是证据分支，不占卡分支命名空间，"
                     f"跳过提交归属检查"
                 )
                 evidence.append(requested)
             else:
+                # 不合规名（evidence/a/b、evidence/-x）：命名提示已由上面的枚举给出
                 notes.append(f"{requested} 不是卡分支，跳过提交归属检查")
         else:
-            card_refs = [ref for ref in existing if "/wt/" in ref]
-            if not card_refs:
-                # 裸卡号只解析到「不带 wt/ 前缀」的同名分支：它根本不是卡分支，
-                # 若就这样放过去，`--branch t_x` 会稽核零条 ref 并报「无偏差」，
-                # 把「PR 头分支漏写 wt/」这种最该抓的偏差放行成假绿。
-                # 卡面只许诺两种写法都指向卡分支，没许诺指向不存在的卡分支时判绿。
-                raise AuditError(
-                    f"分支不存在（本地与 origin 都没有）: wt/{card}"
-                    f"（{requested} 只匹配到 "
-                    f"{'、'.join(ref.removeprefix('refs/') for ref in existing)}，"
-                    f"卡分支必须是 wt/{card}）"
-                )
-            refs.extend((card, ref) for ref in card_refs)
+            card_match = BRANCH_RE.match(
+                requested if requested.startswith("wt/") else f"wt/{requested}"
+            )
+            card = card_match.group(1) if card_match else None
+            if requested.startswith("wt/"):
+                candidates = [
+                    f"refs/heads/{requested}",
+                    f"refs/remotes/origin/{requested}",
+                ]
+            else:
+                candidates = [
+                    f"refs/heads/{requested}",
+                    f"refs/remotes/origin/{requested}",
+                    f"refs/heads/wt/{requested}",
+                    f"refs/remotes/origin/wt/{requested}",
+                ]
+            existing = [
+                candidate for candidate in candidates if _ref_exists(top, candidate)
+            ]
+            if not existing:
+                raise AuditError(f"分支不存在（本地与 origin 都没有）: {requested}")
+            if card is None:
+                notes.append(f"{requested} 不是卡分支，跳过提交归属检查")
+            else:
+                card_refs = [ref for ref in existing if "/wt/" in ref]
+                if not card_refs:
+                    # 裸卡号只解析到「不带 wt/ 前缀」的同名分支：它根本不是卡分支，
+                    # 若就这样放过去，`--branch t_x` 会稽核零条 ref 并报「无偏差」，
+                    # 把「PR 头分支漏写 wt/」这种最该抓的偏差放行成假绿。
+                    # 卡面只许诺两种写法都指向卡分支，没许诺指向不存在的卡分支时判绿。
+                    raise AuditError(
+                        f"分支不存在（本地与 origin 都没有）: wt/{card}"
+                        f"（{requested} 只匹配到 "
+                        f"{'、'.join(ref.removeprefix('refs/') for ref in existing)}，"
+                        f"卡分支必须是 wt/{card}）"
+                    )
+                refs.extend((card, ref) for ref in card_refs)
     else:
         listing = _must_git(
             top,
@@ -1066,15 +1123,6 @@ def audit(
             if not match:
                 continue
             refs.append((match.group(1), ref))
-
-        # R11：证据分支单独扫一遍 —— 它们不进 refs、不跑 git log，只在报告里单列
-        evidence_names, odd_names = _evidence_branch_scan(top)
-        evidence.extend(evidence_names)
-        notes.extend(
-            f"{name} 不符合证据分支命名"
-            f"（应为 evidence/<字母数字开头的单段名>），按普通分支跳过"
-            for name in odd_names
-        )
 
     if allow_file is None:
         allow_path: Path | None = top / ".team-board" / "branch-audit-allow.txt"

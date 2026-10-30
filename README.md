@@ -217,16 +217,21 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 `evidence/t_589cc33a-ci`、`evidence/t_589cc33a-perf`。
 
 - **不占卡分支命名空间**：证据分支不进规则 A 的（卡号, ref）集合 —— 不跑
-  `git log`、不产生提交归属偏差与 checkout 偏移，也不参与 C-1；退出码不受它影响。
-  （超范围提醒：某个 worktree 里**签出**了证据分支时，规则 B 仍按「其它分支」
-  判红 —— 证据分支留在本地/远端 ref 即可，别 checkout 出来。）
+  `git log`、不产生提交归属偏差，也不参与 C-1；退出码不受它影响。规则 B 的
+  checkout 判定**不豁免**（超范围提醒：某个 worktree 里**签出**了证据分支时，仍按
+  「其它分支」判红 —— 证据分支留在本地/远端 ref 即可，别 checkout 出来）。
 - **单列一段**：紧接 `检查的卡分支:` 那行之后打印
   `证据分支（N 条，不占卡分支命名空间、不计入提交归属检查）:`，下一行是顿号
   分隔的名字（`N=0` 时是 `  （无）`）。来源 `refs/heads/evidence/*` 与
-  `refs/remotes/*/evidence/*`（所有远端），同名本地/远端按名字去重、排序。
-- `--branch evidence/<名>`（分支存在）→ 输出一行提示 `… 是证据分支，不占卡分支
-  命名空间，跳过提交归属检查`，rc0；分支不存在 → rc2；`--branch evidence/a/b`
-  这类不合规名走既有的「不是卡分支，跳过」文案。
+  `refs/remotes/<任何远端>/evidence/*`（所有远端，远端没配进 `git remote` 也认），
+  同名本地/远端按名字去重、排序。**全量模式与 `--branch` 模式都扫** —— CI 的
+  `branch-audit` job 两条路径都带 `--branch`，只扫全量模式等于让这一行在 CI 里恒为
+  0 条（假 0）。枚举只读名字里带 `evidence/` 的 ref，因此 `refs/remotes/upstream/
+  br-<非 UTF-8>` 这类无关 refname 不会把稽核打成 rc2。
+- `--branch evidence/<名>` → 存在性口径与上面那段**枚举一致**（本地或任何远端）：
+  存在 → 输出一行提示 `… 是证据分支，不占卡分支命名空间，跳过提交归属检查`，rc0；
+  不存在 → rc2（`分支不存在（本地与任何远端都没有）`）；`--branch evidence/a/b`
+  这类不合规名 → 提示行「不合规证据分支命名」+ 既有「不是卡分支，跳过」，rc0。
 - **卡分支口径未放宽**：`BRANCH_RE` 一字未改，卡分支仍只认
   `wt/t_<8 位小写十六进制>`；把同一条提交搬到 `wt/<不存在的卡号>` 上照旧判
   `未声明卡号` rc1（见下方实测 A/B 对照）。
