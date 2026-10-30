@@ -165,8 +165,9 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
 
 - `--repo PATH` —— 要稽核的 git 仓库（默认 `.`）。
 - `--main-branch NAME` —— 主分支名（默认 `main`）；本地没有就退回 `origin/<NAME>`。
-- `--branch NAME` —— 只查这一条分支（`wt/t_xxx` 或 `t_xxx` 两种写法都行）；
-  CI 用它让每张 PR 只对自己的分支负责。它**只影响规则 A 与 C-2**：**C-1 永远全仓
+- `--branch NAME` —— 只查这一条分支（`wt/t_xxx` 或 `t_xxx` 两种写法都行，
+  也接受 `evidence/xxx`（证据分支，见下）；CI 用它让每张 PR 只对自己的分支负责）。
+  它**只影响规则 A 与 C-2**：**C-1 永远全仓
   枚举、与 `--branch` 无关**（所以 CI 里只传 `--branch` 也照样拦得住「一卡两分支」）。
   指定的分支存在但不是卡分支 → 输出 `… 不是卡分支，跳过提交归属检查`，规则 A 与
   C-2 都不跑（C-1 照跑）。指定的卡号解析不到 `wt/t_xxx` 卡分支（例如只有漏写
@@ -208,6 +209,76 @@ team-board branch-audit [--repo PATH] [--main-branch NAME] [--branch NAME] [--al
   C-2 受 `--branch` 影响。
 - 报告新增段 `分支结构偏差（N 处）`；结论行 `… （提交归属 a 处 / checkout b 处 /
   分支结构 c 处）`，`分支结构 c 处` 无条件打印（0 也打）。
+
+**证据分支命名空间（R11）。** 长期留证的分支一律叫 `evidence/<单段名>`：`evidence/`
+之后**只许一段**，字符集 `[A-Za-z0-9][A-Za-z0-9._-]*`（`evidence` + 空名、
+`evidence/a/b` 多段、`evidence/-x` 非字母数字开头都不算）。推荐带卡号
+`evidence/t_<8 位卡号>`；同一张卡多份证据加主题后缀：`evidence/t_589cc33a`、
+`evidence/t_589cc33a-ci`、`evidence/t_589cc33a-perf`。
+
+- **不占卡分支命名空间**：证据分支不进规则 A 的（卡号, ref）集合 —— 不跑
+  `git log`、不产生提交归属偏差，也不参与 C-1；退出码不受它影响。规则 B 的
+  checkout 判定**不豁免**（超范围提醒：某个 worktree 里**签出**了证据分支时，仍按
+  「其它分支」判红 —— 证据分支留在本地/远端 ref 即可，别 checkout 出来）。
+- **单列一段**：紧接 `检查的卡分支:` 那行之后打印
+  `证据分支（N 条，不占卡分支命名空间、不计入提交归属检查）:`，下一行是顿号
+  分隔的名字（`N=0` 时是 `  （无）`）。来源 `refs/heads/evidence/*` 与
+  `refs/remotes/<任何远端>/evidence/*`（所有远端，远端没配进 `git remote` 也认），
+  同名本地/远端按名字去重、排序。**全量模式与 `--branch` 模式都扫** —— CI 的
+  `branch-audit` job 两条路径都带 `--branch`，只扫全量模式等于让这一行在 CI 里恒为
+  0 条（假 0）。枚举只读名字里带 `evidence/` 的 ref，因此 `refs/remotes/upstream/
+  br-<非 UTF-8>` 这类无关 refname 不会把稽核打成 rc2。
+- `--branch evidence/<名>` → 存在性口径与上面那段**枚举一致**（本地或任何远端）：
+  存在 → 输出一行提示 `… 是证据分支，不占卡分支命名空间，跳过提交归属检查`，rc0；
+  不存在 → rc2（`分支不存在（本地与任何远端都没有）`）；`--branch evidence/a/b`
+  这类不合规名 → 提示行「不合规证据分支命名」+ 既有「不是卡分支，跳过」，rc0。
+- **卡分支口径未放宽**：`BRANCH_RE` 一字未改，卡分支仍只认
+  `wt/t_<8 位小写十六进制>`；把同一条提交搬到 `wt/<不存在的卡号>` 上照旧判
+  `未声明卡号` rc1（见下方实测 A/B 对照）。
+- 旧证据分支不动：已经叫 `wt/*` 的老证据分支（如 `wt/t_589cc33a`）原样保留 ——
+  不删、不改名、不回改历史。
+
+`t_3e2a3582` 实测（`mktemp -d` 临时仓：`main` 一条提交，`evidence/t_589cc33a`
+上一条不申报卡号的 `chore: 证据留档`）：
+
+```
+$ team-board branch-audit --repo <临时仓>
+分支稽核（提交归属 + checkout 偏移 + 分支结构）
+仓库: /tmp/…/repo
+主分支: main
+检查的卡分支: （无）
+证据分支（1 条，不占卡分支命名空间、不计入提交归属检查）:
+  evidence/t_589cc33a
+提交归属偏差（0 处）:
+  （无）
+checkout 偏移（0 处）:
+  （无）
+分支结构偏差（0 处）:
+  （无）
+豁免（0 条）:
+  （无）
+结论：无偏差
+rc=0
+```
+
+同一条提交改放到 `wt/t_589cc33a` 形态以外的**不存在的卡号**分支上
+（`wt/t_deadbeef`）→ 同一命令 rc1，输出 `卡 t_deadbeef 的分支上，提交 …
+未声明卡号（无法归属）`、`证据分支（0 条…）`：这一步就是「没借证据分支放行
+卡分支」的凭证。
+
+`--branch evidence/t_589cc33a` 与全量模式的差别只有一行提示：
+
+```
+$ team-board branch-audit --repo <临时仓> --branch evidence/t_589cc33a
+…
+检查的卡分支: （无）
+证据分支（1 条，不占卡分支命名空间、不计入提交归属检查）:
+  evidence/t_589cc33a
+提示: evidence/t_589cc33a 是证据分支，不占卡分支命名空间，跳过提交归属检查
+…
+结论：无偏差
+rc=0
+```
 
 **爆炸半径**（务必先读再动分支）：C-1 是全仓枚举 —— 任何**一条**含合法卡号却不是
 `wt/<卡号>` 的分支（`wt/t_x-fix`、裸 `t_x`、`x/t_x`、`evidence2/t_x`、rebase 备份
