@@ -157,3 +157,79 @@ class TestRenderGaps:
             "结论: 缺口 1 张（逐张把 PR-CLAIM: #<n> 放到正文首行）",
         ]
         assert prclaim.exit_code_gaps(report) == 1
+
+    def test_control_chars_are_escaped_in_render(self) -> None:
+        """``\\r`` / ``\\t`` 在报告里转义成可见字符：终端不会被回车拉回行首。"""
+        report = prclaim.GapReport(
+            pending=1,
+            gaps=(
+                prclaim.GapRow(
+                    id="t_crlf", status="running", assignee="engineer", hit="合并卡",
+                    first="PR-CLAIM: #47\r",
+                ),
+            ),
+        )
+        line = prclaim.render_gaps(report).splitlines()[1]
+        assert line == r"GAP t_crlf [running] engineer 触发=合并卡 首行=PR-CLAIM: #47\r"
+        assert "\r" not in line
+
+    def test_visible_leaves_normal_text_alone(self) -> None:
+        assert prclaim.visible("目标：…)") == "目标：…)"
+        assert prclaim.visible("a\tb") == "a\\tb"
+        assert prclaim.visible("\x00\x7f") == "\\x00\\x7f"
+
+
+class TestKernelDifferencePin:
+    """钉住「缺口稽核」与内核建卡闸门（卡 ``t_c6ab9672``）的差异集。
+
+    内核 ``_validate_pr_claim`` 取首行用 ``ln.strip()`` + ``str.splitlines()``；
+    本仓 :func:`prclaim.first_line` 不 strip、按 ``\\n`` 切（与 :data:`CLAIM_RE`
+    对齐，``merge_guard`` 也只看 ``CLAIM_RE``）。因此两边在**恰好 4 种形态**上
+    不同：首行缩进 / tab / CRLF / 行尾空格 —— 内核 ACCEPT，稽核报 GAP。
+
+    这张表是内联期望（不 import 内核，CI 不依赖 Hermes 源码）；内核那份若改成
+    同样严格、或本仓改成 mirror 内核，这张表会先红，逼着同轮改
+    ``docs/pr-claim-gate.md`` §2/§5。
+    """
+
+    TITLE = "合并卡（pm）：k"
+
+    #: (样例名, 正文, 内核建卡, 本仓缺口稽核)
+    TABLE: tuple[tuple[str, str, str, str], ...] = (
+        ("正常", "PR-CLAIM: #47\n目标", "ACCEPT", "OK"),
+        ("首行缩进", "  PR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
+        ("首行 tab", "\tPR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
+        ("CRLF", "PR-CLAIM: #47\r\n目标", "ACCEPT", "GAP"),
+        ("行尾空格", "PR-CLAIM: #47 \n目标", "ACCEPT", "GAP"),
+        ("行尾尾随文字", "PR-CLAIM: #47 我领了\n目标", "REJECT", "GAP"),
+        ("冒号后缺空格", "PR-CLAIM:#47\n目标", "REJECT", "GAP"),
+        ("#0", "PR-CLAIM: #0\n目标", "REJECT", "GAP"),
+        ("第二行才有", "目标：…\nPR-CLAIM: #47", "REJECT", "GAP"),
+        ("完全没有", "目标：…", "REJECT", "GAP"),
+    )
+
+    @staticmethod
+    def _audit(body: str) -> str:
+        return "OK" if prclaim.first_claim_pr(body) is not None else "GAP"
+
+    def test_audit_side_matches_table(self) -> None:
+        actual = {name: self._audit(body) for name, body, _k, _a in self.TABLE}
+        expected = {name: a for name, _b, _k, a in self.TABLE}
+        assert actual == expected
+
+    def test_diff_set_is_exactly_the_four_stripped_forms(self) -> None:
+        diffs = [name for name, _b, k, a in self.TABLE if (k == "ACCEPT") != (a == "OK")]
+        assert diffs == ["首行缩进", "首行 tab", "CRLF", "行尾空格"]
+
+    def test_kernel_never_accepts_what_audit_rejects_interchangeably(self) -> None:
+        """稽核只在「内核放过、我们判死」方向差 —— 没有反向差异（我们更宽）。"""
+        reverse = [name for name, _b, k, a in self.TABLE if k == "REJECT" and a == "OK"]
+        assert reverse == []
+
+    def test_audit_pass_implies_claim_re_matches(self) -> None:
+        """「不会更宽」：首行过了，``CLAIM_RE`` 一定也认它（merge_guard 与稽核同口径）。"""
+        for name, body, _k, verdict in self.TABLE:
+            if verdict != "OK":
+                continue
+            assert prclaim.CLAIM_RE.search(body) is not None, name
+            assert prclaim.first_claim_pr(body) in prclaim.claimed_prs(body), name

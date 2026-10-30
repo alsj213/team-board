@@ -9,7 +9,8 @@
 - ``render``：把 :class:`Report` 渲染成 ``pr-claim-audit`` 的整块文本；
 - ``needs_claim`` / ``first_claim_pr`` / ``audit_gaps`` / ``render_gaps``：
   ``pr-claim-audit --gaps`` 的缺口判据（标题命中合并语义、正文首行却不是
-  ``PR-CLAIM: #<N>``），与内核建卡闸门同一份谓词，见 ``docs/pr-claim-gate.md``。
+  ``PR-CLAIM: #<N>``）。触发谓词与内核建卡闸门逐字相同，**首行判据刻意更严**
+  （不 strip），差异集 4 种形态见 ``docs/pr-claim-gate.md`` 第 2 节。
 
 判定口径（照 R17 原文，一个字都不放宽）：
 
@@ -36,12 +37,15 @@ CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$", re.MULTILINE)
 #: 引用行的唯一形态（同样顶格；只回显，不参与判定）
 REF_RE = re.compile(r"^PR-REF: #([1-9][0-9]*)$", re.MULTILINE)
 
-#: 合并语义触发（只看标题前缀；正文关键词版实测误中 60 张返工/文档卡）。
+#: 合并语义触发（只看标题前缀；关键词版显著更宽 —— 现板实测见
+#: ``docs/pr-claim-gate.md`` 第 3 节，含返工/文档卡误中）
 #: 与内核建卡闸门（``hermes_cli/kanban_db.py`` 的 ``_PR_CLAIM_TRIGGER_RE``）
-#: **必须逐字相同**：改动时两边一起改，详见 ``docs/pr-claim-gate.md``。
+#: **正则文本必须逐字相同**：改动时两边一起改，详见 ``docs/pr-claim-gate.md``。
 TRIGGER_RE = re.compile(r"^(?:合并卡|收口卡|合并\s*PR\s*#\s*\d+|收口[：:（(])")
 
-#: 正文首行认领行（与 :data:`CLAIM_RE` 同形态，但**只判首行**且不做 MULTILINE）
+#: 正文首行认领行（与 :data:`CLAIM_RE` 同形态，但**只判首行**且不做 MULTILINE。
+#: 刻意**不** ``strip()``：比内核建卡闸门更严，差异集 4 种形态钉在
+#: ``tests/unit/test_prclaim_gaps.py`` 的 ``TestKernelDifferencePin``）
 FIRST_CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$")
 
 #: ``audit_gaps`` 的末行两种文案（``{count}`` 由 :func:`render_gaps` 填）
@@ -156,6 +160,12 @@ def first_line(body: str | None) -> str:
     ``"PR-CLAIM: #34\\r"`` 都要保持原样，交给 :func:`first_claim_pr` 判死。
     按 ``"\\n"`` 切而不是 ``str.splitlines()`` —— 后者会吞掉 ``\\r``，让
     ``\\r\\n`` 行尾的卡在缺口稽核里「通过」而 :data:`CLAIM_RE` 却不认它。
+
+    这是**刻意**比内核建卡闸门更严的地方（内核 ``_validate_pr_claim`` 用
+    ``ln.strip()`` + ``str.splitlines()``）：稽核与 :data:`CLAIM_RE` 对齐，
+    因为 ``merge_guard`` 认认领行时只看 ``CLAIM_RE``。差异集恰好 4 种形态
+    （首行缩进 / tab / CRLF / 行尾空格），钉在
+    ``tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin``。
     """
     if not body:
         return ""
@@ -185,6 +195,8 @@ def first_claim_pr(body: str | None) -> int | None:
 
     首行 = 第一个非空行（见 :func:`first_line`）；认领行必须在首行，且与
     :data:`CLAIM_RE` 同一形态（顶格、行尾无尾随字符）—— 比它更严，不会更宽。
+    比内核建卡闸门**也更严**（内核会 ``strip()`` 首行，见 :func:`first_line`
+    的说明与 ``TestKernelDifferencePin``）。
     """
     match = FIRST_CLAIM_RE.fullmatch(first_line(body))
     return None if match is None else int(match.group(1))
@@ -302,15 +314,37 @@ def exit_code_gaps(report: GapReport) -> int:
     return 0 if report.ok else 1
 
 
+def visible(text: str) -> str:
+    """把控制字符换成可见转义，供报告里显示。
+
+    正文首行可能带 ``\\r``（CRLF 卡）或 ``\\t``：原样打进终端时 ``\\r`` 会把光标
+    拉回行首、污染整行报告。只动**渲染**，不动判定（:func:`audit_gaps` 的
+    ``GapRow.first`` 仍是原文的前 :data:`FIRST_LINE_LIMIT` 个字符）。
+    """
+    out: list[str] = []
+    for ch in text:
+        if ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def render_gaps(report: GapReport) -> str:
     """渲染 ``--gaps`` 的整块报告（不带尾随换行）。
 
     三段、顺序固定：``未结卡 N 张`` → 逐张
     ``GAP <卡号> [status] assignee 触发=<hit> 首行=<first>`` → 末行结论。
+    ``<first>`` 经 :func:`visible` 转义控制字符后显示（判定不受影响）。
     """
     lines = [f"未结卡 {report.pending} 张"]
     lines.extend(
-        f"GAP {row.id} [{row.status}] {row.assignee} 触发={row.hit} 首行={row.first}"
+        f"GAP {row.id} [{row.status}] {row.assignee} 触发={row.hit} "
+        f"首行={visible(row.first)}"
         for row in report.gaps
     )
     if report.ok:
