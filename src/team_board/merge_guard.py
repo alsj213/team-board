@@ -119,8 +119,11 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
 合出来的提交必然过不了 ``merge-audit --require``（缺 ``merged-by`` / ``merge-card`` /
 ``merge-pr`` 三条）。所以合并模式多四个**必填**参数，全部原样转发给 ``gh pr merge``：
 
-``gh pr merge <pr> --merge --delete-branch --match-head-commit <sha> --subject <subject>
---body-file <path>``
+``gh pr merge <pr> -R <owner/name> --merge --delete-branch --match-head-commit <sha>
+--subject <subject> --body-file <path>``
+
+``-R <owner/name>`` 是仓库钉死（PR #46 双问缺陷 P2-2）：它必须与双问闸门核对过的仓库是
+同一个值，于是「核对的是 A、操作的是 B」不成立。不钉时 gh 按 ``GH_REPO`` / cwd 选仓。
 
 - ``--card`` 形如 ``t_[0-9a-f]{8}``、``--by`` 形如 ``<profile>/run<NNN>`` —— 用
   :mod:`team_board.merges` 的 ``MERGE_CARD_RE`` / ``MERGE_BY_RE`` 校验，**不复制正则**；
@@ -741,6 +744,7 @@ def merge_argv(
     head_oid: str,
     subject: str,
     body_file: str,
+    repo_slug: str,
 ) -> tuple[str, ...]:
     """合并 argv（顺序固定，不许改）。
 
@@ -748,11 +752,16 @@ def merge_argv(
     （R13 / R12 / 预检钉提交），认账的 ``--subject`` 与 ``--body-file`` 只能**追加**在
     ``--match-head-commit <sha>`` 之后：
 
-        gh pr merge <pr> --merge --delete-branch --match-head-commit <sha>
-            --subject <subject> --body-file <path>
+        gh pr merge <pr> -R <owner/name> --merge --delete-branch
+            --match-head-commit <sha> --subject <subject> --body-file <path>
 
     不带这两个参数时 gh 用默认文案生成合并提交 message，**没有任何 trailer**，
     经本工具合出来的提交必然过不了 ``merge-audit --require``（缺认账三字段）。
+
+    ``-R <owner/name>`` 是**必须**的（PR #46 双问缺陷 P2-2）：不带 ``-R`` 时 gh 按
+    ``GH_REPO`` 环境变量 / cwd 的 remote 选仓库，而本工具的仓库核对看的是
+    ``git config --get remote.<name>.url`` —— 两者可以指向不同仓库，于是「核对的是 A、
+    合并的是 B」。``-R`` 的优先级高于 ``GH_REPO``，钉住它才有「核对对象 = 操作对象」。
     """
 
     return (
@@ -760,6 +769,8 @@ def merge_argv(
         "pr",
         "merge",
         str(pr),
+        "-R",
+        repo_slug,
         f"--{method}",
         "--delete-branch",
         "--match-head-commit",
@@ -769,6 +780,21 @@ def merge_argv(
         "--body-file",
         body_file,
     )
+
+
+def pr_view_argv(
+    pr: int, repo_slug: str, fields: str = _PR_VIEW_FIELDS
+) -> tuple[str, ...]:
+    """``gh pr view <n> -R <owner/name> --json <fields>``：仓库显式钉死。
+
+    不带 ``-R`` 时 gh 按 ``GH_REPO`` 环境变量 / cwd 的 remote 选仓库（实测：``GH_REPO``
+    指别仓时 ``gh pr view`` 读的是别仓的同号 PR，rc 仍是 0）—— 而本工具的仓库核对读的
+    是 ``git config --get remote.<name>.url``。两者能各指一个仓库，于是「核对的是 A、
+    操作的是 B」。``-R`` 的优先级高于 ``GH_REPO``，预检与合并都钉住它，
+    「核对对象 = 操作对象」才成立（PR #46 双问缺陷 P2-2）。
+    """
+
+    return ("gh", "pr", "view", str(pr), "-R", repo_slug, "--json", fields)
 
 
 class Probe:
@@ -1276,6 +1302,32 @@ def parse_github_slug(url: str) -> str | None:
     return match.group("slug").lower()
 
 
+#: remote URL 里的 userinfo 段（``user:token@`` / ``user@``）。报错正文只许说「不是
+#: GitHub 形态」，**不许**把凭据回显出去：stderr 会进卡片、CI 日志、终端 scrollback，
+#: 一次回显就等于把 token 抄了一遍（PR #46 双问缺陷 P2-1，实测报错正文含 token）。
+_URL_USERINFO_RE = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^@/]*@")
+_SCP_USERINFO_RE = re.compile(r"^(?P<user>[^@/\s]+)@(?=[A-Za-z0-9.-]+:)")
+
+
+def redact_url(url: str) -> str:
+    """把 URL 的 userinfo 段换成 ``***``（纯函数，不碰文件系统、不调外部命令）。
+
+    两种形态都脱敏：``https://user:token@github.com/o/n.git`` → ``https://***@github.com/o/n.git``，
+    ``user@github.com:o/n.git`` → ``***@github.com:o/n.git``。
+    没认出 userinfo 的 URL 原样返回 —— 本函数只负责「别把凭据抄出去」，不负责判定形态。
+    """
+
+    text = (url or "").strip()
+    for pattern, replacement in (
+        (_URL_USERINFO_RE, r"\g<scheme>***@"),
+        (_SCP_USERINFO_RE, "***@"),
+    ):
+        redacted = pattern.sub(replacement, text, count=1)
+        if redacted != text:
+            return redacted
+    return text
+
+
 def remote_repo_slug(opts: Options) -> str:
     """``--repo`` + ``--remote`` 指向的 GitHub 仓库 ``owner/name``；判不了 → rc2。
 
@@ -1285,6 +1337,10 @@ def remote_repo_slug(opts: Options) -> str:
 
     只读一条 ``git config --get``（不联网、不写）。读不到 / 不是 GitHub URL 都拒绝：
     双问闸门要核对的正是「读的是不是这个仓库的评审」，判不了就不许放行。
+
+    调用方必须把结果显式钉进**每一条** gh 调用（``gh pr view <n> -R <slug>`` /
+    ``gh pr merge <n> -R <slug>``）：不钉 ``-R`` 时 gh 按 ``GH_REPO`` / cwd 选仓库，
+    于是核对的仓库与操作的仓库可以是两个（PR #46 双问缺陷 P2-2）。
     """
 
     argv = ("git", "-C", opts.repo, "config", "--get", f"remote.{opts.remote}.url")
@@ -1298,9 +1354,12 @@ def remote_repo_slug(opts: Options) -> str:
     url = proc.stdout.strip()
     slug = parse_github_slug(url)
     if slug is None:
+        # 配置里可能带凭据（``https://x-access-token:<token>@github.com/...``），
+        # 报错正文只许出现脱敏形态：stderr 会进卡片 / CI 日志 / scrollback。
         raise MergeGuardError(
             f"--repo {opts.repo} 的 remote {opts.remote} 不是 GitHub 形态"
-            f"（git config --get remote.{opts.remote}.url 输出 {url or '(空)'!r}），"
+            f"（git config --get remote.{opts.remote}.url 输出 {redact_url(url) or '(空)'!r}；"
+            "URL 里的 userinfo 已脱敏为 ***），"
             f"无法判定双问绑定的仓库就是 {reviewhead.REPO}；拒绝合并"
             "（跨仓 / 非 GitHub 远端时不许拿别的仓库的评审判定）"
         )
@@ -1375,7 +1434,7 @@ def claim_gate(opts: Options, info: Preflight) -> str:
     )
 
 
-def review_head_gate(opts: Options, info: Preflight) -> str:
+def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
     """**合并前双问绑定闸门**（R18④）：该 head sha 上 defect + regression 各 ≥1 条。
 
     取数与判定全调 :mod:`team_board.reviewhead`（``pr-review-head-audit`` 子命令的同一份
@@ -1384,11 +1443,15 @@ def review_head_gate(opts: Options, info: Preflight) -> str:
     不是 JSON）一律 rc2 —— 「读不到评审」不许被读成「双问没做」（那是 rc1 语义，本工具
     只有 rc2 这一档拒绝）。
 
-    取数前先核对**仓库**：``reviewhead`` 的 ``gh api`` 路径前缀写死
-    ``REPO = alsj213/team-board``，不看 ``--repo``。跨仓时它会去读**另一个仓库**同号
-    PR 的 Review —— 方向虽是拒绝（几乎必「双问缺证」），但判的是别人的评审，不是本次
-    合并对象的。所以先用 ``git config --get remote.<name>.url`` 解析 ``--repo`` 的
-    ``owner/name``，与 ``reviewhead.REPO`` 不一致（或 URL 解析不出 GitHub 形态）就 rc2 拒绝。
+    ``repo_slug`` 由调用方在**预检 gh 调用之前**算好（:func:`remote_repo_slug`，即
+    ``--repo`` 的 ``git config --get remote.<name>.url`` 解析出的 ``owner/name``）：
+
+    ``reviewhead`` 的 ``gh api`` 路径前缀写死 ``REPO = alsj213/team-board``，不看
+    ``--repo``。跨仓时它会去读**另一个仓库**同号 PR 的 Review —— 方向虽是拒绝（几乎必
+    「双问缺证」），但判的是别人的评审，不是本次合并对象的。所以这里先与
+    ``reviewhead.REPO`` 对齐，不一致（或 URL 解析不出 GitHub 形态）就 rc2 拒绝。
+    同一个 slug 也正是调用方钉进 ``gh pr view -R`` / ``gh pr merge -R`` 的那个值：
+    「核对的是 A、操作的是 B」不许成立。
 
     三种拒绝文案一眼可分：
 
@@ -1397,11 +1460,10 @@ def review_head_gate(opts: Options, info: Preflight) -> str:
     - 当前 head 上缺某一类 → ``双问缺类``（附缺的类）。
     """
 
-    slug = remote_repo_slug(opts)
-    if slug != reviewhead.REPO.lower():
+    if repo_slug != reviewhead.REPO.lower():
         raise MergeGuardError(
             f"双问绑定闸门拦下 PR #{opts.pr}：--repo {opts.repo}（remote {opts.remote}）"
-            f"对应仓库 {slug} ≠ 双问判定仓库 {reviewhead.REPO}"
+            f"对应仓库 {repo_slug} ≠ 双问判定仓库 {reviewhead.REPO}"
             "（reviewhead 的 gh api 路径前缀写死，跨仓会拿别的仓库同号 PR 的评审当证据）；拒绝合并"
         )
     head = info.head_oid
@@ -1902,18 +1964,21 @@ def _match_head_unsupported(proc: CommandResult) -> bool:
     return any(hint in text for hint in _UNSUPPORTED_FLAG_HINTS)
 
 
-def fetch_pr_state(opts: Options) -> str | None:
-    """``gh pr view <n> --json state``：反查 gh 非 0 时 PR 的真实状态。
+def fetch_pr_state(opts: Options, repo_slug: str) -> str | None:
+    """``gh pr view <n> -R <slug> --json state``：反查 gh 非 0 时 PR 的真实状态。
 
     只判 ``state`` 一个字段：``MERGED`` = 合并已经发生（gh 的非 0 来自合并**之后**的
     步骤，比如删本地分支失败），调用方要继续做删除验证；其它值 = 合并没发生。
+
+    ``-R`` 与预检 / 合并用的是**同一个** slug（不是 ``GH_REPO``）：反查必须看同一个
+    仓库，否则「合并失败」可能被别仓同号 PR 的 ``MERGED`` 读成「合并已发生」。
 
     反查本身失败（gh 不在 PATH、非 0、输出不是 JSON / 不是对象 / 没有 string 类型的
     ``state``）一律返回 ``None`` —— 反查是补充证据，不是新的失败源，**不许**把 rc1
     「合并失败」悄悄变成 rc2。
     """
 
-    argv = ("gh", "pr", "view", str(opts.pr), "--json", "state")
+    argv = pr_view_argv(opts.pr, repo_slug, "state")
     try:
         proc = _run(argv, cwd=opts.repo, timeout=opts.command_timeout)
     except MergeGuardError:
@@ -1977,15 +2042,10 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         )
     # 合并**前**的「源分支必须存在」闸门：排在所有 gh 调用之前，失败即 rc2 且 stdout 空。
     presence = ensure_branch_present(opts)
-    view_argv = (
-        "gh",
-        "pr",
-        "view",
-        str(opts.pr),
-        "--json",
-        _PR_VIEW_FIELDS,
-    )
-    view = _run(view_argv, cwd=opts.repo, timeout=opts.command_timeout)
+    # 仓库身份在这一步算定（只读一条 git config，不发 gh）：此后每一条 gh 调用都用这
+    # 同一个 slug 显式钉 `-R`，闸门核对的对象与实际操作的仓库因此是同一个（P2-2）。
+    repo_slug = remote_repo_slug(opts)
+    view = _run(pr_view_argv(opts.pr, repo_slug), cwd=opts.repo, timeout=opts.command_timeout)
     if view.returncode != 0:
         raise MergeGuardError(
             f"gh pr view {opts.pr} 失败（rc={view.returncode}）: {key_line(view)}"
@@ -2010,7 +2070,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
     #   ② 双问绑定 head sha（R18④）——只发两条 gh api GET。
     # 两者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
     claim_line = claim_gate(opts, info)
-    review_line = review_head_gate(opts, info)
+    review_line = review_head_gate(opts, info, repo_slug)
     # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。
     # 排在这里（而不是 lines 攒完之后）是刻意的：拒绝时 stdout 必须 0 字节，
     # 否则下游会把半截证据行读成「已经走到合并了」。PASS 行插在 head sha 之后。
@@ -2047,6 +2107,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         info.head_oid,
         accounting.subject,
         accounting.body_file,
+        repo_slug,
     )
     # 从这一行起合并随时可能已经发生：任何异常都必须带着上面那条「预检 | PASS」
     # （以及合并成功后的「合并 | PASS」）走 rc2，不许落 rc1、不许冒 traceback。
@@ -2057,7 +2118,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
                 # 老版本 gh 不认这个 flag：它在解析 argv 时就退出，**合并没发生**。
                 # 先反查一次 PR 状态兜底（万一真是合并后报的这句），仍不是 MERGED
                 # 就按「合并前 rc2」处理 —— 绝不允许退回「不带 sha 合并」。
-                state = fetch_pr_state(opts)
+                state = fetch_pr_state(opts, repo_slug)
                 if state != "MERGED":
                     raise UnsupportedMatchHeadCommit(
                         "gh pr merge 不接受 --match-head-commit"
@@ -2069,7 +2130,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
             # 所以先反查 PR 状态，再决定是「合并失败」还是「合并已发生」。
             _write_stderr_raw(merge.stdout)
             _write_stderr_raw(merge.stderr)
-            state = fetch_pr_state(opts)
+            state = fetch_pr_state(opts, repo_slug)
             state_text = state if state is not None else "反查失败"
             if state != "MERGED":
                 lines.append(

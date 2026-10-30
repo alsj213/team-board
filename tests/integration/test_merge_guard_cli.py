@@ -45,7 +45,11 @@ REMOTE_CALL = "git -C {repo} config --get remote.origin.url"
 
 #: ``gh pr view`` 要的字段（``headRefOid`` 是「预检钉到提交」的凭据）
 VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
-VIEW_CALL = f"gh pr view 9 --json {VIEW_FIELDS}"
+#: 仓库身份（``reviewhead.REPO`` 的小写形态）：合并模式的每一条 gh 调用都必须钉它
+REPO_SLUG = "alsj213/team-board"
+VIEW_CALL = f"gh pr view 9 -R {REPO_SLUG} --json {VIEW_FIELDS}"
+#: 合并失败后的状态反查（同一个 ``-R``，不看 ``GH_REPO``）
+STATE_CALL = f"gh pr view 9 -R {REPO_SLUG} --json state"
 
 
 def merge_call(
@@ -58,7 +62,7 @@ def merge_call(
 
     path = stub.body_file if body_file is None else body_file
     return (
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID} "
         f"--subject {subject} --body-file {path}"
     )
 
@@ -828,7 +832,7 @@ def test_merge_failure_rc1_and_no_verification(
     assert len([call for call in stub.git_calls() if " ls-remote " in call]) == 1
     assert stub.git_calls()[0].startswith("git -C ")
     assert merge_call(stub) in stub.gh_calls()
-    assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
+    assert STATE_CALL in stub.gh_calls()  # 做了状态反查（同一个 -R）
     assert "合并 | FAIL" in out
     assert "合并失败" in out
     assert "PR 状态 OPEN" in out
@@ -855,7 +859,7 @@ def test_merge_gh_nonzero_but_state_merged_then_verification_deleted_rc0(
 
     assert rc == 0
     assert "合并失败" not in out
-    assert "gh pr view 9 --json state" in stub.gh_calls()
+    assert STATE_CALL in stub.gh_calls()
     assert f"合并 | PASS | {merge_call(stub)} | rc=1 | " in out
     assert "PR 状态已是 MERGED" in out
     assert "分支删除 | PASS | " in out
@@ -1079,7 +1083,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
     assert len(merge_calls) == 1
     assert merge_calls[0].startswith(
-        f"gh pr merge 999999999 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 999999999 -R {REPO_SLUG} --merge --delete-branch"
+        f" --match-head-commit {HEAD_OID} "
     )
     assert f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}" in merge_calls[0]
     assert "结论：合并完成" in out
@@ -1945,7 +1950,7 @@ def test_merge_argv_forwards_accounting_verbatim(
     assert stub.gh_calls() == [VIEW_CALL, *API_CALLS, merge_call(stub)]
     call = stub.gh_calls()[3]
     assert call.startswith(
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID} "
     )
     assert call.endswith(f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}")
     assert f"合并 | PASS | {merge_call(stub)} | rc=0 | " in out
@@ -2728,7 +2733,10 @@ def test_gates_run_before_rebase_gate(stub: Stub, capsys: pytest.CaptureFixture[
 def test_gates_pass_keeps_merge_argv_verbatim(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """闸门放行后，``gh pr merge`` 的 argv 与加闸门之前**逐字一致**（不多一个 flag）。"""
+    """闸门放行后，``gh pr merge`` 的 argv 逐字等于 :func:`merge_call`。
+
+    唯一允许的「新 flag」是仓库钉死 ``-R <slug>``（P2-2）—— 除它之外一个都不许多。
+    """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
 
@@ -2738,7 +2746,7 @@ def test_gates_pass_keeps_merge_argv_verbatim(
     assert err == ""
     merge_calls = [c for c in stub.gh_calls() if c.startswith("gh pr merge")]
     assert merge_calls == [
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID}"
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID}"
         f" --subject {MERGE_SUBJECT} --body-file {stub.body_file}"
     ]
     # 两道闸门的证据行都在，顺序 = 认领 → 双问 → rebase
@@ -2828,6 +2836,65 @@ def test_review_head_gate_accepts_https_remote(
 
     assert rc == 0, (out, err)
     assert review_line(stub) in out.splitlines()
+
+
+# ---------------- 16h. P2-1：remote URL 带凭据时，报错正文不许回显凭据
+#
+# PR #46 双问「缺陷视角」实测：临时 repo 把 origin 配成
+# ``https://x-access-token:<TOKEN>@github.com/alsj213/team-board.git`` → rc2 的报错正文
+# 把整条 URL（含 token）打进 stderr。stderr 会进卡片、CI 日志、终端 scrollback，等于
+# 把凭据抄了一遍。判据：仍 rc2（这种形态本工具不认，见下面的注释）、stderr 恰一行、
+# stdout 0 字节、正文不含 token 子串。
+
+TOKEN = "ghp_SECRET123"
+CREDENTIAL_REMOTE = f"https://x-access-token:{TOKEN}@github.com/alsj213/team-board.git"
+
+
+def test_remote_url_with_credentials_never_echoes_token(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A：带 userinfo 的 remote URL → 仍 rc2，但正文里一个 token 字符都不许出现。"""
+
+    stub.setenv("FAKE_REMOTE_URL", CREDENTIAL_REMOTE)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    # 形态判定没放宽：带凭据的 remote URL 仍按「不是 GitHub 形态」拒绝（rc2）
+    assert_rejected(rc, out, err, text="不是 GitHub 形态")
+    assert TOKEN not in err, err  # 核心判据：不回显凭据
+    assert "x-access-token" not in err, err
+    assert "***" in err  # 脱敏后的形态还在（人能看出「这里本来有 userinfo」）
+    assert mg.reviewhead.REPO in err
+    assert stub.api_calls() == []  # 没拿任何评审当证据
+    assert not merged(stub)
+
+
+# ---------------- 16i. P2-2：闸门核对的仓库 == gh 实际操作的仓库
+#
+# PR #46 双问「缺陷视角」实测：非 git 目录里 ``GH_REPO=alsj213/team-board gh pr view 46
+# --json state`` → rc0，证明 gh 的目标仓由 cwd / ``GH_REPO`` 决定。本工具的仓库核对读的是
+# ``git config --get remote.<name>.url``，两者能各指一个仓库 → 「核对的是 A、合并的是 B」。
+# 修法：合并模式每一条 gh 调用都显式钉 ``-R <slug>``（``-R`` 优先级高于 ``GH_REPO``）。
+
+
+def test_merge_mode_pins_every_gh_call_to_gate_checked_repo(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B：``GH_REPO`` 指别仓时，预检 / 合并仍钉 ``-R <核对过的仓>``（rc0）。"""
+
+    stub.setenv("GH_REPO", "someone/else")
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS, merge_call(stub)]
+    # 逐条核对：没有一条 gh 调用靠 cwd / GH_REPO 选仓
+    for call in stub.gh_calls():
+        if call.startswith("gh api "):
+            assert f"repos/{REPO_SLUG}/" in call, call  # api 路径自带仓库
+        else:
+            assert f" -R {REPO_SLUG} " in call, call  # view / merge 显式钉 -R
 
 
 def test_claim_gate_db_failure_names_db_flag(

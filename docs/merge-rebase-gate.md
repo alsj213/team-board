@@ -88,18 +88,19 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/bas
 `test_docs_sample_block_matches_step_order` 对着实跑钉住。）
 `--verify-only` 路径**不加**这一步（它一次 gh 都不调，也不宣称合并前状态）。
 
-现行 8 行样例（2026-10-30 卡 `t_735e9250` 实跑：真 git + 假 gh，`origin` 的配置 URL 是
+现行 8 行样例（2026-10-30 返工卡 `t_c52b9b86` 实跑：真 git + 假 gh，`origin` 的配置 URL 是
 GitHub 形态、传输由 `url.<裸库>.insteadOf` 改写回本地裸库，一次网络调用都没有；`#20` /
-`t_deadbeef` 是合法假号。脚本与完整日志是该卡附件 `t_735e9250-e2e-sample.log`）：
+`t_deadbeef` 是合法假号。预检与合并两条命令都带 `-R alsj213/team-board`，脚本与完整日志是
+该卡附件 `t_c52b9b86-e2e-sample.log`）：
 
 ```
-分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 5690e76ad629876e1beed7f32e321efc26b89db6	refs/heads/wt/t_deadbeef
-预检 | PASS | gh pr view 20 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
-head sha | PASS | 5690e76ad629876e1beed7f32e321efc26b89db6
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421	refs/heads/wt/t_deadbeef
+预检 | PASS | gh pr view 20 -R alsj213/team-board --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
+head sha | PASS | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
-双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 5690e76ad629 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
-rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | ff57582 是 head 5690e76 的祖先（已 rebase 到 main）
-合并 | PASS | gh pr merge 20 --merge --delete-branch --match-head-commit 5690e76ad629876e1beed7f32e321efc26b89db6 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 6b1d25e8f6bd 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 393c846 是 head 6b1d25e 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 6b1d25e8f6bdbfc29ba32b37935618b9a0162421 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
 ```
@@ -109,6 +110,10 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base 
 `git config --get remote.<name>.url`（配置里的原始 URL，不是被 `insteadOf` 改写后的
 `git remote get-url` 结果），解析出 `owner/name` 与 `REPO` 比对；不一致 / 读不到 /
 不是 GitHub 形态一律 rc2 拒绝 —— 跨仓时不许拿别的仓库同号 PR 的评审当证据。
+解析出的 `owner/name` 同时钉进预检 / 合并 / 状态反查三条 gh 调用的 `-R`
+（核对对象 = 操作对象；不钉时 gh 按 `GH_REPO` / cwd 选仓，可与核对对象不同仓）。
+拒绝文案里的 URL 已把 userinfo 脱敏成 `***`：带 `x-access-token:<token>@` 的 remote
+不会把凭据写进 stderr。
 
 
 ### 3. 为什么不放在 branch-audit（`branches.py` 规则 C-2）
