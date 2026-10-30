@@ -86,6 +86,26 @@ def _candidates(text: str) -> tuple[tuple[str, ...], bool]:
     return tuple(line for line in lines if line), False
 
 
+def _select(text: str, limit: int) -> tuple[tuple[str, ...], bool, int]:
+    """挑出本节要列的行，并回带「是否第一轮命中」与候选总数。
+
+    返回 ``(本节列出的行, 是否第一轮命中, 候选总数)``：
+
+    - 第一轮命中 → 取**前** ``limit`` 条命中行；分母 = 去重后命中行数；
+    - 第一轮为空 → 取**后** ``limit`` 条非空行（tail window，原序不重排）；
+      分母 = 全部非空行数，**不受** ``limit`` 截断；
+    - ``limit <= 0`` 或 ``text`` 为空 → ``((), False, 0)``。
+
+    分子（``len(本节列出的行)``）与分母不等 = 截断在摘要里可见。
+    """
+    if limit <= 0 or not text:
+        return (), False, 0
+    candidates, from_first_round = _candidates(text)
+    if from_first_round:
+        return candidates[:limit], True, len(candidates)
+    return candidates[-limit:], False, len(candidates)
+
+
 def failure_lines(text: str, limit: int = FAIL_LINE_LIMIT) -> tuple[str, ...]:
     """从检查器输出里挑出失败行，总数不超过 ``limit``。
 
@@ -93,13 +113,10 @@ def failure_lines(text: str, limit: int = FAIL_LINE_LIMIT) -> tuple[str, ...]:
       / 行首 ``E   ``）→ 取前 ``limit`` 条；
     - 第一轮为空 → 退回末尾 ``limit`` 条非空行；
     - ``limit <= 0`` 或 ``text`` 为空串 → 空 tuple。
+
+    实现只转调 :func:`_select`，对外语义与历史一致，不许改。
     """
-    if limit <= 0 or not text:
-        return ()
-    candidates, from_first_round = _candidates(text)
-    if from_first_round:
-        return candidates[:limit]
-    return candidates[-limit:]
+    return _select(text, limit)[0]
 
 
 def counts_line(text: str) -> str:
@@ -120,31 +137,36 @@ def counts_line(text: str) -> str:
     return " ".join(f"{key}={totals[key]}" for key in _COUNT_KEYS)
 
 
-def _failure_total(text: str) -> int:
-    """失败行总数（不受 ``FAIL_LINE_LIMIT`` 截断），供摘要里的括号计数用。"""
-    if not text:
-        return 0
-    candidates, _ = _candidates(text)
-    return len(candidates)
-
-
 def render_summary(
     *, gate: str, card: str, exit_code: int, text: str, log_path: str
 ) -> str:
     """渲染闸门摘要（不带尾随换行）。
 
-    失败行每条前置 2 空格；括号里是 ``<已列数>/<失败行总数>`` —— 总数超过
-    ``FAIL_LINE_LIMIT`` 时两个数字不等，截断在摘要里可见。
+    两节的分子/分母口径不同，别混：
+
+    - ``失败行（<已列>/<命中总数>，≤20）:``：分母是第一轮命中**去重后**的行数，
+      只取前 20 条；两个数字不等 = 截断在摘要里可见。
+    - ``末尾行（<已列>/<非空行总数>，≤20）:``：只在第一轮零命中且存在非空行时
+      出现，取最后 20 条（tail window，原序不重排）；分母是全部非空行数，
+      **不受** 20 截断。
+    - 第一轮零命中时失败节恒为 ``0/0``，其下**一条行都不挂**（尾巴行只进末尾节）；
+      ``text`` 为空串或全空白时连末尾节也不出现。
     """
-    shown = failure_lines(text)
+    shown, from_first_round, total = _select(text, FAIL_LINE_LIMIT)
     out = [
         f"gate: {gate}",
         f"card: {card}",
         f"exit: {exit_code}",
         f"counts: {counts_line(text)}",
-        f"失败行（{len(shown)}/{_failure_total(text)}，≤{FAIL_LINE_LIMIT}）:",
     ]
-    out.extend(f"  {line}" for line in shown)
+    if from_first_round:
+        out.append(f"失败行（{len(shown)}/{total}，≤{FAIL_LINE_LIMIT}）:")
+        out.extend(f"  {line}" for line in shown)
+    else:
+        out.append(f"失败行（0/0，≤{FAIL_LINE_LIMIT}）:")
+        if total:
+            out.append(f"末尾行（{len(shown)}/{total}，≤{FAIL_LINE_LIMIT}）:")
+            out.extend(f"  {line}" for line in shown)
     out.append(f"log: {log_path}")
     return "\n".join(out)
 

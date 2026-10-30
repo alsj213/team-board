@@ -212,9 +212,8 @@ class TestRenderSummary:
             ]
         )
 
-    def test_fallback_tail_is_listed_when_nothing_marked(self) -> None:
-        # 契约第二轮：第一轮为空 → 列末尾非空行，所以无失败标记但非空的输出
-        # 仍会列出尾巴（括号是 1/1），不是 0/0
+    def test_fallback_tail_is_listed_under_tail_header(self) -> None:
+        # 裁决 C：第一轮零命中时尾巴行进「末尾行」节，失败节挂 0/0 且下面不挂行
         got = render_summary(
             gate="ruff",
             card="t_023f2827",
@@ -222,9 +221,65 @@ class TestRenderSummary:
             text="All checks passed!",
             log_path="/tmp/x.log",
         )
+        assert got == "\n".join(
+            [
+                "gate: ruff",
+                "card: t_023f2827",
+                "exit: 0",
+                "counts: 未解析",
+                "失败行（0/0，≤20）:",
+                "末尾行（1/1，≤20）:",
+                "  All checks passed!",
+                "log: /tmp/x.log",
+            ]
+        )
+
+    def test_fallback_truncation_bracket_counts_all_nonempty_lines(self) -> None:
+        text = "\n".join(f"line-{i}" for i in range(1, 101))
+        got = render_summary(
+            gate="ruff",
+            card="t_023f2827",
+            exit_code=0,
+            text=text,
+            log_path="/tmp/x.log",
+        )
         lines = got.split("\n")
-        assert lines[4] == "失败行（1/1，≤20）:"
-        assert lines[5] == "  All checks passed!"
+        assert lines[4] == "失败行（0/0，≤20）:"
+        assert lines[5] == "末尾行（20/100，≤20）:"
+        # tail window：列最后 20 条，原序，最后一条是第 100 行
+        assert len(lines) == 5 + 1 + 20 + 1
+        assert lines[6] == "  line-81"
+        assert lines[25] == "  line-100"
+        assert lines[-1] == "log: /tmp/x.log"
+
+    def test_marked_case_has_no_tail_block(self) -> None:
+        got = render_summary(
+            gate="pytest",
+            card="t_023f2827",
+            exit_code=1,
+            text="FAILED tests/unit/x.py::test_y\nE   assert 1 == 2",
+            log_path="/tmp/x.log",
+        )
+        assert "末尾行" not in got
+
+    def test_blank_text_has_no_tail_block(self) -> None:
+        got = render_summary(
+            gate="ruff",
+            card="t_023f2827",
+            exit_code=0,
+            text="   \n\n",
+            log_path="/tmp/x.log",
+        )
+        assert got == "\n".join(
+            [
+                "gate: ruff",
+                "card: t_023f2827",
+                "exit: 0",
+                "counts: 未解析",
+                "失败行（0/0，≤20）:",
+                "log: /tmp/x.log",
+            ]
+        )
 
     def test_truncation_is_visible_in_the_bracket(self) -> None:
         text = "\n".join(f"FAILED tests/unit/test_x.py::test_{i}" for i in range(25))
