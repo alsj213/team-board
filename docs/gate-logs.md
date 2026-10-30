@@ -4,6 +4,12 @@
 原样跑起来，全量输出写进文件，stdout 只回一段摘要。检查器自己的输出格式一个字不改，
 判定值（过没过、几个失败）也不由 gate 重算。
 
+## 0. 为什么要有 gate
+
+需求卡 `t_023f2827` 的契约给的原话：一张 QA 卡单次上下文 15.6 万 tok 里，130KB 是 terminal
+输出；全量落盘后上下文只收判定值。gate 就是把这句落地的包装器 —— 它不判定检查器过没过，
+只负责「全量进文件、摘要进上下文」。本节的数字出自该契约，**不是**本文档自己测的。
+
 ## 1. 命令签名
 
 ```
@@ -31,7 +37,7 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
    `/home/liu/project/team-board/.venv/bin/python`。照抄 `.venv/bin/python` 会得到
    `No such file or directory`、rc=127（2026-10-31 实测）。
 
-### 三个可复制样例（pytest / ruff / mypy）
+### 三个可复制样例（pytest / ruff / body-audit）
 
 把 `t_facc5c45` 换成自己的卡号即可原样执行。下面是 2026-10-31 CST 的本机实跑原文，
 摘要逐字照贴（`log:` 指向跑这条命令的那个 checkout 的 `evidence/`）。
@@ -66,19 +72,42 @@ counts: 未解析
 log: /home/liu/project/tb-wt/t_eaa81611/evidence/ruff-t_facc5c45.log
 ```
 
-通过的 `mypy`：
+`body-audit`（真板全量 `--all`；rc=1，见下方注）：
 
 ```
-$ PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python -m team_board.cli gate --gate mypy --card t_facc5c45 -- /home/liu/project/team-board/.venv/bin/python -m mypy src
-gate: mypy
+$ PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python -m team_board.cli gate --gate body-audit --card t_facc5c45 -- /home/liu/project/team-board/.venv/bin/python -m team_board.cli body-audit --all
+gate: body-audit
 card: t_facc5c45
-exit: 0
+exit: 1
 counts: 未解析
 失败行（0/0，≤20）:
-末尾行（1/1，≤20）:
-  Success: no issues found in 16 source files
-log: /home/liu/project/tb-wt/t_eaa81611/evidence/mypy-t_facc5c45.log
+末尾行（20/254，≤20）:
+    t_c9a1c5a6  done       engineer   1255  ok
+    t_eaa81611  done       pm         1252  ok
+    t_57c7b214  done       ops        1223  ok
+    t_a78f0cd4  done       pm         1214  ok
+    t_46b43968  done       pm         1090  ok
+    t_f51328fe  done       pm         1025  ok
+    t_e0866bd4  done       ops        1008  ok
+    t_216a3cf7  done       qa          963  ok
+    t_9abe2b3b  done       pm          951  ok
+    t_facc5c45  done       engineer    929  ok
+    t_844fc961  done       pm          924  ok
+    t_341e9163  done       pm          874  ok
+    t_5158a9e8  done       pm          861  ok
+    t_bd5e3f2b  done       pm          773  ok
+    t_efe6f4aa  done       pm          772  ok
+    t_c8465af4  done       pm          738  ok
+    t_985dbba8  done       pm          726  ok
+    t_f487b347  done       pm          336  ok
+    t_c3ec3d54  done       pm           90  ok
+  超限清单（142 张）：t_f43fa954 t_df640caa t_c836202a t_f3a4fb31 t_41195fb3 t_51f5fad0 t_705687b9 t_4dbf3ae2 t_025de8fe t_069dff27 t_0630a104 t_c9f5866a t_bbeab29f t_3e2a3582 t_991ae40f t_bb6600d8 t_6d5fcf9d t_416057c4 t_5dcafcc7 t_d558ed1e t_b5fde972 t_86f4ab63 t_1e795562 t_ec05d75d t_18713037 t_7ec9e801 t_66c5bac9 t_bbdb794a t_11ef8cf3 t_27daff67 t_86bc3d77 t_f27fbe62 t_12a95eed t_aed80ce3 t_1b200562 t_406be0e8 t_8886ae85 t_631b3f59 t_8f6d5e62 t_9c7f4103 t_927ebb83 t_d2e53461 t_a867da93 t_55009247 t_38509317 t_daba51a7 t_a847ee8f t_68b0a37a t_ecfebe60 t_b78582d0 t_38895c77 t_6b5564aa t_e4656674 t_5d631291 t_e8523c7b t_d22c6399 t_e1cffdca t_7605bfde t_0f09a2b9 t_322e3086 t_8fdc0fbe t_37a51cf3 t_02ad8064 t_cf6bea8e t_8d3291e8 t_0c70c181 t_bd1ced18 t_c07fc14f t_dab6af03 t_668b1909 t_244c0f44 t_1b4d66ff t_2df659ad t_c4302856 t_3e9448f7 t_589cc33a t_c0b674f7 t_3ff92267 t_67cd6c50 t_06c7b458 t_eeefcd01 t_7623a70a t_5154323b t_c6e1f623 t_ce436613 t_c51b7da5 t_476de4a5 t_ad5e7ff6 t_ea915a70 t_c34fbc5e t_8f1ef2f4 t_b9e29152 t_d5149e95 t_35eb0568 t_3700f2a2 t_50013602 t_4b9d456d t_59be4c53 t_90ee3bb7 t_b43ab8a5 t_a8c95560 t_a0ceb572 t_a5c2f894 t_270b9cbf t_4e0e8df4 t_11587ce8 t_58ecad09 t_63785d45 t_2001f0c2 t_dfdbf806 t_ceea0ac2 t_ab3f9b30 t_2e0098fe t_c9787079 t_24015d59 t_439d06bf t_da18937f t_f1e56147 t_e32041c1 t_09100683 t_59c0eae1 t_98ce4cf7 t_9d27934d t_ad16e55a t_c9148b7c t_24e43d1a t_29fbd64c t_d637dca6 t_17550b03 t_40fa5375 t_0b2fd9a3 t_c4ce9108 t_f37aecba t_1b965ab5 t_6a97c910 t_6efb3105 t_6fab0d6e t_90c4f66d t_a65d7674 t_5a465efb t_d804b545 t_946b6472
+log: /home/liu/project/tb-wt/t_eaa81611/evidence/body-audit-t_facc5c45.log
 ```
+
+注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算，其中 142 张的
+`tasks.body` 超 2048 字节；**不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：
+4 张、超限 0 张）时 rc=0 —— 两者都是 rc 原样透传。
 
 ## 2. 日志文件：命名、目录、创建
 
@@ -188,6 +217,7 @@ worktree `/home/liu/project/tb-wt/t_eaa81611`（分支
 | 通过 | `pytest tests/unit/test_gatelog.py -q` | 0 |
 | 通过 | `ruff check src tests` | 0 |
 | 通过 | `mypy src` | 0 |
+| 有历史存量 | `body-audit --all` | 1（`counts: 未解析`，`末尾行（20/254）`，142 张 done 卡超限） |
 | 失败透传 | `pytest` 一个必失败用例 | 1（`counts: passed=0 failed=1`） |
 | 透传 2 | `/bin/sh -c 'echo hi; exit 2'` | 2（有摘要、无 stderr） |
 | 被信号杀 | `/bin/sh -c 'kill -9 $$'` | 137（`128 + 9`，摘要里不带负数） |
