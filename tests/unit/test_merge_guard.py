@@ -21,6 +21,8 @@ HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
 MERGE_CARD = "t_bbeab29f"
 MERGE_BY = "pm/run200"
 MERGE_SUBJECT = "Merge PR #9（t_bbeab29f）"
+#: 仓库核对 / ``-R`` 钉死用的 ``owner/name``（= ``reviewhead.REPO`` 的小写形态）
+REPO_SLUG = "alsj213/team-board"
 BODY_TEXT = f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #9\n"
 
 _BODY_PATH: str | None = None
@@ -801,7 +803,7 @@ def test_fetch_pr_state_parses(
 ) -> None:
     monkeypatch.setattr(mg, "_run", _fake_run(0, stdout=payload))
 
-    assert mg.fetch_pr_state(_opts()) == expected
+    assert mg.fetch_pr_state(_opts(), REPO_SLUG) == expected
 
 
 @pytest.mark.parametrize(
@@ -819,7 +821,7 @@ def test_fetch_pr_state_returns_none_on_garbage(
 ) -> None:
     monkeypatch.setattr(mg, "_run", _fake_run(rc, stdout=payload))
 
-    assert mg.fetch_pr_state(_opts()) is None
+    assert mg.fetch_pr_state(_opts(), REPO_SLUG) is None
 
 
 def test_fetch_pr_state_swallows_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -830,7 +832,30 @@ def test_fetch_pr_state_swallows_run_error(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(mg, "_run", boom)
 
-    assert mg.fetch_pr_state(_opts()) is None
+    assert mg.fetch_pr_state(_opts(), REPO_SLUG) is None
+
+
+def test_fetch_pr_state_pins_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """状态反查也钉 ``-R``：反查必须看**同一个**仓库，不是 cwd / ``GH_REPO``。
+
+    不带 ``-R`` 时 gh 按 ``GH_REPO`` 选仓，别仓同号 PR 的 ``MERGED`` 会把「合并失败」
+    读成「合并已发生」（PR #46 双问缺陷 P2-2 的同一类）。
+    """
+
+    seen: list[tuple[str, ...]] = []
+
+    def spy(argv: tuple[str, ...], *, cwd: str, timeout: float) -> mg.CommandResult:
+        seen.append(argv)
+        return mg.CommandResult(
+            argv=argv, returncode=0, stdout='{"state": "OPEN"}', stderr=""
+        )
+
+    monkeypatch.setattr(mg, "_run", spy)
+
+    assert mg.fetch_pr_state(_opts(), REPO_SLUG) == "OPEN"
+    assert seen == [
+        ("gh", "pr", "view", "9", "-R", REPO_SLUG, "--json", "state")
+    ]
 
 
 # ------------------------------------------------------- 子命令超时（timeout=）
@@ -1095,15 +1120,21 @@ def test_handle_signals_turns_signal_into_interrupted(
 
 
 def test_merge_argv_verbatim_order() -> None:
-    """argv 逐字：三段语义（--merge/--delete-branch/--match-head-commit）原位，认账追加在后。"""
+    """argv 逐字：三段语义（--merge/--delete-branch/--match-head-commit）原位，认账追加在后。
 
-    argv = mg.merge_argv(9, "merge", HEAD_OID, MERGE_SUBJECT, "/tmp/body.txt")
+    ``-R <slug>`` 必须紧跟 PR 号（P2-2）：没有它，gh 按 ``GH_REPO`` / cwd 选仓库，
+    与闸门核对的仓库可以不是同一个。
+    """
+
+    argv = mg.merge_argv(9, "merge", HEAD_OID, MERGE_SUBJECT, "/tmp/body.txt", REPO_SLUG)
 
     assert argv == (
         "gh",
         "pr",
         "merge",
         "9",
+        "-R",
+        REPO_SLUG,
         "--merge",
         "--delete-branch",
         "--match-head-commit",
@@ -1115,6 +1146,25 @@ def test_merge_argv_verbatim_order() -> None:
     )
     # 顺序也是契约：--subject / --body-file 必须在 --match-head-commit <sha> 之后
     assert argv.index("--match-head-commit") < argv.index("--subject") < argv.index("--body-file")
+    # 仓库钉死必须在第一个 gh 子命令参数之后、任何写法参数之前
+    assert argv.index("-R") < argv.index("--merge")
+
+
+def test_pr_view_argv_pins_repo() -> None:
+    """预检 ``gh pr view`` 也钉 ``-R``（同一个 slug，不是 ``GH_REPO``）。"""
+
+    assert mg.pr_view_argv(9, REPO_SLUG) == (
+        "gh",
+        "pr",
+        "view",
+        "9",
+        "-R",
+        REPO_SLUG,
+        "--json",
+        mg._PR_VIEW_FIELDS,
+    )
+    assert mg.pr_view_argv(9, REPO_SLUG, "state")[-2:] == ("--json", "state")
+
 
 
 def test_validate_carries_accounting_into_options() -> None:
@@ -1459,3 +1509,112 @@ def test_check_base_ref_shape_accepts_plain_branch_names() -> None:
     for base in ("main", "master", "release/1.0", "wt/t_bbeab29f"):
         mg.check_base_ref_shape(base)  # 不抛
 
+
+
+# --------------------------------------------------- 双问闸门的仓库核对（纯函数部分）
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@github.com:alsj213/team-board.git", "alsj213/team-board"),
+        ("git@github.com:alsj213/team-board", "alsj213/team-board"),
+        ("git@github.com:alsj213/team-board.git/", "alsj213/team-board"),
+        ("https://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("https://github.com/alsj213/team-board", "alsj213/team-board"),
+        ("http://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("ssh://git@github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("ssh://git@github.com:443/alsj213/team-board.git", "alsj213/team-board"),
+        ("git://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        # 大小写：GitHub 的 owner/name 不区分大小写，比较口径统一成小写
+        ("git@github.com:ALSJ213/Team-Board.git", "alsj213/team-board"),
+    ],
+)
+def test_parse_github_slug_accepts(url: str, expected: str) -> None:
+    """GitHub remote 的两种形态（scp / URL）都解析成 ``owner/name``（小写）。"""
+
+    assert mg.parse_github_slug(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "   ",
+        "/tmp/origin.git",  # 本地裸库：判不出仓库 → 由调用方按「判不了」拒绝
+        "file:///tmp/origin.git",
+        "git@gitlab.com:alsj213/team-board.git",  # 别的 host
+        "https://gitlab.com/alsj213/team-board.git",
+        "https://github.com/alsj213",  # 缺仓库名
+        "https://github.com/alsj213/team-board/extra",  # 多段路径不是仓库
+        "git@github.com:alsj213/team-board.git extra",
+    ],
+)
+def test_parse_github_slug_rejects(url: str) -> None:
+    """不是 GitHub 形态一律 ``None``（不知道 ≠ 通过，由调用方 rc2）。"""
+
+    assert mg.parse_github_slug(url) is None
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # 带凭据的 https 形态：userinfo 整段换成 ***，token 一个字符都不留
+        (
+            "https://x-access-token:ghp_SECRET123@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        (
+            "https://oauth2:tok@gitlab.com/o/n.git",
+            "https://***@gitlab.com/o/n.git",
+        ),
+        # 密码里含 `/`：旧判据（`[^@/]*`）整段不匹配 → 原样回显（PR #46 复验 P2，现场 2）
+        (
+            "https://x-access-token:a55w/0rdTOKEN@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 密码里含 `@`：旧判据只换掉首个 `@` 前的部分 → 尾部 `ssword9` 残留（现场 3）
+        (
+            "https://user:p@ssword9@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 多个 `@` 混合（用户名 + 密码各带一个）：按最后一个 `@` 切，全部吃掉
+        (
+            "https://us@er:p@ss/word@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # 只有用户名没有密码同样整段脱敏
+        (
+            "https://x-access-token@github.com/alsj213/team-board.git",
+            "https://***@github.com/alsj213/team-board.git",
+        ),
+        # scp 形态的 userinfo 同样脱敏
+        ("git@github.com:alsj213/team-board.git", "***@github.com:alsj213/team-board.git"),
+        # 没有 userinfo 的 URL 原样返回（本函数不判形态）
+        ("https://github.com/alsj213/team-board.git", "https://github.com/alsj213/team-board.git"),
+        ("/tmp/origin.git", "/tmp/origin.git"),
+        ("", ""),
+    ],
+)
+def test_redact_url_strips_userinfo(url: str, expected: str) -> None:
+    """报错正文里的 URL 必须脱敏：stderr 会进卡片 / CI 日志 / scrollback（P2-1）。"""
+
+    assert mg.redact_url(url) == expected
+
+
+def test_redact_url_never_leaves_token() -> None:
+    """回归钉子：任一形态下凭据子串都不许留在脱敏结果里（含密码带 `/`、`@` 的形态）。"""
+
+    token = "ghp_SECRET123"
+    cases = [
+        (f"https://x-access-token:{token}@github.com/alsj213/team-board.git", token),
+        (f"https://x-access-token:{token}@gitlab.com/o/n.git", token),
+        (f"x-access-token:{token}@github.com:alsj213/team-board.git", token),
+        # 现场 2 / 3：密码含 `/`、含 `@`（旧判据在这两条上把凭据留在正文里）
+        ("https://x-access-token:a55w/0rdTOKEN@github.com/alsj213/team-board.git", "a55w/0rdTOKEN"),
+        ("https://user:p@ssword9@github.com/alsj213/team-board.git", "ssword9"),
+        ("https://usr9:p@ss/wo@rd88@github.com/alsj213/team-board.git", "rd88"),
+    ]
+    for url, secret in cases:
+        redacted = mg.redact_url(url)
+        assert secret not in redacted, (url, redacted)
+        assert "***" in redacted, (url, redacted)

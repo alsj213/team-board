@@ -558,7 +558,14 @@ python3 -m team_board.merge_guard \
   `OverflowError: int too large to convert to float`，而那时**合并已经发生了**。
 - `--command-timeout`（默认 60）是**单次子命令**的硬超时：预检的 `gh pr view` 超时 → rc2；
   轮询里的 `git ls-remote` 超时 → 记一次通信错误继续轮询（绝不当成「分支还在」或「已删」）。
-- `--repo` 默认 `.`，gh 与 git 都以它为工作目录（gh 由 git remote 自己认仓库）；
+- `--repo` 默认 `.`，git 以它为工作目录；**gh 的每一条调用都显式钉仓库**（`gh pr view <pr>
+  -R <owner/name>` / `gh pr merge <pr> -R <owner/name>`），`<owner/name>` 由
+  `git config --get remote.<name>.url` 解析、并与双问判定仓库比对过（见下）——
+  不靠 cwd、也不看 `GH_REPO`：`GH_REPO` 指别仓时 gh 的目标仓就是别仓（实测
+  `GH_REPO=cli/cli gh pr view 46 --json headRefName` → rc1「cli/cli 没有 #46 这个 PR」，
+  同一个号加 `-R alsj213/team-board` → rc0 读到 `wt/t_735e9250`），而本工具核对的是 remote
+  配置里的仓库，两者能各指一个仓库，于是「核对的是 A、操作的是 B」。`-R` 的优先级高于
+  `GH_REPO`，钉住它才有「核对对象 = 操作对象」；
   `--remote` 默认 `origin`。
 - `--branch` 等于该 PR 的 `baseRefName`，或等于 `main` / `master` → rc2（防删主分支）。
 - **合并前先确认源分支在远端存在**：`git -C <repo> ls-remote --exit-code --refs <remote>
@@ -567,8 +574,9 @@ python3 -m team_board.merge_guard \
   `gh pr view` 之前）。没有这一步，「这个 ref 从来没存在过」会被出口判定读成「已删除」：
   PR 来自 fork（gh 不删 fork 侧分支，探针在本仓 origin 上必然 rc2）或 `--remote` 指到
   另一个没有该分支的 remote 时，这条误判必现。
-- 合并前预检 `gh pr view <pr> --json
-  number,state,headRefName,baseRefName,headRefOid`：`state` 必须是 `OPEN`、
+- 合并前预检 `gh pr view <pr> -R <owner/name> --json
+  number,state,headRefName,baseRefName,headRefOid`（`<owner/name>` = 上面那个由 remote 配置
+  解析出的仓库，下同）：`state` 必须是 `OPEN`、
   `headRefName` 必须与 `--branch` **逐字相等**，`headRefOid` 必须是 40 位（SHA-1）或
   64 位（SHA-256）十六进制提交 SHA —— 缺字段或格式不对一律 rc2，说清实际值。预检通过
   后把提交钉进证据：`head sha | PASS | <sha>`。
@@ -586,9 +594,19 @@ python3 -m team_board.merge_guard \
      只发两条 `gh api GET`（`pulls/<n>/reviews` + `issues/<n>/comments`，`--paginate`）。
      三种拒绝文案：`双问缺证`（一条标记都没有） / `双问陈旧`（有标记但都不是当前 head，
      head 变了没重跑双问） / `双问缺类`（当前 head 上缺某一类，附缺的类）。
+     **取数前先核对仓库**：`reviewhead` 的 `gh api` 路径前缀写死 `alsj213/team-board`、不看
+     `--repo`，所以闸门先读 `git config --get remote.<name>.url`（配置里的原始 URL，不是被
+     `insteadOf` 改写后的 `git remote get-url` 结果）解析 `owner/name` 与它比对；不一致 /
+     读不到 / 不是 GitHub 形态一律 rc2 拒绝 —— 跨仓时不许拿别的仓库同号 PR 的评审当证据。
+     解析出的这个 `owner/name` 同时就是预检 / 合并 / 状态反查三条 gh 调用钉的 `-R` 值
+     （核对对象 = 操作对象）；报错文案里的 URL 已把 userinfo 脱敏成 `***`，
+     带 `x-access-token:<token>@` 的 remote 不会把凭据写进 stderr。脱敏判据按位置算：
+     `://` 之后到该串**最后一个** `@` 之前的整段一律换成 `***`，所以 userinfo 里含 `/`
+     或 `@`（密码里带分隔符、多个 `@`）同样整体脱敏，host / path 不动。
 - `--db` 默认取看板库路径（认领闸门的数据源，只读打开）；库打不开 / 不是合法 SQLite /
-  读 `tasks` 失败一律 rc2 且说清原因 —— **不许**读成「没有卡认领」。
-- 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>
+  读 `tasks` 失败一律 rc2 且说清原因（错误文案点出 `--db <路径>` 与缺省值）——
+  **不许**读成「没有卡认领」。
+- 合并只用 `gh pr merge <pr> -R <owner/name> --<method> --delete-branch --match-head-commit <sha>
   --subject <subject> --body-file <path>`
   （`<sha>` = 预检读到的 `headRefOid`；后两个参数来自 `--subject` / `--body-file`，顺序固定）。
   只比分支名不约束内容：预检到合并之间源分支被
@@ -598,7 +616,8 @@ python3 -m team_board.merge_guard \
   降级成「不带 sha 合并」。**gh 返回非 0 不等于合并失败**：
   2.103.3 的 `mergeRun` 顺序是 `merge()` → `deleteLocalBranch()` → `deleteRemoteBranch()`，
   删本地分支失败就返回非 0（`failed to delete local branch …`），而那时 PR 已合、远端
-  分支还没删。所以非 0 之后必须 `gh pr view <pr> --json state` 反查：
+  分支还没删。所以非 0 之后必须 `gh pr view <pr> -R <owner/name> --json state` 反查
+  （同一个 `-R`：别仓同号 PR 的 `MERGED` 不许被当成「合并已发生」）：
   - `state=MERGED` → **不许**写「合并失败」；gh 的退出码与输出原文留证，然后照常做删除
     验证（分支已删 → rc0；分支仍在 → rc1；判不了 → 「合并已完成但无法判定」rc2）；
   - `state` 不是 `MERGED`（含反查本身失败）→ 维持 rc1「合并失败」，且不跑删除验证。
@@ -665,19 +684,29 @@ stdout 失败」，`141` 是 SIGPIPE）。
 124 / 130 / 143）。合并已发生却被杀掉时若留下 0 字节 stdout，下一轮就会把它读成
 「没合并、可以重跑」。
 
-输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
-`分支存在` / `预检` / `合并` / `分支删除`（按执行顺序；预检后另有一行 `head sha | PASS |
-<sha>` 记下钉住的提交，再往后是合并前的 `rebase | PASS | …` 闸门行，见下一小节），末行固定
-`结论：` 前缀。下面这段是假 gh / 假 git 跑出来的端到端样例（真仓库只有路径与 sha 那段不同）：
+输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，末行固定
+`结论：` 前缀。
+
+步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `双问绑定` → `rebase` → `合并` → `分支删除`。
+
+这段顺序由 `tests/integration/test_merge_guard_cli.py` 的
+`test_evidence_step_order_matches_constants` / `test_docs_declare_same_step_order` /
+`test_docs_sample_block_matches_step_order` 对着实跑钉住 —— 把下面这个样例改回旧样板
+（少了 `认领唯一性` / `双问绑定` 两行）会直接红。下面是 2026-10-30 返工卡（`t_c52b9b86`）
+真 git + 假 gh 跑出来的端到端样例（`#20` / `t_deadbeef` 是合法假号；真仓库只有路径与 sha
+那段不同，预检与合并两条命令都带 `-R alsj213/team-board`，脚本与完整日志是返工卡
+`t_c52b9b86` 的附件 `t_c52b9b86-e2e-sample.log`）：
 
 ```
-分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
-预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
-head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
-rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/9/base refs/merge-guard/9/head | rc=0 | b3c1d2e 是 head 4f2a9c0 的祖先（已 rebase 到 main）
-合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 --subject Merge PR #9（t_bbeab29f） --body-file /tmp/t_bbeab29f-merge-body.txt | rc=0 | (无输出)
-分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
-结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421	refs/heads/wt/t_deadbeef
+预检 | PASS | gh pr view 20 -R alsj213/team-board --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
+head sha | PASS | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421
+认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 6b1d25e8f6bd 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 393c846 是 head 6b1d25e 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 6b1d25e8f6bdbfc29ba32b37935618b9a0162421 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
+结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
 ```
 
 ### 合并前：rebase 闸门
@@ -707,7 +736,9 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
 # $FAKE_LOG 里 gh 只被调过 1 次（那次 gh pr view）；gh pr merge 次数=0
 ```
 
-`git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`）：
+`git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`；
+**这段是 2026-10-29 只有 rebase 闸门时的历史原文**，认领 / 双问两道闸门是 PR #45 才接上的，
+现行 8 行样例见上一节的端到端样例）：
 
 ```
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | f483f2d8c4ae812086c19c7003406eb270774c56	refs/heads/wt/t_deadbeef

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from team_board import cli as board_cli
 from team_board import merge_guard as mg
 
 CARD_BRANCH = "wt/t_bbeab29f"
@@ -39,9 +40,16 @@ HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
 #: 假 git 在 ``refs/merge-guard/<pr>/base`` 上读到的 base 提交（rebase PASS 行的 key 用它前 7 位）
 BASE_OID = "b3c1d2e4f5a6978899aabbccddeeff0011223344"
 
+#: 双问绑定闸门的仓库核对调用（``--repo`` 的 remote 配置 URL 必须指向同一仓库）
+REMOTE_CALL = "git -C {repo} config --get remote.origin.url"
+
 #: ``gh pr view`` 要的字段（``headRefOid`` 是「预检钉到提交」的凭据）
 VIEW_FIELDS = "number,state,headRefName,baseRefName,headRefOid"
-VIEW_CALL = f"gh pr view 9 --json {VIEW_FIELDS}"
+#: 仓库身份（``reviewhead.REPO`` 的小写形态）：合并模式的每一条 gh 调用都必须钉它
+REPO_SLUG = "alsj213/team-board"
+VIEW_CALL = f"gh pr view 9 -R {REPO_SLUG} --json {VIEW_FIELDS}"
+#: 合并失败后的状态反查（同一个 ``-R``，不看 ``GH_REPO``）
+STATE_CALL = f"gh pr view 9 -R {REPO_SLUG} --json state"
 
 
 def merge_call(
@@ -54,7 +62,7 @@ def merge_call(
 
     path = stub.body_file if body_file is None else body_file
     return (
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID} "
         f"--subject {subject} --body-file {path}"
     )
 
@@ -145,7 +153,7 @@ GIT_STUB = """#!/bin/sh
 printf 'git %s\\n' "$*" >> "$FAKE_LOG"
 for arg in "$@"; do
   case "$arg" in
-    ls-remote|fetch|rev-parse|merge-base) sub="$arg"; break ;;
+    ls-remote|fetch|rev-parse|merge-base|config) sub="$arg"; break ;;
   esac
 done
 case "$sub" in
@@ -182,6 +190,12 @@ case "$sub" in
   merge-base)
     if [ -n "$FAKE_MERGE_BASE_ERR" ]; then printf '%s\\n' "$FAKE_MERGE_BASE_ERR" >&2; fi
     exit "${FAKE_MERGE_BASE_RC:-0}"
+    ;;
+  config)
+    # 双问绑定闸门的仓库核对：``git config --get remote.<name>.url`` → 假 remote URL
+    if [ -n "$FAKE_REMOTE_URL" ]; then printf '%s\\n' "$FAKE_REMOTE_URL"; fi
+    if [ -n "$FAKE_REMOTE_ERR" ]; then printf '%s\\n' "$FAKE_REMOTE_ERR" >&2; fi
+    exit "${FAKE_REMOTE_RC:-0}"
     ;;
   *)
     printf 'fake git: unexpected args: %s\\n' "$*" >&2
@@ -319,6 +333,9 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     monkeypatch.setenv("FAKE_REV_PARSE_OUT", HEAD_OID)
     monkeypatch.setenv("FAKE_REV_PARSE_BASE_OUT", BASE_OID)
     monkeypatch.setenv("FAKE_MERGE_BASE_RC", "0")
+    # 默认：``--repo`` 的 remote 指向本仓（双问绑定闸门的仓库核对通过）
+    monkeypatch.setenv("FAKE_REMOTE_URL", "git@github.com:alsj213/team-board.git")
+    monkeypatch.setenv("FAKE_REMOTE_RC", "0")
     monkeypatch.setenv("FAKE_API_RC", "0")
     out = Stub(
         bindir=bindir,
@@ -815,7 +832,7 @@ def test_merge_failure_rc1_and_no_verification(
     assert len([call for call in stub.git_calls() if " ls-remote " in call]) == 1
     assert stub.git_calls()[0].startswith("git -C ")
     assert merge_call(stub) in stub.gh_calls()
-    assert "gh pr view 9 --json state" in stub.gh_calls()  # 做了状态反查
+    assert STATE_CALL in stub.gh_calls()  # 做了状态反查（同一个 -R）
     assert "合并 | FAIL" in out
     assert "合并失败" in out
     assert "PR 状态 OPEN" in out
@@ -842,7 +859,7 @@ def test_merge_gh_nonzero_but_state_merged_then_verification_deleted_rc0(
 
     assert rc == 0
     assert "合并失败" not in out
-    assert "gh pr view 9 --json state" in stub.gh_calls()
+    assert STATE_CALL in stub.gh_calls()
     assert f"合并 | PASS | {merge_call(stub)} | rc=1 | " in out
     assert "PR 状态已是 MERGED" in out
     assert "分支删除 | PASS | " in out
@@ -1066,7 +1083,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     merge_calls = [call for call in stub.gh_calls() if call.startswith("gh pr merge")]
     assert len(merge_calls) == 1
     assert merge_calls[0].startswith(
-        f"gh pr merge 999999999 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 999999999 -R {REPO_SLUG} --merge --delete-branch"
+        f" --match-head-commit {HEAD_OID} "
     )
     assert f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}" in merge_calls[0]
     assert "结论：合并完成" in out
@@ -1932,7 +1950,7 @@ def test_merge_argv_forwards_accounting_verbatim(
     assert stub.gh_calls() == [VIEW_CALL, *API_CALLS, merge_call(stub)]
     call = stub.gh_calls()[3]
     assert call.startswith(
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID} "
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID} "
     )
     assert call.endswith(f"--subject {MERGE_SUBJECT} --body-file {stub.body_file}")
     assert f"合并 | PASS | {merge_call(stub)} | rc=0 | " in out
@@ -2083,6 +2101,8 @@ def test_absolute_body_file_unchanged_when_cwd_differs_from_repo(
 PROBE_CARD = "t_deadbeef"
 PROBE_BRANCH = f"wt/{PROBE_CARD}"
 PROBE_PR = 20
+#: 探针库写进 remote 配置的 URL（GitHub 形态；真实传输由 url.<裸库>.insteadOf 改写到本地）
+PROBE_REMOTE_URL = "git@github.com:alsj213/team-board.git"
 #: 真 git 的绝对路径（假 gh 内部要造 merge commit，不能被 PATH 里的假 git 抢走）
 REAL_GIT = shutil.which("git") or "git"
 
@@ -2185,7 +2205,11 @@ def _probe_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     (work / "base.txt").write_text("base\n", encoding="utf-8")
     _git("add", "base.txt", cwd=work)
     _git("commit", "-q", "-m", "base", cwd=work)
-    _git("remote", "add", "origin", str(origin), cwd=work)
+    # 配置里写 GitHub 形态的 URL（双问绑定闸门的仓库核对按配置回答「这是哪个仓库」），
+    # 再用 url.<本地裸库>.insteadOf 把真实传输改写回本地裸库 —— 于是 fetch / ls-remote /
+    # push 全打在本地，一次网络调用都没有。
+    _git("remote", "add", "origin", PROBE_REMOTE_URL, cwd=work)
+    _git("config", f"url.{origin}.insteadOf", PROBE_REMOTE_URL, cwd=work)
     _git("push", "-q", "origin", "main", cwd=work)
 
     _git("checkout", "-q", "-b", PROBE_BRANCH, cwd=work)
@@ -2470,8 +2494,8 @@ def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
 def test_rebase_gate_git_subcommand_order_passing(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """通过路径的 git 子命令顺序必须是：存在性探针 → fetch → rev-parse → merge-base →
-    rev-parse(base，只用于证据行) → 删除探针。
+    """通过路径的 git 子命令顺序必须是：存在性探针 → remote get-url（仓库核对）→ fetch →
+    rev-parse → merge-base → rev-parse(base，只用于证据行) → 删除探针。
     """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
@@ -2480,8 +2504,16 @@ def test_rebase_gate_git_subcommand_order_passing(
 
     assert rc == 0
     subs = [call.split()[3] for call in stub.git_calls()]
-    assert subs[:5] == ["ls-remote", "fetch", "rev-parse", "merge-base", "rev-parse"]
-    assert set(subs[5:]) == {"ls-remote"}  # 后面全是删除探针
+    assert subs[:6] == [
+        "ls-remote",
+        "config",
+        "fetch",
+        "rev-parse",
+        "merge-base",
+        "rev-parse",
+    ]
+    assert set(subs[6:]) == {"ls-remote"}  # 后面全是删除探针
+    assert REMOTE_CALL.format(repo=stub.repo) in stub.git_calls()
     assert rebase_line(stub) in out.splitlines()
 
 
@@ -2701,7 +2733,10 @@ def test_gates_run_before_rebase_gate(stub: Stub, capsys: pytest.CaptureFixture[
 def test_gates_pass_keeps_merge_argv_verbatim(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """闸门放行后，``gh pr merge`` 的 argv 与加闸门之前**逐字一致**（不多一个 flag）。"""
+    """闸门放行后，``gh pr merge`` 的 argv 逐字等于 :func:`merge_call`。
+
+    唯一允许的「新 flag」是仓库钉死 ``-R <slug>``（P2-2）—— 除它之外一个都不许多。
+    """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
 
@@ -2711,7 +2746,7 @@ def test_gates_pass_keeps_merge_argv_verbatim(
     assert err == ""
     merge_calls = [c for c in stub.gh_calls() if c.startswith("gh pr merge")]
     assert merge_calls == [
-        f"gh pr merge 9 --merge --delete-branch --match-head-commit {HEAD_OID}"
+        f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID}"
         f" --subject {MERGE_SUBJECT} --body-file {stub.body_file}"
     ]
     # 两道闸门的证据行都在，顺序 = 认领 → 双问 → rebase
@@ -2735,4 +2770,342 @@ def test_verify_only_never_runs_gates(stub: Stub, capsys: pytest.CaptureFixture[
     assert "认领唯一性 |" not in out
     assert "双问绑定 |" not in out
     assert stub.api_calls() == []
+    assert not merged(stub)
+
+
+# --------------------- 16e. 双问绑定闸门的仓库核对（--repo 的 remote 必须指向同一仓库）
+#
+# ``reviewhead`` 的 ``gh api`` 路径前缀写死 ``REPO = alsj213/team-board``，不看 ``--repo``。
+# 跨仓时它会去读**另一个仓库**同号 PR 的 Review —— 判的是别人的证据。所以闸门先用
+# ``git config --get remote.<name>.url`` 解析 ``owner/name``，与 ``REPO`` 不一致就拒绝。
+
+
+def test_review_head_gate_other_repo_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """``--repo`` 的 remote 指向别的仓库 → rc2，且一条 ``gh api`` 都不发。"""
+
+    stub.setenv("FAKE_REMOTE_URL", "git@github.com:someone/team-board.git")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="≠ 双问判定仓库")
+    assert "someone/team-board" in err and mg.reviewhead.REPO in err
+    assert stub.api_calls() == []  # 没拿别人的仓评审判定
+    assert not merged(stub)
+
+
+def test_review_head_gate_non_github_remote_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """remote 不是 GitHub 形态（本地裸库 / 别的 host）→ rc2「判不了」，不是放行。"""
+
+    stub.setenv("FAKE_REMOTE_URL", "/tmp/probe-origin.git")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="不是 GitHub 形态")
+    assert mg.reviewhead.REPO in err
+    assert stub.api_calls() == []
+    assert not merged(stub)
+
+
+def test_review_head_gate_remote_config_unreadable_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``remote.<name>.url`` 读不到（rc≠0）→ rc2 并点出 ``--repo`` / remote 名。"""
+
+    stub.setenv("FAKE_REMOTE_URL", "")
+    stub.setenv("FAKE_REMOTE_RC", "1")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="读不到 --repo")
+    assert "remote.origin.url" in err
+    assert stub.api_calls() == []
+    assert not merged(stub)
+
+
+def test_review_head_gate_accepts_https_remote(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``origin-https`` 那种 https 形态同样认（R10：两种通道都留着）。"""
+
+    stub.setenv("FAKE_REMOTE_URL", "https://github.com/alsj213/team-board.git")
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert review_line(stub) in out.splitlines()
+
+
+# ---------------- 16h. P2-1：remote URL 带凭据时，报错正文不许回显凭据
+#
+# PR #46 双问「缺陷视角」实测：临时 repo 把 origin 配成
+# ``https://x-access-token:<TOKEN>@github.com/alsj213/team-board.git`` → rc2 的报错正文
+# 把整条 URL（含 token）打进 stderr。stderr 会进卡片、CI 日志、终端 scrollback，等于
+# 把凭据抄了一遍。判据：仍 rc2（这种形态本工具不认，见下面的注释）、stderr 恰一行、
+# stdout 0 字节、正文不含 token 子串。
+
+TOKEN = "ghp_SECRET123"
+CREDENTIAL_REMOTE = f"https://x-access-token:{TOKEN}@github.com/alsj213/team-board.git"
+
+
+def test_remote_url_with_credentials_never_echoes_token(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A：带 userinfo 的 remote URL → 仍 rc2，但正文里一个 token 字符都不许出现。"""
+
+    stub.setenv("FAKE_REMOTE_URL", CREDENTIAL_REMOTE)
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    # 形态判定没放宽：带凭据的 remote URL 仍按「不是 GitHub 形态」拒绝（rc2）
+    assert_rejected(rc, out, err, text="不是 GitHub 形态")
+    assert TOKEN not in err, err  # 核心判据：不回显凭据
+    assert "x-access-token" not in err, err
+    assert "***" in err  # 脱敏后的形态还在（人能看出「这里本来有 userinfo」）
+    assert mg.reviewhead.REPO in err
+    assert stub.api_calls() == []  # 没拿任何评审当证据
+    assert not merged(stub)
+
+
+# ---------------- 16i. P2-2：闸门核对的仓库 == gh 实际操作的仓库
+#
+# PR #46 双问「缺陷视角」实测：非 git 目录里 ``GH_REPO=alsj213/team-board gh pr view 46
+# --json state`` → rc0，证明 gh 的目标仓由 cwd / ``GH_REPO`` 决定。本工具的仓库核对读的是
+# ``git config --get remote.<name>.url``，两者能各指一个仓库 → 「核对的是 A、合并的是 B」。
+# 修法：合并模式每一条 gh 调用都显式钉 ``-R <slug>``（``-R`` 优先级高于 ``GH_REPO``）。
+
+
+def test_merge_mode_pins_every_gh_call_to_gate_checked_repo(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B：``GH_REPO`` 指别仓时，预检 / 合并仍钉 ``-R <核对过的仓>``（rc0）。"""
+
+    stub.setenv("GH_REPO", "someone/else")
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS, merge_call(stub)]
+    # 逐条核对：没有一条 gh 调用靠 cwd / GH_REPO 选仓
+    for call in stub.gh_calls():
+        if call.startswith("gh api "):
+            assert f"repos/{REPO_SLUG}/" in call, call  # api 路径自带仓库
+        else:
+            assert f" -R {REPO_SLUG} " in call, call  # view / merge 显式钉 -R
+
+
+def test_claim_gate_db_failure_names_db_flag(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """库读不到时文案点出 ``--db`` 参数名（``merge-record`` 打印的命令不带 --db，走默认值）。"""
+
+    missing = stub.board_db.with_name("nope.db")
+
+    rc, out, err = run(args_for(stub, "--db", str(missing)), capsys)
+
+    assert_rejected(rc, out, err, text="读看板库失败")
+    assert f"--db {missing}" in err
+    assert "缺省" in err and mg.DEFAULT_DB in err
+    assert stub.gh_calls() == [VIEW_CALL]
+    assert not merged(stub)
+
+
+# --------------------- 16f. 证据行顺序：实跑 = 常量 = README / docs 样例
+#
+# PR #45 第二视角回归项 3/4：证据行顺序加了认领唯一性、双问绑定两道，README 与
+# docs/merge-rebase-gate.md 的「步骤行顺序固定」声明和样例都没同步，而且没有测试
+# 解析这段（把文档改回旧样板红不了）。这里把「实跑顺序」和「文档写的东西」绑在一起。
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: 合并路径证据行的执行顺序（唯一来源 = merge_guard 的 STEP_* 常量）
+STEP_ORDER = (
+    mg.STEP_BRANCH_PRESENT,
+    mg.STEP_PREFLIGHT,
+    mg.STEP_HEAD_SHA,
+    mg.STEP_CLAIM,
+    mg.STEP_REVIEW_HEAD,
+    mg.STEP_REBASE,
+    mg.STEP_MERGE,
+    mg.STEP_DELETE,
+)
+
+#: 文档里「步骤行顺序固定：…」声明的出现位置（两份文档各一处）
+DOC_FILES = ("README.md", "docs/merge-rebase-gate.md")
+
+
+def evidence_labels(lines: list[str]) -> list[str]:
+    """只留步骤行（``<标签> | …``），按出现顺序返回标签。"""
+
+    labels = []
+    for line in lines:
+        head = line.split(" | ", 1)[0]
+        if " | " in line and head in STEP_ORDER:
+            labels.append(head)
+    return labels
+
+
+def declaration_labels(text: str) -> list[str]:
+    """抓文档里「步骤行顺序固定：」那一行的反引号标签串。"""
+
+    for line in text.splitlines():
+        if "步骤行顺序固定" in line:
+            return re.findall(r"`([^`]+)`", line)
+    raise AssertionError("文档里找不到「步骤行顺序固定」声明行")
+
+
+def sample_block_labels(text: str, marker: str) -> list[str]:
+    """抓 ``marker`` 之后第一个围栏块里的步骤行标签。"""
+
+    index = text.find(marker)
+    assert index >= 0, f"文档里找不到取样标记：{marker}"
+    rest = text[index:]
+    start = rest.index("```")
+    end = rest.index("```", start + 3)
+    block = rest[start + 3 : end]
+    return evidence_labels(block.splitlines())
+
+
+def test_evidence_step_order_matches_constants(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """走通的合并路径打 8 行步骤证据，顺序 = 常量顺序（实跑，不是照抄文档）。"""
+
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert evidence_labels(out.splitlines()) == list(STEP_ORDER)
+
+
+@pytest.mark.parametrize("name", DOC_FILES)
+def test_docs_declare_same_step_order(name: str) -> None:
+    """两份文档的「步骤行顺序固定」声明必须与实跑的常量顺序逐字一致。"""
+
+    text = (REPO_ROOT / name).read_text(encoding="utf-8")
+
+    assert declaration_labels(text) == list(STEP_ORDER)
+
+
+@pytest.mark.parametrize(
+    ("name", "marker"),
+    [
+        ("README.md", "跑出来的端到端样例（"),
+        ("docs/merge-rebase-gate.md", "现行 8 行样例（2026-10-30"),
+    ],
+)
+def test_docs_sample_block_matches_step_order(name: str, marker: str) -> None:
+    """文档样例块的步骤行顺序必须与实跑一致（改回旧样板 → 本用例红）。"""
+
+    text = (REPO_ROOT / name).read_text(encoding="utf-8")
+
+    assert sample_block_labels(text, marker) == list(STEP_ORDER)
+
+
+# --------------- 16g. merge-record 打印出来的合并命令必须真能走到认领闸门
+#
+# PR #45 第二视角回归项 7：把 ``DEFAULT_DB`` 改成不存在的路径后全量测试仍然 1247 passed
+# —— 说明没有任何用例从「打印出来的命令」真正走到认领闸门（既有的
+# ``test_printed_command_is_merge_guard_and_runnable`` 在更早的「源分支存在」闸门就
+# 退出，认领闸门一次都没跑）。打印的命令**不带** ``--db``，走的是 ``DEFAULT_DB``，
+# 所以这两条用例把 ``DEFAULT_DB`` 改成 fixture 库 / 不存在的路径来分别证明
+# 「走到并放行」与「走到并拒绝」。
+
+
+def printed_merge_argv(out: str) -> list[str]:
+    """从 ``merge-record`` 的输出里取出打印命令，``shlex.split`` 成 merge_guard 的 argv。"""
+
+    marker = "python3 -m team_board.merge_guard"
+    for line in out.splitlines():
+        if marker in line:
+            return shlex.split(line.split(marker, 1)[1])
+    raise AssertionError(f"输出里没有打印命令：{out!r}")
+
+
+def merge_record_argv(stub: Stub, body_out: Path) -> list[str]:
+    """``merge-record`` 的生成模式 argv（与真实调用同形，参数取自 fixture 常量）。"""
+
+    return [
+        "merge-record",
+        "--pr",
+        "9",
+        "--branch",
+        CARD_BRANCH,
+        "--card",
+        MERGE_CARD,
+        "--by",
+        MERGE_BY,
+        "--subject",
+        MERGE_SUBJECT,
+        "--body-out",
+        str(body_out),
+        "--repo",
+        str(stub.repo),
+    ]
+
+
+def test_printed_command_reaches_claim_gate_and_passes(
+    stub: Stub,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """照抄 ``merge-record`` 打印的命令 → 认领闸门放行 → 一路合并到 rc0。
+
+    打印的命令不带 ``--db``；这里把它指向的 ``DEFAULT_DB`` 换成 fixture 库（恰好一张未结
+    卡认领 PR #9 且卡号 = ``--card``），其余一切照原样（假 gh / 假 git，不联网）。
+    """
+
+    rc = board_cli.main(merge_record_argv(stub, tmp_path / "recv-body.txt"))
+    printed = capsys.readouterr()
+    assert rc == 0, (printed.out, printed.err)
+    argv = printed_merge_argv(printed.out)
+    assert "--db" not in argv  # 打印的命令本来就不带 --db（走默认值）
+
+    monkeypatch.setattr(mg, "DEFAULT_DB", str(stub.board_db))
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+
+    rc = mg.main(argv)
+    out, err = capsys.readouterr()
+
+    assert rc == 0, (out, err)
+    lines = out.splitlines()
+    # 认领闸门这一行真的出现了（不是被更早的闸门截住）
+    assert lines[3] == claim_line(stub)
+    assert evidence_labels(lines) == list(STEP_ORDER)
+
+
+def test_printed_command_reaches_claim_gate_when_default_db_missing(
+    stub: Stub,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``DEFAULT_DB`` 指向不存在的库 → rc2、stdio 干净、文案点出 ``--db``。
+
+    这是「打印的命令真的走到了认领闸门」的对照组：如果哪天闸门被挪到更早的位置，这条
+    用例会因为错误文案变成「源分支存在」那一档而红。
+    """
+
+    rc = board_cli.main(merge_record_argv(stub, tmp_path / "recv-body.txt"))
+    printed = capsys.readouterr()
+    assert rc == 0, (printed.out, printed.err)
+    argv = printed_merge_argv(printed.out)
+
+    missing = tmp_path / "no-such-board.db"
+    monkeypatch.setattr(mg, "DEFAULT_DB", str(missing))
+
+    rc = mg.main(argv)
+    out, err = capsys.readouterr()
+
+    assert rc == 2, (out, err)
+    assert out == ""  # 合并没发生 → 一个字的证据都不该有
+    assert err.count("\n") == 1  # stderr 恰一行
+    assert err.startswith("错误: 读看板库失败（--db ")
+    assert str(missing) in err
+    assert "不在 origin 远端" not in err  # 不是更早的「源分支存在」闸门
     assert not merged(stub)
