@@ -96,6 +96,11 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
    取数失败 / 证据不齐一律 rc2。三种拒绝文案：``双问缺证``（一条标记都没有） /
    ``双问陈旧``（有标记但都不是当前 head，即 head 变了没重跑双问） / ``双问缺类``
    （当前 head 上缺某一类）。
+   取数前还有一道**仓库核对**：``reviewhead`` 的 ``gh api`` 路径前缀写死
+   ``REPO = alsj213/team-board``、不看 ``--repo``，所以先用
+   ``git config --get remote.<name>.url`` 解析 ``--repo`` 的 ``owner/name``，与 ``REPO`` 不一致
+   （或不是 GitHub 形态 / 读不到 remote）→ rc2 拒绝。跨仓时它原本会去读**另一个仓库**
+   同号 PR 的评审 —— 判的是别人的证据。
 
 两道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-review-head``），也都不在
 ``--verify-only`` 路径上跑（那条路径不合并，不该要求认领与双问）。
@@ -168,7 +173,8 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
   **合并前认领闸门拒绝**（读不到看板库 / PR 无未结卡认领 / 重复认领 / 认领卡 ≠
   ``--card``）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
-  双问缺类）、
+  双问缺类 / ``--repo`` 的 remote 读不到或不是 GitHub 形态 / 该仓库 ≠
+  ``alsj213/team-board``）、
   **合并前 rebase 闸门拒绝**（``gh pr view`` 的 ``baseRefName`` 形态非法；``git fetch``
   取远端提交失败；远端 head 与预检的 ``headRefOid`` 不一致；``base`` 不是 ``head`` 的
   祖先；祖先关系判不了）、
@@ -1237,6 +1243,70 @@ def _claim_row_ids(rows: tuple[prclaim.ClaimRow, ...]) -> str:
     return ",".join(row.id for row in rows) if rows else "(无)"
 
 
+#: GitHub remote URL → ``owner/name``。两种形态都要认（本仓 ``origin`` 是 scp 形态的
+#: ``git@github.com:alsj213/team-board.git``，``origin-https`` 是 https 形态，见 R10）：
+#:   ``[user@]github.com:owner/name(.git)``            —— scp 形态（ssh）
+#:   ``{ssh,git,http,https}://[user@]github.com[:port]/owner/name(.git)`` —— URL 形态
+_REMOTE_SLUG_RE = re.compile(
+    r"""
+    (?:
+        ^(?:[A-Za-z0-9._-]+@)?github\.com:
+      |
+        ^(?:ssh|git|https?)://(?:[A-Za-z0-9._-]+@)?github\.com(?::\d+)?/
+    )
+    (?P<slug>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)
+    (?:\.git)?
+    /?
+    $
+    """,
+    re.VERBOSE | re.ASCII,
+)
+
+
+def parse_github_slug(url: str) -> str | None:
+    """remote URL → ``owner/name``（小写）；不是 GitHub 形态 → ``None``。
+
+    纯函数：不碰文件系统、不调外部命令。只认 GitHub —— 别的 host（GitLab / 本地裸库 /
+    ``file://``）一律 ``None``，由调用方按「判不了」拒绝（不知道 ≠ 通过）。
+    """
+
+    match = _REMOTE_SLUG_RE.match((url or "").strip())
+    if match is None:
+        return None
+    return match.group("slug").lower()
+
+
+def remote_repo_slug(opts: Options) -> str:
+    """``--repo`` + ``--remote`` 指向的 GitHub 仓库 ``owner/name``；判不了 → rc2。
+
+    读的是**配置里的原始 URL**（``git config --get remote.<name>.url``），不是
+    ``git remote get-url``：后者会把 ``url.<base>.insteadOf`` 的改写结果吐出来，
+    镜像 / 转发的 URL 看起来就不是 GitHub 的了，而「这是哪个仓库」该按配置回答。
+
+    只读一条 ``git config --get``（不联网、不写）。读不到 / 不是 GitHub URL 都拒绝：
+    双问闸门要核对的正是「读的是不是这个仓库的评审」，判不了就不许放行。
+    """
+
+    argv = ("git", "-C", opts.repo, "config", "--get", f"remote.{opts.remote}.url")
+    proc = _run(argv, cwd=opts.repo, timeout=opts.command_timeout)
+    if proc.returncode != 0:
+        raise MergeGuardError(
+            f"读不到 --repo {opts.repo} 的 remote {opts.remote} 配置"
+            f"（git config --get remote.{opts.remote}.url rc={proc.returncode}："
+            f"{key_line(proc)}），无法判定双问绑定的仓库就是 {reviewhead.REPO}；拒绝合并"
+        )
+    url = proc.stdout.strip()
+    slug = parse_github_slug(url)
+    if slug is None:
+        raise MergeGuardError(
+            f"--repo {opts.repo} 的 remote {opts.remote} 不是 GitHub 形态"
+            f"（git config --get remote.{opts.remote}.url 输出 {url or '(空)'!r}），"
+            f"无法判定双问绑定的仓库就是 {reviewhead.REPO}；拒绝合并"
+            "（跨仓 / 非 GitHub 远端时不许拿别的仓库的评审判定）"
+        )
+    return slug
+
+
 def claim_gate(opts: Options, info: Preflight) -> str:
     """**合并前认领唯一性闸门**（R17⑤）：``PR-CLAIM`` 唯一且就是 ``--card``，否则 rc2。
 
@@ -1262,8 +1332,12 @@ def claim_gate(opts: Options, info: Preflight) -> str:
     try:
         conn = db.connect(opts.db_path)
     except (db.BoardError, OSError) as exc:
+        # 点出参数名 --db：``merge-record`` 打印的合并命令**不带** --db（走默认值），
+        # 默认路径换机/换 HERMES_HOME 就失效；只写「读看板库失败」时调用方不知道
+        # 该改哪个参数（PR #45 第二视角缺陷项 9 / 回归项 2）。
         raise MergeGuardError(
-            f"读看板库失败，无法判定 PR #{opts.pr} 的认领唯一性：{exc}；拒绝合并"
+            f"读看板库失败（--db {opts.db_path}），无法判定 PR #{opts.pr} 的认领唯一性："
+            f"{exc}；拒绝合并（认领闸门只读 --db 指向的库，缺省 {DEFAULT_DB}）"
         ) from exc
     try:
         rows = db.iter_claim_rows(conn)
@@ -1310,6 +1384,12 @@ def review_head_gate(opts: Options, info: Preflight) -> str:
     不是 JSON）一律 rc2 —— 「读不到评审」不许被读成「双问没做」（那是 rc1 语义，本工具
     只有 rc2 这一档拒绝）。
 
+    取数前先核对**仓库**：``reviewhead`` 的 ``gh api`` 路径前缀写死
+    ``REPO = alsj213/team-board``，不看 ``--repo``。跨仓时它会去读**另一个仓库**同号
+    PR 的 Review —— 方向虽是拒绝（几乎必「双问缺证」），但判的是别人的评审，不是本次
+    合并对象的。所以先用 ``git config --get remote.<name>.url`` 解析 ``--repo`` 的
+    ``owner/name``，与 ``reviewhead.REPO`` 不一致（或 URL 解析不出 GitHub 形态）就 rc2 拒绝。
+
     三种拒绝文案一眼可分：
 
     - 一条结构化标记都没有 → ``双问缺证``；
@@ -1317,6 +1397,13 @@ def review_head_gate(opts: Options, info: Preflight) -> str:
     - 当前 head 上缺某一类 → ``双问缺类``（附缺的类）。
     """
 
+    slug = remote_repo_slug(opts)
+    if slug != reviewhead.REPO.lower():
+        raise MergeGuardError(
+            f"双问绑定闸门拦下 PR #{opts.pr}：--repo {opts.repo}（remote {opts.remote}）"
+            f"对应仓库 {slug} ≠ 双问判定仓库 {reviewhead.REPO}"
+            "（reviewhead 的 gh api 路径前缀写死，跨仓会拿别的仓库同号 PR 的评审当证据）；拒绝合并"
+        )
     head = info.head_oid
     short = head[:12]
     try:

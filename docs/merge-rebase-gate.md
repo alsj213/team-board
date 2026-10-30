@@ -82,8 +82,34 @@ grep / 文档 / 测试逐字断言）：
 rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-guard/<pr>/head | rc=0 | <base sha 前 7 位> 是 head <head sha 前 7 位> 的祖先（已 rebase 到 <base>）
 ```
 
-步骤行顺序固定：`分支存在` → `预检` → `head sha` → `rebase` → `合并` → `分支删除`。
+步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `双问绑定` → `rebase` → `合并` → `分支删除`。
+（本文各节的样例块是各卡当时的真跑原文；现行 8 行样例见本节末尾「现行 8 行样例」，由
+`tests/integration/test_merge_guard_cli.py` 的 `test_docs_declare_same_step_order` /
+`test_docs_sample_block_matches_step_order` 对着实跑钉住。）
 `--verify-only` 路径**不加**这一步（它一次 gh 都不调，也不宣称合并前状态）。
+
+现行 8 行样例（2026-10-30 卡 `t_735e9250` 实跑：真 git + 假 gh，`origin` 的配置 URL 是
+GitHub 形态、传输由 `url.<裸库>.insteadOf` 改写回本地裸库，一次网络调用都没有；`#20` /
+`t_deadbeef` 是合法假号。脚本与完整日志是该卡附件 `t_735e9250-e2e-sample.log`）：
+
+```
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | a5b839a0775579d7b21de297c7a2f49755116014	refs/heads/wt/t_deadbeef
+预检 | PASS | gh pr view 20 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
+head sha | PASS | a5b839a0775579d7b21de297c7a2f49755116014
+认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head a5b839a07755 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | b4072e9 是 head a5b839a 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 --merge --delete-branch --match-head-commit a5b839a0775579d7b21de297c7a2f49755116014 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
+结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
+```
+
+双问绑定闸门取数前还要核对**仓库**：`reviewhead` 的 `gh api` 路径前缀写死
+`REPO = alsj213/team-board`、不看 `--repo`，所以闸门先读
+`git config --get remote.<name>.url`（配置里的原始 URL，不是被 `insteadOf` 改写后的
+`git remote get-url` 结果），解析出 `owner/name` 与 `REPO` 比对；不一致 / 读不到 /
+不是 GitHub 形态一律 rc2 拒绝 —— 跨仓时不许拿别的仓库同号 PR 的评审当证据。
+
 
 ### 3. 为什么不放在 branch-audit（`branches.py` 规则 C-2）
 

@@ -586,8 +586,13 @@ python3 -m team_board.merge_guard \
      只发两条 `gh api GET`（`pulls/<n>/reviews` + `issues/<n>/comments`，`--paginate`）。
      三种拒绝文案：`双问缺证`（一条标记都没有） / `双问陈旧`（有标记但都不是当前 head，
      head 变了没重跑双问） / `双问缺类`（当前 head 上缺某一类，附缺的类）。
+     **取数前先核对仓库**：`reviewhead` 的 `gh api` 路径前缀写死 `alsj213/team-board`、不看
+     `--repo`，所以闸门先读 `git config --get remote.<name>.url`（配置里的原始 URL，不是被
+     `insteadOf` 改写后的 `git remote get-url` 结果）解析 `owner/name` 与它比对；不一致 /
+     读不到 / 不是 GitHub 形态一律 rc2 拒绝 —— 跨仓时不许拿别的仓库同号 PR 的评审当证据。
 - `--db` 默认取看板库路径（认领闸门的数据源，只读打开）；库打不开 / 不是合法 SQLite /
-  读 `tasks` 失败一律 rc2 且说清原因 —— **不许**读成「没有卡认领」。
+  读 `tasks` 失败一律 rc2 且说清原因（错误文案点出 `--db <路径>` 与缺省值）——
+  **不许**读成「没有卡认领」。
 - 合并只用 `gh pr merge <pr> --<method> --delete-branch --match-head-commit <sha>
   --subject <subject> --body-file <path>`
   （`<sha>` = 预检读到的 `headRefOid`；后两个参数来自 `--subject` / `--body-file`，顺序固定）。
@@ -665,19 +670,28 @@ stdout 失败」，`141` 是 SIGPIPE）。
 124 / 130 / 143）。合并已发生却被杀掉时若留下 0 字节 stdout，下一轮就会把它读成
 「没合并、可以重跑」。
 
-输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，步骤标签固定
-`分支存在` / `预检` / `合并` / `分支删除`（按执行顺序；预检后另有一行 `head sha | PASS |
-<sha>` 记下钉住的提交，再往后是合并前的 `rebase | PASS | …` 闸门行，见下一小节），末行固定
-`结论：` 前缀。下面这段是假 gh / 假 git 跑出来的端到端样例（真仓库只有路径与 sha 那段不同）：
+输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，末行固定
+`结论：` 前缀。
+
+步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `双问绑定` → `rebase` → `合并` → `分支删除`。
+
+这段顺序由 `tests/integration/test_merge_guard_cli.py` 的
+`test_evidence_step_order_matches_constants` / `test_docs_declare_same_step_order` /
+`test_docs_sample_block_matches_step_order` 对着实跑钉住 —— 把下面这个样例改回旧样板
+（少了 `认领唯一性` / `双问绑定` 两行）会直接红。下面是 2026-10-30 本卡（`t_735e9250`）
+真 git + 假 gh 跑出来的端到端样例（`#20` / `t_deadbeef` 是合法假号；真仓库只有路径与 sha
+那段不同，脚本与完整日志是本卡附件 `t_735e9250-e2e-sample.log`）：
 
 ```
-分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
-预检 | PASS | gh pr view 9 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_bbeab29f, baseRefName=main
-head sha | PASS | 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2
-rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/9/base refs/merge-guard/9/head | rc=0 | b3c1d2e 是 head 4f2a9c0 的祖先（已 rebase 到 main）
-合并 | PASS | gh pr merge 9 --merge --delete-branch --match-head-commit 4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2 --subject Merge PR #9（t_bbeab29f） --body-file /tmp/t_bbeab29f-merge-body.txt | rc=0 | (无输出)
-分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=2 | 分支已不在远端
-结论：合并完成，源分支 wt/t_bbeab29f 已从 origin 删除
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | a5b839a0775579d7b21de297c7a2f49755116014	refs/heads/wt/t_deadbeef
+预检 | PASS | gh pr view 20 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
+head sha | PASS | a5b839a0775579d7b21de297c7a2f49755116014
+认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head a5b839a07755 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | b4072e9 是 head a5b839a 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 --merge --delete-branch --match-head-commit a5b839a0775579d7b21de297c7a2f49755116014 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
+结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
 ```
 
 ### 合并前：rebase 闸门
@@ -707,7 +721,9 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
 # $FAKE_LOG 里 gh 只被调过 1 次（那次 gh pr view）；gh pr merge 次数=0
 ```
 
-`git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`）：
+`git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`；
+**这段是 2026-10-29 只有 rebase 闸门时的历史原文**，认领 / 双问两道闸门是 PR #45 才接上的，
+现行 8 行样例见上一节的端到端样例）：
 
 ```
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | f483f2d8c4ae812086c19c7003406eb270774c56	refs/heads/wt/t_deadbeef

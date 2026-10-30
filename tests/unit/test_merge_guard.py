@@ -1459,3 +1459,47 @@ def test_check_base_ref_shape_accepts_plain_branch_names() -> None:
     for base in ("main", "master", "release/1.0", "wt/t_bbeab29f"):
         mg.check_base_ref_shape(base)  # 不抛
 
+
+
+# --------------------------------------------------- 双问闸门的仓库核对（纯函数部分）
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@github.com:alsj213/team-board.git", "alsj213/team-board"),
+        ("git@github.com:alsj213/team-board", "alsj213/team-board"),
+        ("git@github.com:alsj213/team-board.git/", "alsj213/team-board"),
+        ("https://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("https://github.com/alsj213/team-board", "alsj213/team-board"),
+        ("http://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("ssh://git@github.com/alsj213/team-board.git", "alsj213/team-board"),
+        ("ssh://git@github.com:443/alsj213/team-board.git", "alsj213/team-board"),
+        ("git://github.com/alsj213/team-board.git", "alsj213/team-board"),
+        # 大小写：GitHub 的 owner/name 不区分大小写，比较口径统一成小写
+        ("git@github.com:ALSJ213/Team-Board.git", "alsj213/team-board"),
+    ],
+)
+def test_parse_github_slug_accepts(url: str, expected: str) -> None:
+    """GitHub remote 的两种形态（scp / URL）都解析成 ``owner/name``（小写）。"""
+
+    assert mg.parse_github_slug(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "   ",
+        "/tmp/origin.git",  # 本地裸库：判不出仓库 → 由调用方按「判不了」拒绝
+        "file:///tmp/origin.git",
+        "git@gitlab.com:alsj213/team-board.git",  # 别的 host
+        "https://gitlab.com/alsj213/team-board.git",
+        "https://github.com/alsj213",  # 缺仓库名
+        "https://github.com/alsj213/team-board/extra",  # 多段路径不是仓库
+        "git@github.com:alsj213/team-board.git extra",
+    ],
+)
+def test_parse_github_slug_rejects(url: str) -> None:
+    """不是 GitHub 形态一律 ``None``（不知道 ≠ 通过，由调用方 rc2）。"""
+
+    assert mg.parse_github_slug(url) is None
