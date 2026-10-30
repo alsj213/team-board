@@ -683,13 +683,13 @@ stdout 失败」，`141` 是 SIGPIPE）。
 那段不同，脚本与完整日志是本卡附件 `t_735e9250-e2e-sample.log`）：
 
 ```
-分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | a5b839a0775579d7b21de297c7a2f49755116014	refs/heads/wt/t_deadbeef
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 5690e76ad629876e1beed7f32e321efc26b89db6	refs/heads/wt/t_deadbeef
 预检 | PASS | gh pr view 20 --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
-head sha | PASS | a5b839a0775579d7b21de297c7a2f49755116014
+head sha | PASS | 5690e76ad629876e1beed7f32e321efc26b89db6
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
-双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head a5b839a07755 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
-rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | b4072e9 是 head a5b839a 的祖先（已 rebase 到 main）
-合并 | PASS | gh pr merge 20 --merge --delete-branch --match-head-commit a5b839a0775579d7b21de297c7a2f49755116014 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 5690e76ad629 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | ff57582 是 head 5690e76 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 --merge --delete-branch --match-head-commit 5690e76ad629876e1beed7f32e321efc26b89db6 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
 ```
