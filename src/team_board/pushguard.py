@@ -29,8 +29,8 @@ CARD_BRANCH_RE = branches.BRANCH_RE
 #: P-4 的保护名单（``remote_ref`` 精确命中即拒绝）
 PROTECTED_MAIN_REFS = ("refs/heads/main", "refs/heads/master")
 
-#: P-2 文案里固定的 worktree 落点前缀（与 pm 契约一致，逐字）
-WORKTREE_HOME = "/home/liu/tb-wt"
+#: P-2 文案里固定的 worktree 落点前缀（与现存约定一致：本机 20/26 个 worktree 在这里）
+WORKTREE_HOME = "/home/liu/project/tb-wt"
 
 
 @dataclass(frozen=True)

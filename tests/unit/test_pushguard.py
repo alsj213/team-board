@@ -200,7 +200,7 @@ def test_p2_main_checkout_must_not_push_card_branch(repo: Path) -> None:
     assert verdicts[0].blocked is True
     assert verdicts[0].message == (
         f"拒绝：主 checkout 不许推送卡分支 wt/t_aaaaaaaa；"
-        f"做法：git -C {repo} worktree add /home/liu/tb-wt/t_aaaaaaaa "
+        f"做法：git -C {repo} worktree add /home/liu/project/tb-wt/t_aaaaaaaa "
         f"-b wt/t_aaaaaaaa origin/main"
     )
 
