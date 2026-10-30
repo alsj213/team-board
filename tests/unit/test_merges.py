@@ -952,3 +952,203 @@ class TestGitEnvIsolation:
         assert report.ok
         assert Path(report.repo).resolve() == other_repo.resolve()
         assert report.records == ()
+
+
+# ------------------------- 判定对象 = first-parent 合并（卡 t_d22c6399）
+#
+# 同一条 git 调用层的用例：只有造出「卡分支同步 main（second-parent 侧）+ 把卡分支
+# 合进 main（first-parent 侧）」的真实拓扑，才验得出「只判 first-parent」。期望值来自
+# 卡 t_d22c6399：同步合并（``git merge origin/main``）没合任何 PR，本来就不该有
+# ``merge-card`` / ``merge-pr``，判它就是假红。
+
+#: 分支侧同步合并的 message（真实形态，无 trailer）
+SYNC_MSG = "Merge origin/main into wt/t_deadbeef（解冲突：两侧全保留）"
+
+#: 合格的 first-parent 合并（认账三字段齐）
+GOOD_PR_MSG = (
+    "Merge pull request #999 from alsj213/wt/t_deadbeef\n"
+    "\n"
+    "merged-by: pm/run189\n"
+    "merge-card: t_deadbeef\n"
+    "merge-pr: #999\n"
+)
+
+#: 不合格的 first-parent 合并（无认账字段，必须仍然判红）
+BAD_PR_MSG = "Merge pull request #998 from alsj213/wt/t_deadbeef"
+
+
+def _commit(repo: Path, name: str, content: str, message: str) -> str:
+    """写一个文件并提交，返回新提交 sha。"""
+
+    (repo / name).write_text(content, encoding="utf-8")
+    _real_git(repo, "add", "-A")
+    _real_git(repo, "commit", "-q", "-m", message)
+    return _real_git(repo, "rev-parse", "HEAD").strip()
+
+
+def _pr_topology(
+    path: Path, pr_message: str, later_pr_message: str | None = None
+) -> dict[str, str]:
+    """造出 first-parent / second-parent 两条链都有的真仓，返回各节点 sha。
+
+    拓扑（``main`` 的 first-parent 链是 baseline → main → pr）：
+
+        baseline -- main --------- pr -- pr2
+               \\                  /
+                side -- sync ----+          side2 -- pr2（可选）
+    """
+
+    path.mkdir(parents=True, exist_ok=True)
+    _real_git(path, "init", "-q", "-b", "main")
+    shas = {"baseline": _commit(path, "README.md", "base\n", "chore: 基线")}
+    # 卡分支从基线切出，之后 main 自己前进 —— 才需要「同步 main 回分支」
+    _real_git(path, "checkout", "-q", "-b", "side")
+    shas["side"] = _commit(path, "side.txt", "side\n", "feat: 卡分支提交")
+    _real_git(path, "checkout", "-q", "main")
+    shas["main"] = _commit(path, "main.txt", "main\n", "feat: main 前进")
+    # 分支侧把 main 同步回来：second-parent 侧的内部合并，没有认账字段
+    _real_git(path, "checkout", "-q", "side")
+    _real_git(path, "merge", "-q", "--no-ff", "main", "-m", SYNC_MSG)
+    shas["sync"] = _real_git(path, "rev-parse", "HEAD").strip()
+    # 把卡分支合进 main：first-parent 侧的认账事件
+    _real_git(path, "checkout", "-q", "main")
+    _real_git(path, "merge", "-q", "--no-ff", "side", "-m", pr_message)
+    shas["pr"] = _real_git(path, "rev-parse", "HEAD").strip()
+    if later_pr_message is not None:
+        _real_git(path, "checkout", "-q", "-b", "side2")
+        shas["side2"] = _commit(path, "side2.txt", "side2\n", "feat: 第二张卡的提交")
+        _real_git(path, "checkout", "-q", "main")
+        _real_git(path, "merge", "-q", "--no-ff", "side2", "-m", later_pr_message)
+        shas["pr2"] = _real_git(path, "rev-parse", "HEAD").strip()
+    return shas
+
+
+class TestFirstParentOnly:
+    """卡 t_d22c6399：判定对象只有 first-parent 链上的合并提交。"""
+
+    def test_first_parent_merge_is_judged(self, tmp_path: Path) -> None:
+        """① first-parent 合并（把分支合进 main）被计入判定段。"""
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, GOOD_PR_MSG)
+
+        report = audit(repo=repo, baseline=shas["baseline"])
+
+        assert report.problems == ()
+        assert [record.sha for record in report.records] == [shas["pr"]]
+        assert report.records[0].source == "trailer"
+        assert report.records[0].card == "t_deadbeef"
+
+    def test_sync_merge_is_not_judged(self, tmp_path: Path) -> None:
+        """② 同步合并（second-parent 侧）不计入 records / problems。
+
+        拓扑里确实有一条两父的同步合并（先断言它是真合并），它没有认账字段；
+        修前它会被当成「缺三个字段」，于是这里拿到 6 条问题、判定段 2 条记录。
+        """
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, BAD_PR_MSG)
+        assert len(_real_git(repo, "rev-list", "--parents", "-n", "1", shas["sync"]).split()) == 3
+
+        report = audit(repo=repo, baseline=shas["baseline"])
+
+        assert [record.sha for record in report.records] == [shas["pr"]]
+        assert shas["sync"] not in {record.sha for record in report.records}
+        assert [problem.sha for problem in report.problems] == [shas["pr"]] * 3
+        assert {problem.kind for problem in report.problems} == {KIND_MISSING}
+
+    def test_mixed_range_judges_only_first_parent(self, tmp_path: Path) -> None:
+        """③ 两者混在同一区间：只判 first-parent 那条，同步合并一条都不出。"""
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, BAD_PR_MSG, later_pr_message=GOOD_PR_MSG)
+
+        report = audit(repo=repo, baseline=shas["baseline"])
+
+        assert sorted(record.sha for record in report.records) == sorted(
+            [shas["pr"], shas["pr2"]]
+        )
+        assert [problem.sha for problem in report.problems] == [shas["pr"]] * 3
+        assert shas["sync"] not in {record.sha for record in report.records}
+
+    def test_history_section_excludes_sync_merge(self, tmp_path: Path) -> None:
+        """④ 历史段同样只取 first-parent：基线落在 PR 合并提交上时只有它自己。"""
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, GOOD_PR_MSG)
+        assert len(_real_git(repo, "rev-list", "--parents", "-n", "1", shas["pr"]).split()) == 3
+
+        report = audit(repo=repo, baseline=shas["pr"])
+
+        assert report.records == ()
+        assert [record.sha for record in report.history] == [shas["pr"]]
+        assert shas["sync"] not in {record.sha for record in report.history}
+        assert report.ok
+
+    def test_card_branch_tip_rev_still_judges_sync_merge(self, tmp_path: Path) -> None:
+        """⑤ ``--rev`` 给卡分支尖端（CI ``pull_request`` 现状）时，同步合并照旧被判。
+
+        锁定现状，防「承诺大于实现」：``--first-parent`` 是**沿被审 rev 的链**取数，
+        不是给同步合并开豁免。rev = 卡分支尖端 → 该分支自己的同步合并就在链上，
+        缺三字段即 rc1（这就是 CI ``pull_request`` 事件 ``--rev = head.sha`` 的行为）。
+        """
+
+        repo = tmp_path / "repo"
+        shas = _pr_topology(repo, GOOD_PR_MSG)
+        assert len(_real_git(repo, "rev-list", "--parents", "-n", "1", shas["sync"]).split()) == 3
+
+        report = audit(repo=repo, baseline=shas["baseline"], rev=shas["sync"])
+
+        assert [record.sha for record in report.records] == [shas["sync"]]
+        assert [problem.sha for problem in report.problems] == [shas["sync"]] * 3
+        assert {problem.kind for problem in report.problems} == {KIND_MISSING}
+        assert not report.ok
+
+    def test_card_side_baseline_history_only_follows_its_first_parent(
+        self, tmp_path: Path
+    ) -> None:
+        """⑥ ``--baseline`` 给卡分支侧提交时，历史段只沿 baseline 的 first-parent 链。
+
+        拓扑：``b0`` → 卡分支 ``side``；main 上另合一张 PR（``m1``，无 trailer）；
+        卡分支把 main 同步回来（``sync``）；最后把卡分支合进 main（``pr``，三字段齐）。
+        ``--baseline <sync> --rev <pr>``：判定段仍是 ``pr`` 一条、rc0（视角收窄不等于
+        放宽）；历史段不再回显 second-parent 侧的 main PR 合并 ``m1``（修前 2 条 → 1 条）。
+        """
+
+        repo = tmp_path / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        _real_git(repo, "init", "-q", "-b", "main")
+        _commit(repo, "README.md", "base\n", "chore: 基线")
+        _real_git(repo, "checkout", "-q", "-b", "side")
+        _commit(repo, "side.txt", "side\n", "feat: 卡分支提交")
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(repo, "checkout", "-q", "-b", "other")
+        _commit(repo, "other.txt", "other\n", "feat: 另一张卡")
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(
+            repo,
+            "merge",
+            "-q",
+            "--no-ff",
+            "other",
+            "-m",
+            "Merge pull request #7 from alsj213/wt/t_aaaa1111",
+        )
+        main_pr = _real_git(repo, "rev-parse", "HEAD").strip()
+        _real_git(repo, "checkout", "-q", "side")
+        _real_git(repo, "merge", "-q", "--no-ff", "main", "-m", SYNC_MSG)
+        sync = _real_git(repo, "rev-parse", "HEAD").strip()
+        _real_git(repo, "checkout", "-q", "main")
+        _real_git(repo, "merge", "-q", "--no-ff", "side", "-m", GOOD_PR_MSG)
+        pr = _real_git(repo, "rev-parse", "HEAD").strip()
+
+        # 修前取数（无 --first-parent）：历史段把 main 侧 PR 合并也数进来
+        unfiltered = _real_git(repo, "log", "--merges", "--format=%h", sync)
+        assert sorted(unfiltered.split()) == sorted([sync[:7], main_pr[:7]])
+
+        report = audit(repo=repo, baseline=sync, rev=pr)
+
+        assert [record.sha for record in report.records] == [pr]
+        assert [record.sha for record in report.history] == [sync]
+        assert main_pr not in {record.sha for record in report.history}
+        assert report.ok

@@ -103,6 +103,24 @@ CI 侧另两点不变：`--rev` 用 `github.event.pull_request.head.sha`（不�
 `merge-accountability`（另一张卡加）常驻跑同一判定，红就是真红 —— 无认账字段的
 合并动作会被机器拦下或告警（rc≠0），补齐后同一条检查 rc=0。
 
+**判什么：只判 first-parent 链上的合并** —— 即「把卡分支合进 main」的那个合并提交，
+也就是真正的「合并一张 PR」事件。工具按**被审 `rev` / `baseline` 自己的 first-parent
+链**取数（判定段沿 `rev`，历史段沿 `baseline`），所以：
+
+- **起点在 main 线上时**（`merge-audit --repo .` 在 main checkout 的默认 `HEAD`；
+  CI `merge-accountability` job 的 `push` 事件 `--rev origin/main`）：分支侧
+  `git merge origin/main` 产生的同步合并（把 main 并回卡分支）落在 second-parent 链上，
+  既没合任何 PR，也本来就不该有 `merge-card` / `merge-pr`，因此**既不判、也不计入**
+  records / problems / 历史段。
+- **起点不在 main 线上时结论随起点变**，这不是豁免：`--rev` 给的是**卡分支尖端**时
+  （CI `pull_request` 事件就是 `--rev = github.event.pull_request.head.sha`），该分支
+  自己的同步合并仍在它自己的 first-parent 链上，**照旧被判**（缺三字段即 rc1）；
+  `--baseline` 给成卡分支侧提交时，历史段只沿那条卡分支的链回显，main 侧已合并的 PR
+  合并会从历史段消失（视角变化，判定段与 rc 不受影响）。
+  判据跟着**起点自己的链**走，不跟着「这条提交是不是同步合并」走。
+
+工具里没有反向开关（没有 `--all-merges` 之类）：判定对象是口径，不是可选项。
+
 ```bash
 team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
 ```
@@ -225,6 +243,19 @@ bash scripts/setup-bot-identity.sh engineer /home/liu/project/tb-wt/t_xxxxxxxx
 基线之前的合并只能回读 PR 号 / 卡号 / sha，`merged-by` 一律写「无法判定」——
 那些提交里本来就没有该字段。**不做历史批量回填**：回填等于用今天的自述覆盖
 当时的事实，比留白更糟。
+
+历史段与判定段用同一条 `--first-parent`，但**两段各自沿自己的起点取数**：判定段沿
+被审 `rev` 的链，历史段沿 `baseline` 的链。所以在 main 视角下（`rev` 与 `baseline`
+都在 main 线上）分支侧的同步合并（second-parent 侧）在历史段里同样不出现、不计数 ——
+它不是认账事件。起点不在 main 线上时结论随起点变：`--rev` 给卡分支尖端，该分支自己的
+同步合并就在判定段的链上、照旧被判；`--baseline` 给卡分支侧提交，历史段只沿那条卡分支
+的链回显，main 侧已合并的 PR 合并会从历史段消失。**那是视角变化，不是豁免** ——
+判定段的结论与 rc 语义都不受影响。
+
+`--baseline` 应给 **main 线上的提交**（默认的 `--baseline REV` 与基线文件
+`.team-board/merge-audit-baseline` 都按这个用）。历史段取数**包含基线自身**：
+`git log --merges --first-parent <baseline>` 会列出基线这条提交（若它是合并提交），
+与判定段的 `(baseline, rev]` 不重叠。
 
 ## 边界（不许写成「已解决」）
 
