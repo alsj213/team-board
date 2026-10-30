@@ -16,7 +16,8 @@ rc2、``--subject`` 含换行 rc2、``--body-out`` / ``--repo`` 含换行 rc2、
 （``--pr`` 取值域含 0 / 负 / 空串 / 13 位毫秒 / 天文数字 / 超上限 / ``+1`` / ``1_0``，
 ``--by`` 与 ``--card`` 形态，生成模式缺参数，``--check-file`` 不存在 / 是目录 /
 空文件 / 非 UTF-8 / 与 ``--body-out`` 同给，``--body-out`` 父目录不存在）、stdout
-编码表示不了中文的 rc2，以及**文档守卫**：``README.md`` 与
+编码表示不了中文的 rc2、stdout 写不进去（``> /dev/full``，收口卡 ``t_fc31145f``
+用例 o），以及**文档守卫**：``README.md`` 与
 ``docs/merge-accountability.md`` 里每条 ``merge-record …`` 生成命令抠出来真跑一遍
 必须 rc0（文档漂移即 CI 红）。
 """
@@ -977,6 +978,52 @@ def test_ascii_stdout_returns_two(tmp_path: Path) -> None:
     assert proc.stdout == b""
     assert proc.stderr.startswith("错误: ".encode())
     assert b"Traceback" not in proc.stderr
+
+
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="需要 Linux 的 /dev/full")
+def test_o_stdout_write_failure_is_rc2(tmp_path: Path) -> None:
+    """o) stdout 写不进去（``> /dev/full`` → ENOSPC）→ rc2，不许 rc0 静默吞掉。
+
+    生成模式打印的 merge_guard 命令是给人照抄执行的（R12 ①）。宽 catch
+    ``except (BrokenPipeError, OSError)`` 会把这条命令**丢了**却返回 rc0 —— 拿空输出
+    去合并。现在只有 EPIPE 算「没人要」，其余 OSError 走「环境坏」：stderr
+    ``错误: stdout 写不进去…`` + rc2，且退出时不再二次 flush 炸成 120。
+    """
+
+    src = Path(__file__).resolve().parents[2] / "src"
+    env = {**os.environ, "PYTHONPATH": str(src)}
+    body_path = tmp_path / "full-body.txt"
+    with open("/dev/full", "wb") as full:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "team_board.cli",
+                "merge-record",
+                "--card",
+                CARD,
+                "--by",
+                BY,
+                "--pr",
+                PR,
+                "--branch",
+                BRANCH,
+                "--repo",
+                str(tmp_path),
+                "--body-out",
+                str(body_path),
+            ],
+            stdout=full,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stderr.startswith("错误: stdout 写不进去".encode())
+    assert b"Traceback" not in proc.stderr
+    # body 文件照旧落地：失败的是「打印给你照抄的那段」，不是认账 body 本身
+    assert body_path.exists()
 
 
 # ------------------------- 文档守卫：README / docs 里的 merge-record 生成命令必须真能跑

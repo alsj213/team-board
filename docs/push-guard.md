@@ -48,7 +48,13 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 - `0` —— 放行（stdout 恰一行；`--check-install` 时表示钩子已装好）；
 - `1` —— 拦下（stdout 空，stderr 每处一行以 `拒绝：` 开头）；
 - `2` —— 参数或环境错误（`--repo` 不存在 / 不是工作树、`--main-branch` 为空或该
-  分支不存在、stdin 每行字段数 ≠ 4、stdin 为空、编码失败）；stderr 一行 `错误: …`。
+  分支不存在、stdin 每行字段数 ≠ 4、stdin 为空、编码失败、stdout 写不进去）；
+  stderr 一行 `错误: …`。
+
+  两种「写 stdout 出问题」**分得很开**，别混：管道断开（`BrokenPipeError` / `EPIPE`）
+  ＝没人要输出了，判定码照旧（本来 rc0 仍 0）；而 `ENOSPC` / `EIO` 这类非 EPIPE 的
+  `OSError` ＝输出**真的丢了** → rc2（stderr `错误: stdout 写不进去（errno=…）`）。
+  合并成一个宽 catch 会把「判定结果没打印出来」吞成 rc0，钩子那边就成了假的放行。
 
 钩子层（`git push` 看到的那一层）—— **只有 `0` / `1` 两个码**，而且这条是**设计保证**
 （钩子不落临时文件、自己判 stdin），不是「按理说只有」：

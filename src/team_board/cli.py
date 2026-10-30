@@ -676,7 +676,20 @@ def _write_stdout(text: str) -> bool:
     要了」不再算错误：判定结果本身是好的，照旧返回 ``True``（rc 仍是判定码），并把
     stdout 接到 ``/dev/null``，免得解释器退出时再 flush 一次又炸出
     ``Exception ignored … BrokenPipeError``。
+
+    三种情形**必须分开**，不许合并成一个 except：
+
+    - ``BrokenPipeError``（含 ``errno=EPIPE``）＝没人要输出 → ``True``（判定码照旧）；
+    - 其余 ``OSError``（``ENOSPC`` / ``EIO`` / ``EBADF``…）＝**环境坏、输出真的丢了**
+      → stderr ``错误: …`` + ``False``（调用点映射 rc2）。合并成宽 catch 会把
+      「``merge-record`` 该打印给人照抄的 merge_guard 命令没打出来」吞成 rc0；
+    - ``sys.stdout is None``（调用方 exec 时 ``1>&-``）＝连流都没有，判定码照旧
+      → ``True``。旧版在这里抛 ``AttributeError: 'NoneType' object has no attribute
+      'write'``，同样被钩子判成「跑不起来」。
     """
+
+    if sys.stdout is None:  # `1>&-`：fd1 在 exec 时就被关掉，Python 把流设成 None
+        return True
 
     try:
         sys.stdout.write(text)
@@ -688,11 +701,20 @@ def _write_stdout(text: str) -> bool:
             "请改用 UTF-8（例如 PYTHONIOENCODING=utf-8 / LC_ALL=C.UTF-8）"
         )
         return False
-    except (BrokenPipeError, OSError):
-        # 管道对端已关 / 写不进去：输出目标没了，不是判定错误，也不是可修复的环境
-        # 错误（报 rc2 会让钩子按「环境错误」误拦）。把 fd 挪到 /dev/null 后返回 True。
+    except BrokenPipeError:
+        # 管道对端已关：输出目标没了，不是判定错误，也不是可修复的环境错误
+        # （报 rc2 会让钩子按「环境错误」误拦）。把 fd 挪到 /dev/null 后返回 True。
         _detach_stdout()
         return True
+    except OSError as exc:
+        # 写不进去但不是 EPIPE（磁盘满 / EIO / fd 坏了）：输出**真的丢了**，
+        # 不能当「没人要」放行 —— merge-record 打印的 merge_guard 命令是要照抄
+        # 执行的（R12 ①），静默吞掉等于让人拿着空输出去合并。→ 环境错误 rc2。
+        # 报完错同样把 fd 挪到 /dev/null：缓冲区里还压着没写出去的字节，不挪的话
+        # 解释器退出时再 flush 一次又炸，rc 会从 2 变成 120（真实实测）。
+        _write_stderr_error(f"stdout 写不进去（errno={exc.errno}）：{exc}")
+        _detach_stdout()
+        return False
     return True
 
 
@@ -702,12 +724,18 @@ def _detach_stdout() -> None:
     只为了压掉「退出时最后一次 flush」的 ``Exception ignored … BrokenPipeError``：
     那行会进钩子的 stderr 捕获变量，而钩子按文本判「跑不起来」。没有 ``fileno``
     的替身对象（pytest ``capsys`` 一类）直接跳过。
+
+    fd 已被关掉时 ``os.open`` 可能**正好把 fd 1 拿回来**（``devnull == fileno``）：
+    那就已经指向 ``/dev/null``，不许再 ``dup2``，也**不许 close 它**（close 会把刚
+    接好的 fd 1 又关掉）。与 :func:`team_board.merge_guard._silence_stdout` 同款守卫。
     """
 
     try:
         fileno = sys.stdout.fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
     except (AttributeError, OSError, ValueError):
+        return
+    if devnull == fileno:  # 关掉的 fd 被 os.open 复用了：已是 /dev/null，保持打开
         return
     try:
         os.dup2(devnull, fileno)
