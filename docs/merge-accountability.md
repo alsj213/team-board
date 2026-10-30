@@ -3,7 +3,7 @@
 谁合的 PR、谁写的提交，都要能**从机器可判的元数据里查得到**，不靠账号、不靠自觉。
 本文件写清三条判据、各自的判定命令、以及每个 bot 怎么持有自己的提交者身份。
 
-三条判据（全部有命令、全部进 CI）：
+三条判据（各有机器命令；②③ 全程进 CI，① 在 CI 只跑**字段判据**、卡级比较在验收时跑）：
 
 1. **判据① `merged-by` == 该卡 assignee**：合并提交必须带认账三字段
    `merged-by: <profile>/run<NNN>` / `merge-card: t_xxxxxxxx` / `merge-pr: NN`
@@ -13,6 +13,13 @@
    `{该卡**建卡时** assignee, engineer, qa}` 之一。
 3. **判据③ committer 是本 bot**：每条提交的 committer 必须是
    `.team-board/bots.tsv` 里登记过的 bot 身份，且与该提交的 author 是同一个 profile。
+
+判据① 在 CI 端跑的是**字段判据**（口径澄清，不是减检查项）：job `merge-accountability`
+判 trailer 三字段**齐 + 格式合法**（缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区
+→ rc1）。而「`merged-by` 的 profile == 该卡 `tasks.assignee`」这一步 CI 端**做不到**：
+一条合并提交属于哪张卡要查看板，CI 里没有「本次合并对应哪张卡」这个输入。于是卡级比较
+由**验收时**跑 `team-board merge-audit --card <卡> --require` 完成（输出带判据① 行与 rc）。
+CI 不是「豁免判据①」：它的字段部分已在 CI 常驻判，卡级部分随卡验收判，两段都不缺。
 
 本仓的解法是**在合并提交 message 末尾写三行 trailer**，并把「机器能判什么 /
 判不了什么」分成三层写死。三层不许互相冒充：甲层是机器判定，乙层是卡面留痕
@@ -100,15 +107,18 @@ CI 侧另两点不变：`--rev` 用 `github.event.pull_request.head.sha`（不�
 
 合并提交 message 末尾的 trailer 三字段**齐 + 格式合法** → `merge-audit` rc0；
 缺字段 / 格式非法 / 重复字段 / 字段未落在 trailer 区 → rc1。CI job
-`merge-accountability`（另一张卡加）常驻跑同一判定，红就是真红 —— 无认账字段的
-合并动作会被机器拦下或告警（rc≠0），补齐后同一条检查 rc=0。
+`merge-accountability`（另一张卡加）常驻跑**这一段字段判据**（判据① 的卡级比较随卡
+验收跑，见上），红就是真红 —— 无认账字段的合并动作会被机器拦下或告警（rc≠0），
+补齐后同一条检查 rc=0。
 
 **判什么：只判 first-parent 链上的合并** —— 即「把卡分支合进 main」的那个合并提交，
 也就是真正的「合并一张 PR」事件。工具按**被审 `rev` / `baseline` 自己的 first-parent
 链**取数（判定段沿 `rev`，历史段沿 `baseline`），所以：
 
 - **起点在 main 线上时**（`merge-audit --repo .` 在 main checkout 的默认 `HEAD`；
-  CI `merge-accountability` job 的 `push` 事件 `--rev origin/main`）：分支侧
+  CI `merge-accountability` job 的 `push` 事件 `--rev = ${{ github.sha }}` —— 判的是
+  **本次 push 的那个提交**，不是 `origin/main`：并发合并时 fetch 到的 `origin/main`
+  可能已前进到别人的提交上，红就会记错提交）：分支侧
   `git merge origin/main` 产生的同步合并（把 main 并回卡分支）落在 second-parent 链上，
   既没合任何 PR，也本来就不该有 `merge-card` / `merge-pr`，因此**既不判、也不计入**
   records / problems / 历史段。
@@ -218,8 +228,25 @@ bash scripts/setup-bot-identity.sh engineer /home/liu/project/tb-wt/t_xxxxxxxx
 - 判定区间由基线文件 `.team-board/merge-audit-baseline` 决定（另一张卡建），也可用
   `--baseline REV` 显式给；两者只能给一个，都不给时读默认文件，**文件缺失即 rc2**
   （不静默当成「没有基线」）。
-- 把基线文件改成新 sha 会让判定区间变空 = 等于关闸。这条改动**会出现在 PR diff
-  里**，属「明着关闸」、不是隐蔽豁免；审 PR 的人看得见。
+- **CI 只认 base 侧那份文件（机器强制，不靠人看 diff）**：`merge-accountability` job
+  先 `git show <BASE_REF>:.team-board/merge-audit-baseline` 写出到
+  `$RUNNER_TEMP/baseline`，再用 `--baseline-file` 喂给工具；工具只认这个参数的内容，
+  **不读检出树里的那份**。`BASE_REF` 的定义：`pull_request` → `origin/<base_ref>`
+  （main 侧提供基线）；`push` → `github.event.before`（上一个 main 尖端）。
+  于是被审 PR 改自己那份基线**不生效** —— 旧口径只写「这条改动会出现在 PR diff 里、
+  审的人看得见」（纯 prose、无校验），现在由机器挡住。
+  读不到该文件（新分支 push 的 `before` 全 0、或 base 侧根本没有这条文件）→ `rc=2`
+  红，属**预期 fail-closed**，不是配置失误。
+- **方向断言（防静默假绿）**：基线必须是被审 `rev` 的**祖先**，否则 `rc=2` +
+  `错误: 基线不是被审 rev 的祖先：<B> / <R>`。`git log <baseline>..<rev>` 在基线不在
+  rev 上游时会退化成空区间，输出「判定（0 条）/ 结论：无问题」并 rc0，与「真的没有
+  任何合并」不可区分 —— 那种假绿比红更坏，所以一律报错而不是照样跑。
+  CI 里的可见后果（**预期行为，不是误报**）：PR 分支若从基线之前切出、又没有同步
+  main，`head.sha` 里就没有基线提交 → 方向断言不成立 → `merge-accountability` 红，
+  提示先 rebase/同步 main 再合并。宁可红一次要求补基数，也不给空区间开路。
+- 把基线文件改成新 sha 仍然等于关闸（区间变空）；但因为基线必须来自 base 侧，PR 自己
+  推不动它 —— 推基线要单独一张卡、改 main 上的那份文件，且在 `push` 事件里同样受方向
+  断言约束（基线到不了 rev 之外）。
 - 工具**不提供** `--skip` / `--force` / `--ignore` 任何降级开关：要么三字段齐，要么红。
 
 ### 基线 = 历史不追溯点（本 job 引入时的口径）

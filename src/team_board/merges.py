@@ -63,6 +63,13 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
 10. 基线来源：``baseline`` 参数 > ``baseline_file`` 参数 > ``<repo>/.team-board/
     merge-audit-baseline``。文件不存在 / 不是 UTF-8 / 空 / 多行 / 不是 7–40 位
     小写十六进制 → ``MergeAuditError``（**不静默当成「没有基线」**）。
+    给出 ``baseline_file`` 时**只认该文件的内容**，不读当前检出树里的默认文件 ——
+    CI 因此可以喂 base 侧那份（``git show <BASE_REF>:.team-board/merge-audit-baseline``），
+    使被审 PR 改自己那份基线不生效（否则它能把自己的判定区间缩成空区间，见
+    t_daba51a7 P2-4）。
+    另有一条**方向断言**：基线必须是 ``rev`` 的祖先，否则 rc2（``<baseline>..<rev>``
+    在 git 里会退化成一个空区间，输出「判定（0 条）/ 结论：无问题」并 rc0，与
+    「真的没有合并」不可区分 = 静默假绿，见 t_daba51a7 P2-3）。
 11. **判据①**：``merged-by`` 的 profile 部分（``/`` 之前）必须**严格等于**该卡
     ``tasks.assignee``。只在 ``audit(only_card=…)``（即 CLI 给了 ``--card``）时生效，
     且只判 ``source="trailer"`` 的记录 —— 历史段（``source="legacy"``）没有
@@ -716,7 +723,7 @@ def audit(
     参数/环境级错误一律抛 :class:`MergeAuditError`（CLI 转 rc2），检查顺序：
     仓库 → ``baseline``/``baseline_file`` 互斥 → ``only_card`` 形态 →
     ``require`` 依赖 → 判据① 的 ``assignee``（读看板库）→ 基线取值与解析 →
-    ``rev`` 解析。
+    ``rev`` 解析 → 方向断言（基线必须是 ``rev`` 的祖先，否则 rc2，不让空区间假绿）。
 
     ``only_card`` 只过滤两段的**记录清单**，不吞掉已判出的问题（有问题的合并
     即使不属于该卡也照样红）。``require=True`` 时：区间内有该卡零问题的
@@ -756,6 +763,18 @@ def audit(
         baseline = _read_baseline_file(source)
     baseline_sha = _resolve_commit(root, baseline, "基线")
     rev_sha = _resolve_commit(root, rev, "区间终点")
+
+    # 区间方向断言：基线**必须是**被审 rev 的祖先（含相等）。否则 ``<baseline>..<rev>``
+    # 在 git 里会退化成「rev 侧为空」的空区间 —— 输出「判定（0 条）/ 结论：无问题」并
+    # rc0，与「真的没有任何合并」不可区分，即静默假绿（t_daba51a7 P2-3）。
+    # merge-base --is-ancestor: rc0 = 是祖先；rc1 = 不是；其它 = 判不了。后两者都 rc2。
+    ancestor = _git(root, "merge-base", "--is-ancestor", baseline_sha, rev_sha)
+    if ancestor.returncode != 0:
+        raise MergeAuditError(
+            f"基线不是被审 rev 的祖先：{baseline_sha} / {rev_sha}"
+            "（区间必须是 <基线>..<rev> 且方向为正：基线在被审 rev 的上游。"
+            "基线被前推、或 rev 给成基线之前的提交时，区间会变空并静默假绿，故一律报错）"
+        )
 
     judged: list[MergeRecord] = []
     problems: list[Problem] = []

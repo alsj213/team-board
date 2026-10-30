@@ -357,7 +357,13 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
   细则见 `docs/merge-accountability.md` 甲层。两者只能给
   一个（同给 → rc2）。都不给时读默认文件 `<repo>/.team-board/merge-audit-baseline`，
   **该文件不存在 → rc2（不静默当成「没有基线」）**；内容须是一行 7–40 位小写
-  十六进制 sha（空文件 / 多行 / 非 UTF-8 / 不是 sha 一律 rc2）。
+  十六进制 sha（空文件 / 多行 / 非 UTF-8 / 不是 sha 一律 rc2）。给了
+  `--baseline-file` 就**只认该文件的内容**（不读检出树里的默认文件）。
+  基线**必须是被审 `rev` 的祖先**，否则 rc2（`基线不是被审 rev 的祖先：<B> / <R>`）——
+  方向反了区间会变空并静默假绿，所以直接报错。CI 的基线来自 **base 侧**那份文件
+  （`git show <BASE_REF>:.team-board/merge-audit-baseline` + `--baseline-file`），
+  被审 PR 改自己那份不生效；`push` 事件的 `--rev` 是 `github.sha`（不是 `origin/main`，
+  并发合并时它会已前进到别人的提交）。
 - `--rev REV` —— 区间终点（默认 `HEAD`）；解析不成提交（含空串）→ rc2。
 - `--card CARD` —— 只列这张卡的合并记录（**同时过滤判定段与历史段**）；形态不是
   `t_` + 8 位小写十六进制（空串、大写、多字符、缺前缀）→ rc2。它只过滤记录
