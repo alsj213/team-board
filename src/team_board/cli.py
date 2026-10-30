@@ -42,6 +42,18 @@
   stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--db`` 不存在、
   不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
 
+``gate`` 子命令（包装外部检查器：全量落盘 + stdout 只回摘要）：
+- 0 / 1 / 其他：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``）
+- 2：参数或环境错误（``--gate`` / ``--card`` 形态非法、``--`` 之后没有命令、
+  子进程起不来（``FileNotFoundError`` / ``PermissionError`` /
+  ``NotADirectoryError``）、日志写不进去、stdout 编码表示不了中文 →
+  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback）。子命令自己返回 2 时
+  同样透传为 2（两个语义同码，不冲突）
+- 全量输出（stdout + stderr 按写入顺序）落 ``<log-dir>/<gate>-<卡号>.log``，
+  ``--log-dir`` 默认 ``evidence``（相对 CWD）；子命令没起来时不写日志
+- stdout 只有摘要（``gate:`` / ``card:`` / ``exit:`` / ``counts:`` /
+  ``失败行（n/m，≤20）:`` / ``log:``），日志原文**不再打印一次**
+
 ``push-guard`` 子命令（git pre-push 的判定本体，只读，不写任何东西）：
 - 0：放行（stdout 恰一行 ``push-guard: 放行 N 条 ref（checkout=…，HEAD=…）``）；
   给 ``--check-install`` 时表示 pre-push 钩子已装好
@@ -98,6 +110,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import date, datetime
@@ -109,6 +122,7 @@ from . import (
     commands,
     commits,
     db,
+    gatelog,
     merges,
     prclaim,
     pushguard,
@@ -455,6 +469,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="连 done 卡一起算（默认只算未结卡：status ∉ {done, archived}）",
+    )
+
+    gate_cmd = subparsers.add_parser(
+        "gate",
+        help=(
+            "包一层检查器命令：全量输出落 <log-dir>/<gate>-<卡号>.log、stdout 只回摘要"
+            "（rc 透传子命令 / 2 = 参数或环境错误）"
+        ),
+    )
+    gate_cmd.add_argument(
+        "--gate",
+        required=True,
+        metavar="NAME",
+        help=(
+            "闸门名（字母数字开头，其后字母数字与 ._-；进日志文件名，"
+            "含 / 或空串 → rc2）"
+        ),
+    )
+    gate_cmd.add_argument(
+        "--card",
+        required=True,
+        metavar="CARD",
+        help="卡号（t_ + 8 位小写十六进制；进日志文件名，形态非法 → rc2）",
+    )
+    gate_cmd.add_argument(
+        "--log-dir",
+        default=gatelog.LOG_DIR_DEFAULT,
+        metavar="DIR",
+        help=(
+            f"日志目录（默认 {gatelog.LOG_DIR_DEFAULT}，相对当前目录；"
+            "不存在就建）"
+        ),
+    )
+    gate_cmd.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        metavar="CMD",
+        help=(
+            "要执行的命令及其参数，写在 -- 之后（-- 本身不是命令）；"
+            "去掉 -- 后为空 → rc2"
+        ),
     )
 
     push_cmd = subparsers.add_parser(
@@ -1155,6 +1210,73 @@ def _run_body_audit(args: argparse.Namespace) -> int:
     return 1 if summary.counts["over"] else 0
 
 
+def _run_gate(args: argparse.Namespace) -> int:
+    """``gate`` 子命令：跑一条外部检查器，全量输出落盘、stdout 只回摘要。
+
+    退出码分工：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``），
+    ``2`` 专门留给「参数或环境错误」—— 形态非法、``--`` 之后没有命令、
+    起不来、日志写不进去、stdout 编码表示不了中文。正因为 2 被工具自己占用，
+    子命令自己返回 2 时本命令也返回 2（透传优先，两者同码不冲突）。
+
+    落盘与摘要的**唯一实现**在 :mod:`team_board.gatelog`：这里只负责
+    「去掉 REMAINDER 里的 ``--``」「跑子进程」「顺序：先落盘再打印摘要」。
+    先落盘后打印，是为了让「日志没写成」判 rc2 时不留下半截 stdout ——
+    摘要里的 ``log:`` 行恒指向一个**已经存在**的文件。
+
+    ``--gate`` / ``--card`` 的形态校验复用 :func:`gatelog.log_filename`
+    （与落盘同一判据，不复制正则），所以非法卡号的文案是 ``卡号形态非法``。
+    """
+
+    try:
+        gatelog.log_filename(args.gate, args.card)
+    except gatelog.GateLogError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    # argparse 把 ``--`` 留在 REMAINDER 里；不去掉就会去 exec 一个字面量 ``--``
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        _write_stderr_error("缺少要执行的命令（-- 之后至少一个）")
+        return 2
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    except OSError as exc:
+        # FileNotFoundError / PermissionError / NotADirectoryError 都在这条分支里
+        # （三个都是 OSError 子类）；命令没起来就没有输出，不写日志
+        _write_stderr_error(f"启动失败：{cmd[0]}: {exc}")
+        return 2
+
+    rc = completed.returncode
+    if rc < 0:
+        # 被信号杀：负号换成 shell 惯用码，日志与摘要里不带负数
+        rc = 128 + (-rc)
+    text = completed.stdout or ""
+
+    try:
+        log_path = gatelog.write_log(
+            text, gate=args.gate, card=args.card, log_dir=args.log_dir
+        )
+    except (gatelog.GateLogError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    summary = gatelog.render_summary(
+        gate=args.gate, card=args.card, exit_code=rc, text=text, log_path=log_path
+    )
+    if not _write_stdout(summary + "\n"):
+        return 2
+    return rc
+
+
 def _push_guard_check_install(args: argparse.Namespace) -> int:
     """``push-guard --check-install``：钩子装好 rc0 / 没装好 rc1 / 参数环境错 rc2。
 
@@ -1293,6 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "body-audit":
         return _run_body_audit(args)
+
+    if args.command == "gate":
+        return _run_gate(args)
 
     if args.command == "push-guard":
         return _run_push_guard(args)
