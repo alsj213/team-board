@@ -124,6 +124,7 @@ from . import (
     db,
     gatelog,
     merges,
+    outputaudit,
     prclaim,
     pushguard,
     reviewhead,
@@ -510,6 +511,25 @@ def build_parser() -> argparse.ArgumentParser:
             "要执行的命令及其参数，写在 -- 之后（-- 本身不是命令）；"
             "去掉 -- 后为空 → rc2"
         ),
+    )
+
+    output_cmd = subparsers.add_parser(
+        "output-audit",
+        help=(
+            "稽核评论 / result 的字节数是否超过上限"
+            "（0 无超限 / 1 有超限 / 2 参数或环境错误）"
+        ),
+    )
+    output_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    output_cmd.add_argument(
+        "--all",
+        action="store_true",
+        help="连 done 卡一起算（默认只算未结卡：status ∉ {done, archived}）",
     )
 
     push_cmd = subparsers.add_parser(
@@ -1279,6 +1299,32 @@ def _run_gate(args: argparse.Namespace) -> int:
     return rc
 
 
+def _run_output_audit(args: argparse.Namespace) -> int:
+    """``output-audit`` 子命令：读失败一律 stderr 一行 ``错误: …`` + rc2。
+
+    三个码的分工：0 无超限 / 1 有超限 / 2 参数或环境错误。库不可用时 stdout
+    **一个字节都不写**（报告整块在库读成功之后才拼），所以 rc2 与 rc1 不会混。
+    """
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        rows = db.iter_output_rows(conn, include_done=args.all)
+    except (db.BoardError, gatelog.GateLogError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    summary = outputaudit.summarize(rows)
+    scope = bodylimit.SCOPE_ALL if args.all else bodylimit.SCOPE_PENDING
+    text = outputaudit.render(summary, db_path=args.db, scope=scope)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 1 if summary.counts["over"] else 0
+
+
 def _push_guard_check_install(args: argparse.Namespace) -> int:
     """``push-guard --check-install``：钩子装好 rc0 / 没装好 rc1 / 参数环境错 rc2。
 
@@ -1417,6 +1463,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "body-audit":
         return _run_body_audit(args)
+    if args.command == "output-audit":
+        return _run_output_audit(args)
 
     if args.command == "gate":
         return _run_gate(args)

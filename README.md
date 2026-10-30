@@ -22,12 +22,13 @@ team-board member engineer
 team-board export
 ```
 
-共十四个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
-`merge-record` / `commit-audit` / `body-audit` / `gate` / `push-guard` / `pr-claim-audit` /
+共十五个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `commit-audit` / `body-audit` / `gate` / `output-audit` / `push-guard` / `pr-claim-audit` /
 `pr-review-head-audit` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
-`pr-claim-audit` 见「PR 认领唯一性稽核」一节，`gate` 见「闸门日志」一节）。
+`pr-claim-audit` 见「PR 认领唯一性稽核」一节，`gate` 见「闸门日志」一节，
+`output-audit` 见「输出上限稽核」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -970,6 +971,31 @@ $ PYTHONPATH=src python3 -m team_board.cli gate --gate pytest --card t_eaa81611 
 
 用法、退出码与真实样例见 [`docs/gate-logs.md`](docs/gate-logs.md)。
 
+## 输出上限稽核（output-audit）
+
+单条**评论**（`task_comments.body`）与单张卡的 **result**（`tasks.result`）也有
+**8192 字节**（UTF-8）软上限 —— 超过就不该再往卡上贴，全量输出该落日志文件、
+卡面只留摘要 + 日志路径。上限常量是 `gatelog.OUTPUT_LIMIT_BYTES`，本子命令只 import，
+不另写数字。它是**只读**的：`mode=ro` 打开看板库，既不建表也不写库。
+
+```
+$ PYTHONPATH=src python3 -m team_board.cli output-audit; echo rc=$?
+/home/liu/.hermes/kanban/boards/devteam/kanban.db
+口径：单条评论 / result 的 UTF-8 字节数；上限 8192 字节
+范围：未结卡（status ∉ {done, archived}）
+合计：8 条；超限：0 条
+超限清单（0 条）：—
+rc=0
+```
+
+`--all` 把已结卡也算进来（仍不含 `archived`）。存量超限卡是历史事实，本子命令只列不改：
+真板实测 `--all` 是 `合计：606 条；超限：23 条` → `rc=1`，清单形如
+`  t_6b5564aa  comment#284  16336 字节`（行内列间 2 个空格、行尾不留空格）。
+
+rc 三档：`0` 无超限 / `1` **发现**超限（不是数据源错误）/ `2` 参数或环境错误
+（`--db` 不存在、不是合法 SQLite、缺 `task_comments` 表、stdout 编码表示不了中文）。
+库读成功之前 stdout 一个字节都不写，所以 2 与 1 不会混。
+
 ## PR 认领唯一性稽核（pr-claim-audit）
 
 一张 PR 只许**一张未结卡**认领，否则两张卡各自发 `gh` 写操作，谁在合就说不清了。
@@ -1052,6 +1078,8 @@ REF t_9f000001 [review] pm
 「提交身份稽核」一节。
 `body-audit` 另有一套：`0` 无超限 / `1` **发现**超限卡 / `2` 数据源或参数错误
 （注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
+`output-audit` 与 `body-audit` 同口径：`0` 无超限 / `1` **发现**超限的评论或 result /
+`2` 参数或环境错误；详见上面「输出上限稽核（output-audit）」一节。
 `pr-review-head-audit` 同理：`1` 表示**该 head 上双问不齐**
 （缺一类 / 两类都缺 / 只有别的 sha 的标记 = head 变过没重跑）、`2` 表示参数或环境
 错误（`--head` 非 40/64 位小写十六进制、`--pr` 非正整数、`gh api` 调用失败）。

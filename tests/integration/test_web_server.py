@@ -44,6 +44,7 @@ EXPECTED_SUBCOMMANDS = (
     "merge-record",
     "body-audit",
     "gate",
+    "output-audit",
     "push-guard",
     "pr-claim-audit",
     "pr-review-head-audit",
@@ -62,6 +63,7 @@ CN_DIGITS = {
     12: "十二",
     13: "十三",
     14: "十四",
+    15: "十五",
 }
 
 
