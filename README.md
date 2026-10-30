@@ -22,12 +22,12 @@ team-board member engineer
 team-board export
 ```
 
-共十三个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
-`merge-record` / `commit-audit` / `body-audit` / `push-guard` / `pr-claim-audit` /
+共十四个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+`merge-record` / `commit-audit` / `body-audit` / `gate` / `push-guard` / `pr-claim-audit` /
 `pr-review-head-audit` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
-`pr-claim-audit` 见「PR 认领唯一性稽核」一节）。
+`pr-claim-audit` 见「PR 认领唯一性稽核」一节，`gate` 见「闸门日志」一节）。
 
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -950,6 +950,25 @@ $ echo $?
 
 条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板 +
 实测 719 字节样例）见 [`docs/card-template.md`](docs/card-template.md)。
+
+## 闸门日志（gate）
+
+检查器（`pytest` / `ruff` / `mypy` / 各 `*-audit`）的输出**整份落盘**，stdout 只回一段
+摘要 —— 卡上贴摘要 + 日志路径，不再把几百行终端输出粘进上下文：
+
+```
+$ PYTHONPATH=src python3 -m team_board.cli gate --gate pytest --card t_eaa81611 -- .venv/bin/python -m pytest -q
+```
+
+`--` 之后是要执行的命令（`--` 本身不是命令），**退出码原样透传**（被信号杀记
+`128 + (-rc)`）；`2` 专留给参数或环境错误（`--gate` / `--card` 形态非法、`--` 之后没有
+命令、命令起不来、日志写不进去）。全量输出（stdout + stderr 按写入顺序）落
+`<log-dir>/<gate>-<卡号>.log`，`--log-dir` 默认 `evidence`（相对 CWD，不存在就建）。
+摘要恒为 `gate:` / `card:` / `exit:` / `counts:` / `失败行（n/m，≤20）:` /
+（零命中时）`末尾行（n/m，≤20）:` / `log:` 几行，格式的唯一实现是
+`team_board.gatelog.render_summary`。
+
+用法、退出码与真实样例见 [`docs/gate-logs.md`](docs/gate-logs.md)。
 
 ## PR 认领唯一性稽核（pr-claim-audit）
 
