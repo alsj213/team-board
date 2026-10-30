@@ -54,8 +54,8 @@ push-guard: 放行 N 条 ref（checkout=<root>，HEAD=<actual>）
 （钩子不落临时文件、自己判 stdin），不是「按理说只有」：
 
 **例外（一个）**：**调用方把钩子的 fd1 关掉**（例如 `git push >&-`）时钩子拿不到可写的
-stdout，`exec 3>&1` 直接失败 —— 实测（2026-10-30）dash **rc=2**（`.githooks/pre-push: 56:
-1: Bad file descriptor` 即退，一句人话都没有）、bash **rc=1**（`3: Bad file descriptor`
+stdout，`exec 3>&1` 直接失败 —— 实测（2026-10-30）dash **rc=2**（只吐一句 `1: Bad file
+descriptor` 即退，没有任何人话）、bash **rc=1**（`3: Bad file descriptor`
 后继续跑到判定红那档，还打了两行提示）。这是调用方用法的问题，不是钩子自己的判定：
 正常 `git push` 一定有 stdout，`0` / `1` 的保证只在这个前提下成立。
 

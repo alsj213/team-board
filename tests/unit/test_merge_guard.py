@@ -188,8 +188,8 @@ def test_poll_single_shot_timeout() -> None:
 # ------------------- 总预算硬约束：--timeout 是「总」等待，不是「每次」等待
 #
 # 依据「合并后删源分支（merge_guard）」一节里那句「总等待不超过 `--timeout`：
-# `--timeout` 是**总**预算」。只引原话、不写行号：README 每加几行行号就漂（这条注释
-# 原引的 README:313 已经漂到 507 行）。修之前单次探针只受 --command-timeout
+# `--timeout` 是**总**预算」。只引原话、不写行号：README 每加几行行号就漂（原先写死的
+# 行号已经漂到 507 行）。修之前单次探针只受 --command-timeout
 # 约束：--timeout 1 --command-timeout 60 + 一次卡 3 秒的 git → 3.1 秒才返回。
 
 def test_poll_budget_exhausted_skips_new_probe() -> None:
