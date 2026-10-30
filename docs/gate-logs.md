@@ -174,6 +174,8 @@ log: <日志文件的绝对路径>
 | 透传 2 | `/bin/sh -c 'echo hi; exit 2'` | 2（有摘要、无 stderr） |
 | 被信号杀 | `/bin/sh -c 'kill -9 $$'` | 137（`128 + 9`，摘要里不带负数） |
 | 起不来 | `nosuchcmd_xyz` | 2（stderr 恰一行、无日志） |
+| 日志目录不可写 | `--log-dir /proc/nope/logs` | 2（stderr 恰一行） |
+| stdout 编码非 UTF-8 | `PYTHONIOENCODING=ascii` | 2（stderr 恰一行，提示改用 UTF-8） |
 | 卡号非法 | `--card t_XYZ` | 2（stderr 恰一行、无日志） |
 | `--` 后为空 | `--` | 2（stderr 恰一行） |
 | `--log-dir` 覆盖 | `--log-dir <tmp>/logs` | 0，日志落在覆盖目录、`evidence/` 未新建 |
