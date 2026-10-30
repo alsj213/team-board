@@ -21,8 +21,9 @@ FIRST_CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$")
 ## 2. 首行判据（比内核建卡闸门更严，与 `CLAIM_RE` 对齐）
 
 - 「首行」= 正文的**第一个非空行**（空行跳过，按 `\n` 切分，**不吞 `\r`**）；
-- 该行必须**整行**等于 `PR-CLAIM: #<n>`，`n` 是 `1..999999999` 的 ASCII 十进制正整数
-  （`#0` / `#034` / 13 位毫秒一律不认）；
+- 该行必须**整行**等于 `PR-CLAIM: #<n>`；认领行的 `n` 是 **≥1 的 ASCII 十进制正整数、无上限**
+  （与 `CLAIM_RE` / 内核一致：`#0` / `#034` 不认，13 位毫秒 `#1793160000000` 照认；
+  `--pr` 参数那个 `1..999999999` 上限只约束命令行参数，不约束认领行）；
 - 顶格、行尾无尾随字符：`  PR-CLAIM: #47`、`PR-CLAIM: #47 我领了`、`PR-CLAIM: #47\r`
   都不算；`PR-CLAIM:#47`（冒号后缺空格）也不算；
 - 比 `CLAIM_RE`（正文任意顶格行）**同形态、更严**，不会更宽 —— 首行过了，后面的
@@ -43,7 +44,12 @@ CRLF / 行尾空格都放行）；本仓 `first_line()` **不 strip、按 `\n` �
 方向是刻意选的：放宽成「mirror 内核」会造出**反向缺口** —— 稽核通过、`merge_guard`
 却拒绝合并；而建卡时被放过的这 4 种形态，补一行顶格认领行即可闭合。差异集钉在
 `tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin`（内联期望表：多一条少一条
-都会红），内核那份若改成同样严格也要先被这张表提醒。
+都会红）。**那张表只钉本仓一侧**，不 import 内核 —— 表里「内核建卡」列是写死的期望
+字符串，内核侧改成同样严格它不会自己红。内核侧由同一文件的
+`TestKernelLiveComparison` 复核：找得到内核源码（环境变量 `HERMES_KERNEL_KANBAN_DB`，
+否则默认 `~/.hermes/hermes-agent/hermes_cli/kanban_db.py`）时 exec 内核那两条正则与
+`_validate_pr_claim`，逐条与「内核建卡」列比对，并断言两条正则文本与本仓逐字相同；
+找不到内核源码就 `skip`（CI runner 上没有 Hermes 源码，本仓 CI 不依赖它）。
 
 ## 3. 为什么只看标题前缀（实测依据）
 
@@ -66,10 +72,10 @@ print("关键词版(正文含合并):", sum("合并" in (b or "") for _t, b in r
 PY
 ```
 
-该快照的实跑输出（证据 `evidence/t_cd645098-doc-cmd.log`）：
+该快照的实跑输出（2026-10-31 02:15 CST，证据 `evidence/t_cd645098-r3-doc-cmd.log`）：
 
 ```
-未归档卡: 237
+未归档卡: 238
 前缀版(needs_claim): 25
   其中 CLAIM-OK: 5
   其中 NO-CLAIM: 20
@@ -89,7 +95,8 @@ PY
 PYTHONPATH=src python3 -m team_board.cli pr-claim-audit --gaps --db <看板.db>
 ```
 
-快照：`未结卡 9 张` / `结论: 无缺口（合并类卡都带 PR-CLAIM）`，rc=0 —— 命中 **0 张**，
+快照（2026-10-31 02:15 CST，证据 `evidence/t_cd645098-r3-gaps-live.log`）：
+`未结卡 6 张` / `结论: 无缺口（合并类卡都带 PR-CLAIM）`，rc=0 —— 命中 **0 张**，
 **存量缺口为空，无需回填**（未结卡数随板上变动，判据是「命中 0 张 + rc0」）。
 
 ## 4. 命令与退出码
@@ -129,7 +136,9 @@ GAP <id> [<status>] <assignee> 触发=<hit> 首行=<first>
 - **触发谓词逐字相同**（§1 那两行 `re.compile`）：改一处必须同轮改另一处，否则
   「建卡时放过的卡稽核时报缺口」或「稽核认的卡建卡时被拦」；
 - **首行判据不同、方向固定**：`needs_claim` 两边一致；`first_claim_pr` 比内核严格
-  （内核 `strip()`，本仓不 strip），差异集就是 §2 那 4 种形态，由
-  `TestKernelDifferencePin` 钉住。改内核那一侧前先看那张表是否会红；
+  （内核 `strip()`，本仓不 strip），差异集就是 §2 那 4 种形态。两个测试都在
+  `tests/unit/test_prclaim_gaps.py`：`TestKernelDifferencePin` 钉**本仓一侧**（内联期望，
+  不读内核），`TestKernelLiveComparison`（有内核源码时，否则 skip）exec 内核那两条正则
+  与 `_validate_pr_claim` 逐条复核。改内核那一侧前先跑后者；
 - 本仓这份是 `pr-claim-audit --gaps` 的唯一实现，不新增第二份判定（不加 allowlist、
   不改 CI job 顺序、不动 `merge_guard` 的认领闸门语义）。

@@ -5,6 +5,12 @@
 
 from __future__ import annotations
 
+import ast
+import os
+import re
+from pathlib import Path
+from typing import Any
+
 import pytest
 
 from team_board import prclaim
@@ -180,16 +186,18 @@ class TestRenderGaps:
 
 
 class TestKernelDifferencePin:
-    """钉住「缺口稽核」与内核建卡闸门（卡 ``t_c6ab9672``）的差异集。
+    """钉住「缺口稽核」与本仓 :data:`prclaim.CLAIM_RE` 之间刻意保留的差异集。
 
     内核 ``_validate_pr_claim`` 取首行用 ``ln.strip()`` + ``str.splitlines()``；
     本仓 :func:`prclaim.first_line` 不 strip、按 ``\\n`` 切（与 :data:`CLAIM_RE`
     对齐，``merge_guard`` 也只看 ``CLAIM_RE``）。因此两边在**恰好 4 种形态**上
     不同：首行缩进 / tab / CRLF / 行尾空格 —— 内核 ACCEPT，稽核报 GAP。
 
-    这张表是内联期望（不 import 内核，CI 不依赖 Hermes 源码）；内核那份若改成
-    同样严格、或本仓改成 mirror 内核，这张表会先红，逼着同轮改
-    ``docs/pr-claim-gate.md`` §2/§5。
+    本表**只钉本仓一侧**：表里「内核建卡」列是写死的期望字符串，**不 import 内核**，
+    所以内核那边改成同样严格时这张表**不会**自己红（说它会红就是假话）。本仓改成
+    mirror 内核、或稽核放宽/收紧，这张表才红，逼着同轮改 ``docs/pr-claim-gate.md``
+    §2/§5。内核侧的现行行为由 :class:`TestKernelLiveComparison` 在本机能找到内核
+    源码时 exec 核对（CI runner 上没有 Hermes 源码 → skip）。
     """
 
     TITLE = "合并卡（pm）：k"
@@ -204,6 +212,8 @@ class TestKernelDifferencePin:
         ("行尾尾随文字", "PR-CLAIM: #47 我领了\n目标", "REJECT", "GAP"),
         ("冒号后缺空格", "PR-CLAIM:#47\n目标", "REJECT", "GAP"),
         ("#0", "PR-CLAIM: #0\n目标", "REJECT", "GAP"),
+        ("前导零", "PR-CLAIM: #034\n目标", "REJECT", "GAP"),
+        ("13 位毫秒", "PR-CLAIM: #1793160000000\n目标", "ACCEPT", "OK"),
         ("第二行才有", "目标：…\nPR-CLAIM: #47", "REJECT", "GAP"),
         ("完全没有", "目标：…", "REJECT", "GAP"),
     )
@@ -233,3 +243,108 @@ class TestKernelDifferencePin:
                 continue
             assert prclaim.CLAIM_RE.search(body) is not None, name
             assert prclaim.first_claim_pr(body) in prclaim.claimed_prs(body), name
+
+    def test_claim_number_has_no_upper_bound(self) -> None:
+        """认领行的 ``n`` 只要求 ≥1 的 ASCII 十进制正整数、无上限。
+
+        ``--pr`` 参数那个 ``1..999999999`` 上限只约束命令行（:func:`prclaim.parse_pr`），
+        不约束认领行 —— 与 ``CLAIM_RE`` / 内核 ``_PR_CLAIM_LINE_RE`` 一致。
+        """
+        for body in ("PR-CLAIM: #1000000000", "PR-CLAIM: #1793160000000"):
+            assert prclaim.first_claim_pr(body) is not None, body
+            assert prclaim.CLAIM_RE.search(body) is not None, body
+        for body in ("PR-CLAIM: #0", "PR-CLAIM: #00", "PR-CLAIM: #034", "PR-CLAIM: #-1"):
+            assert prclaim.first_claim_pr(body) is None, body
+        with pytest.raises(prclaim.ClaimAuditError):
+            prclaim.parse_pr("1793160000000")
+
+
+# --------------------------------------------------------------------------- 内核实跑复核
+
+_KERNEL_DEFAULT = Path.home() / ".hermes" / "hermes-agent" / "hermes_cli" / "kanban_db.py"
+
+#: 从内核源码里只 exec 这几段（不 import ``hermes_cli``：CI 没装 Hermes）
+_KERNEL_NAMES = (
+    "_PR_CLAIM_TRIGGER_RE",
+    "_PR_CLAIM_LINE_RE",
+    "PrClaimMissingError",
+    "_validate_pr_claim",
+)
+
+
+def _kernel_source_path() -> Path | None:
+    """内核 ``kanban_db.py`` 的位置：环境变量优先，否则 :data:`_KERNEL_DEFAULT`。"""
+    raw = os.environ.get("HERMES_KERNEL_KANBAN_DB", "").strip()
+    candidates = [Path(raw)] if raw else []
+    candidates.append(_KERNEL_DEFAULT)
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _load_kernel(path: Path) -> dict[str, Any]:
+    """按 AST 取出建卡闸门那几段源码并 exec，返回它们的命名空间。
+
+    只取需要的顶层节点：整文件 exec 会把 ``kanban_db`` 的依赖全拖进来（CI 没有）。
+    """
+    source = path.read_text(encoding="utf-8")
+    segments: list[str] = []
+    found: set[str] = set()
+    for node in ast.parse(source).body:
+        name: str | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            name = getattr(node.targets[0], "id", None)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            name = node.name
+        if name in _KERNEL_NAMES:
+            segment = ast.get_source_segment(source, node)
+            assert segment is not None, name
+            segments.append(segment)
+            found.add(name)
+    missing = set(_KERNEL_NAMES) - found
+    assert not missing, f"内核源码里找不到 {sorted(missing)}（{path}）"
+    namespace: dict[str, Any] = {"re": re}
+    exec(compile("\n\n".join(segments), str(path), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.skipif(
+    _kernel_source_path() is None,
+    reason="本机没有 Hermes 内核源码（可用 HERMES_KERNEL_KANBAN_DB 指定 kanban_db.py）",
+)
+class TestKernelLiveComparison:
+    """用**真内核源码**复核 :class:`TestKernelDifferencePin` 那张表的「内核建卡」列。
+
+    那张表的这一列是硬编码字符串，内核侧改动它不会自己红；本类在找得到内核
+    ``kanban_db.py`` 时 exec 两条正则与 ``_validate_pr_claim``，按真实内核重判每一行，
+    并断言两条正则文本与本仓逐字相同。找不到内核源码就整类 skip（CI 上就是这样）。
+    """
+
+    @staticmethod
+    def _kernel() -> dict[str, Any]:
+        path = _kernel_source_path()
+        assert path is not None
+        return _load_kernel(path)
+
+    def test_regex_text_is_char_for_char_identical(self) -> None:
+        kernel = self._kernel()
+        assert kernel["_PR_CLAIM_TRIGGER_RE"].pattern == prclaim.TRIGGER_RE.pattern
+        # 内核那份带 re.MULTILINE（worker 自救写认领行用），本仓首行版不带 —— 只比文本
+        assert kernel["_PR_CLAIM_LINE_RE"].pattern == prclaim.FIRST_CLAIM_RE.pattern
+
+    def test_table_kernel_column_matches_live_kernel(self) -> None:
+        kernel = self._kernel()
+        validate = kernel["_validate_pr_claim"]
+        missing = kernel["PrClaimMissingError"]
+        title = TestKernelDifferencePin.TITLE
+        actual: dict[str, str] = {}
+        for name, body, _expected, _audit in TestKernelDifferencePin.TABLE:
+            try:
+                validate(title, body)
+            except missing:
+                actual[name] = "REJECT"
+            else:
+                actual[name] = "ACCEPT"
+        expected = {
+            name: kernel_verdict
+            for name, _body, kernel_verdict, _audit in TestKernelDifferencePin.TABLE
+        }
+        assert actual == expected
