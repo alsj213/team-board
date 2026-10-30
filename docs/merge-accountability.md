@@ -241,6 +241,9 @@ bash scripts/setup-bot-identity.sh engineer /home/liu/project/tb-wt/t_xxxxxxxx
   `错误: 基线不是被审 rev 的祖先：<B> / <R>`。`git log <baseline>..<rev>` 在基线不在
   rev 上游时会退化成空区间，输出「判定（0 条）/ 结论：无问题」并 rc0，与「真的没有
   任何合并」不可区分 —— 那种假绿比红更坏，所以一律报错而不是照样跑。
+  CI 里的可见后果（**预期行为，不是误报**）：PR 分支若从基线之前切出、又没有同步
+  main，`head.sha` 里就没有基线提交 → 方向断言不成立 → `merge-accountability` 红，
+  提示先 rebase/同步 main 再合并。宁可红一次要求补基数，也不给空区间开路。
 - 把基线文件改成新 sha 仍然等于关闸（区间变空）；但因为基线必须来自 base 侧，PR 自己
   推不动它 —— 推基线要单独一张卡、改 main 上的那份文件，且在 `push` 事件里同样受方向
   断言约束（基线到不了 rev 之外）。
