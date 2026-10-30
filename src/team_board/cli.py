@@ -53,6 +53,15 @@
   不存在或不是工作树、``--main-branch`` 为空或该分支不存在、stdin 每行字段数 ≠ 4、
   stdin 为空）
 
+``pr-claim-audit`` 子命令（只读，看「PR 认领唯一性」，R17 的机器闸门）：
+- 0：未结卡里**恰好一张**卡在正文顶格写了 ``PR-CLAIM: #<该 PR>``
+- 1：0 张（``无未结卡认领该 PR``）或 ≥2 张（``重复认领``）
+- 2：参数或环境错误（``prclaim.ClaimAuditError`` / ``db.BoardError`` /
+  ``OSError`` / ``sqlite3.Error`` → stderr 恰一行 ``错误: …``、stdout 空、不冒
+  traceback；含 ``--pr`` 为 0 / 负数 / 13 位毫秒 / 超过 ``prclaim.MAX_PR`` /
+  空串 / 非 ASCII 数字，``--db`` 不存在、不是合法 SQLite、打不开、读 ``tasks``
+  失败、stdout 编码表示不了中文）
+
 ``merge-record`` 子命令（合并**前**那一半）：
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
 - 1：``--check-file`` 预检发现认账问题（每处一行 ``问题: <kind>：<detail>``）
@@ -87,7 +96,17 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
-from . import bodylimit, branches, commands, commits, db, merges, pushguard, web
+from . import (
+    bodylimit,
+    branches,
+    commands,
+    commits,
+    db,
+    merges,
+    prclaim,
+    pushguard,
+    web,
+)
 from .model import DEFAULT_DB
 
 #: serve --bind 只接受的「本机」地址（不给 0.0.0.0 / 空串留口子）
@@ -103,14 +122,11 @@ _LOCAL_BINDS = frozenset({"127.0.0.1", "localhost"})
 #: ASCII 数字（``"١٢٣"`` → 123），比 README 表格的「1–65535 的整数」宽得多。
 _PORT_DIGITS = re.compile(r"[0-9]+", re.ASCII)
 
-#: ``merge-record --pr`` 只接受 ASCII 十进制正整数（同 ``_PORT_DIGITS`` 的理由：
-#: ``int()`` 会静默接受 ``" 15"`` / ``"+15"`` / ``"1_0"`` / 阿拉伯-印度数字）
-_PR_DIGITS = re.compile(r"[1-9][0-9]*", re.ASCII)
-
-#: ``merge-record --pr`` 的上限。GitHub 的 PR 号是仓库内递增计数，9 位（< 2**31）
-#: 已经远超任何真实仓库；13 位毫秒（``1793160000000``）与天文数字
-#: （``99999999999999999999``）都属「填错了字段」，一律 rc2 而不是收下。
-MAX_MERGE_PR = 999_999_999
+#: ``--pr`` 的上限：唯一定义在 :data:`team_board.prclaim.MAX_PR`（PR 号池只有一个
+#: 口径）。GitHub 的 PR 号是仓库内递增计数，9 位（< 2**31）已经远超任何真实仓库；
+#: 13 位毫秒（``1793160000000``）与天文数字（``99999999999999999999``）都属
+#: 「填错了字段」，一律 rc2 而不是收下。
+MAX_MERGE_PR = prclaim.MAX_PR
 
 
 def _parse_date(value: str) -> date:
@@ -168,7 +184,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十一个**子命令。
+    """建 CLI 前端：prog=team-board，共**十二个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -191,6 +207,8 @@ def build_parser() -> argparse.ArgumentParser:
     - ``push-guard``：git pre-push 的判定本体（0 放行 / 1 拦下 / 2 参数或环境
       错误），吃 ``--repo`` / ``--main-branch`` / ``--check-install``；不带
       ``--check-install`` 时从 stdin 读 pre-push 的 ref 行；
+    - ``pr-claim-audit``：稽核 PR 认领唯一性（0 恰好一张卡认领 / 1 无人认领或重复
+      认领 / 2 参数或环境错误），吃 ``--pr``（必填）/ ``--db``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -449,6 +467,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-install",
         action="store_true",
         help="只检查 pre-push 钩子是否已装好（不读 stdin）",
+    )
+
+    claim_cmd = subparsers.add_parser(
+        "pr-claim-audit",
+        help=(
+            "稽核 PR 认领唯一性（0 恰好一张卡认领 / 1 无未结卡认领或重复认领 / "
+            "2 参数或环境错误）"
+        ),
+    )
+    claim_cmd.add_argument(
+        "--pr",
+        required=True,
+        metavar="N",
+        help=(
+            f"PR 号（1-{prclaim.MAX_PR} 的 ASCII 十进制正整数；"
+            "0 / 负数 / 13 位毫秒 / 空串 → rc2）"
+        ),
+    )
+    claim_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
     )
 
     serve = subparsers.add_parser(
@@ -748,21 +789,15 @@ def _detach_stdout() -> None:
 def _parse_merge_pr(value: str) -> int:
     """``merge-record --pr``：ASCII 十进制正整数且不超 ``MAX_MERGE_PR``，否则 rc2。
 
-    只用字符串接收、在这里转 int（argparse 不挂 ``type=int``）：``type=int`` 抛的是
-    ``SystemExit(2)`` + argparse 自己的文案，与其它 rc2 的 ``错误: …`` 不一致，
-    且它拦不住 ``0``、``1_0``（=10）、``+1``、``1793160000000``。
+    取值域与文案的**唯一实现**在 :func:`team_board.prclaim.parse_pr`（``pr-claim-audit``
+    共用同一份，禁止两份判定逻辑）；这里只把它的错误类型折成本子命令既有的
+    ``merges.MergeAuditError`` 口径。
     """
 
-    if not isinstance(value, str) or _PR_DIGITS.fullmatch(value) is None:
-        raise merges.MergeAuditError(
-            f"PR 号非法：{value!r}（应为 1-{MAX_MERGE_PR} 的 ASCII 十进制正整数）"
-        )
-    pr = int(value)
-    if pr > MAX_MERGE_PR:
-        raise merges.MergeAuditError(
-            f"PR 号超出上限 {MAX_MERGE_PR}：{value!r}（13 位毫秒与天文数字都不合法）"
-        )
-    return pr
+    try:
+        return prclaim.parse_pr(value)
+    except prclaim.ClaimAuditError as exc:
+        raise merges.MergeAuditError(str(exc)) from exc
 
 
 def _merge_identity(
@@ -1157,6 +1192,32 @@ def _run_push_guard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_pr_claim_audit(args: argparse.Namespace) -> int:
+    """``pr-claim-audit`` 子命令：读失败/参数错一律 stderr 一行 ``错误: …`` + rc2。
+
+    三个码的分工：0 恰好一张卡认领 / 1 无人认领或重复认领 / 2 参数或环境错误。
+    ``--pr`` 先校验再看库：库不可用时 stdout **一个字节都不写**（报告整块在库读
+    成功之后才拼），所以 rc2 与 rc1 不会混。
+    """
+
+    conn = None
+    try:
+        pr = prclaim.parse_pr(args.pr)
+        conn = db.connect(args.db)
+        rows = db.iter_claim_rows(conn)
+    except (prclaim.ClaimAuditError, db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    report = prclaim.audit(rows, pr)
+    if not _write_stdout(prclaim.render(report) + "\n"):
+        return 2
+    return prclaim.exit_code(report)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1177,6 +1238,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "push-guard":
         return _run_push_guard(args)
+
+    if args.command == "pr-claim-audit":
+        return _run_pr_claim_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)

@@ -112,6 +112,32 @@ def iter_body_rows(
     ]
 
 
+def iter_claim_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    """``(id, status, assignee, body)`` 的未结卡，按 id 升序。
+
+    口径固定为 :data:`_BODY_SCOPE_PENDING`（``status NOT IN ('done','archived')``）：
+    ``pr-claim-audit`` 只看未结卡，已结卡一律不参与认领唯一性判定。
+    ``body`` 为 NULL 时归成空串（没有正文 = 没有认领行），``status`` / ``assignee``
+    的 NULL 同样归成空串，渲染层不必再判空。
+    """
+    # where 来自模块常量（无外部输入，不是注入面）→ bandit B608 假阳性
+    sql = f"SELECT {_BODY_COLUMNS} FROM tasks WHERE {_BODY_SCOPE_PENDING} ORDER BY id"  # nosec B608
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.body 失败: {exc}") from exc
+
+    return [
+        (
+            str(row[0]),
+            "" if row[1] is None else str(row[1]),
+            "" if row[2] is None else str(row[2]),
+            "" if row[3] is None else str(row[3]),
+        )
+        for row in rows
+    ]
+
+
 def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """task_id -> 'changes_requested' 事件数；0 次的不进字典。"""
     sql = (
