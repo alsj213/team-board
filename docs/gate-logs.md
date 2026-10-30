@@ -188,7 +188,7 @@ worktree `/home/liu/project/tb-wt/t_eaa81611`（分支
 | 通过 | `pytest tests/unit/test_gatelog.py -q` | 0 |
 | 通过 | `ruff check src tests` | 0 |
 | 通过 | `mypy src` | 0 |
-| 失败透传 | `pytest` 一个必失败用例 | 1（`counts: passed=1 failed=1`） |
+| 失败透传 | `pytest` 一个必失败用例 | 1（`counts: passed=0 failed=1`） |
 | 透传 2 | `/bin/sh -c 'echo hi; exit 2'` | 2（有摘要、无 stderr） |
 | 被信号杀 | `/bin/sh -c 'kill -9 $$'` | 137（`128 + 9`，摘要里不带负数） |
 | 起不来 | `nosuchcmd_xyz` | 2（stderr 恰一行、无日志） |
