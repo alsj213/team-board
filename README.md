@@ -1018,6 +1018,8 @@ $ echo $?
 [`docs/card-template.md`](docs/card-template.md)，第 7 块的闸门口径见
 [`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
 
+装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（默认 `${HERMES_KANBAN_HOME:-${HERMES_HOME:-$HOME/.hermes}}/templates/card-template.md`，`--dest` 覆盖；`--check` 只比 sha256、rc1 = 漂移或缺目标）。
+
 ## 闸门日志（gate）
 
 检查器（`pytest` / `ruff` / `mypy` / 各 `*-audit`）的输出**整份落盘**，stdout 只回一段
