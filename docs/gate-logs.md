@@ -174,12 +174,15 @@ $ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名
 三段都有用，别省：
 
 - **`cd … || { …; exit 2; }`**：`cd` 失败时用 `;` 接着跑，等于在**错的 cwd** 里跑检查器、日志也写进
-  错的目录，`rc=` 照样是 0 —— 假证据。实测 `cd /nonexistent && echo hi` → rc=2（shell 的，不是
-  检查器的）；`cd /nonexistent; echo hi > evidence/x.log` → **rc=0**（echo 成功，最危险的那种）。
-  `|| { … exit 2; }` 把「目录不对」与「检查器失败」分开：前者固定 2 且先打印错目录。
+  错的目录，`rc=` 照样是 0 —— 假证据。实测 `cd /nonexistent && echo hi` → **shell 的 rc 随 shell 变**：
+  本机 bash 5.1.16 是 **1**、dash（`/bin/sh`，`readlink -f /bin/sh` = `/usr/bin/dash`）是 **2**；
+  `cd /nonexistent; echo hi > evidence/x.log` → **rc=0**（两种 shell 都是，echo 成功，最危险的那种）。
+  `|| { … exit 2; }` 把「目录不对」与「检查器失败」分开：前者固定 2 且先打印错目录（两种 shell 实测都是 2）。
 - **`mkdir -p evidence`**：`evidence/` 不存在时 `> evidence/<名>-<卡号>.log` 的重定向本身失败，
-  shell 返回 2、检查器**根本没跑** —— 这个 2 会被当成检查器「有环境错误」。实测目标目录不存在
-  → rc=2 且无日志；先 `mkdir -p` → rc=0。
+  shell 返回 **1（bash 5.1.16）/ 2（dash）** 而检查器**根本没跑** —— 这个 1 或 2 会被当成检查器的
+  「有失败」或「有环境错误」。判据是**它来自 shell**：stderr 是 shell 自己的
+  `No such file or directory` / `cannot create`，没有 `错误:` 前缀，也没有任何摘要行。
+  实测目标目录不存在 → bash rc=1、dash rc=2，且无日志；先 `mkdir -p` → 两种 shell 都 rc=0。
 - **`env PYTHONPATH=<本卡 worktree>/src` 这个前缀不是装饰**（写绝对路径，理由见前置第 4 条）：
   `.venv` 里 `team-board` 是**已安装**的、指主 checkout，而前置第 1 条又让你
   `export PYTHONPATH=<含 gate 的树>/src`。少了前缀，pytest 跑的是主 checkout 的代码 —— 本卡
