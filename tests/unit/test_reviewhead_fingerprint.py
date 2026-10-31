@@ -31,7 +31,6 @@ from team_board.reviewhead import (
     UnrelatedHistoryError,
     fingerprint,
     fingerprint_of_commit,
-    patch_id_supports_verbatim,
 )
 
 _GIT_ENV = {

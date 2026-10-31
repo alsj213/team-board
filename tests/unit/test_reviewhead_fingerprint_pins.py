@@ -199,7 +199,12 @@ def test_diff_renames_false_keeps_fingerprint(tmp_path: Path) -> None:
     rename_on = raw_patch_id(repo, baseline.merge_base, "topic")
     rename_off = raw_patch_id(repo, baseline.merge_base, "topic", "-U0", "--no-renames")
     assert rename_on != rename_off
-    assert baseline.value == rename_off  # 被测模块取的是钉死后的那一份
+    # 被测模块的指纹是 sha256(内容行)[:40]，不是 patch-id；rename 这一维靠 -c/--no-renames 钉死：
+    # 打开/关闭 diff.renames 后 fingerprint 都必须给出同一值。
+    git(repo, "config", "diff.renames", "true")
+    assert fingerprint(repo, "main", "topic").value == baseline.value
+    git(repo, "config", "diff.renames", "false")
+    assert fingerprint(repo, "main", "topic").value == baseline.value
 
     # 注入 diff.renames=false（仓库内配置，摘不掉）→ 指纹逐字不变
     git(repo, "config", "diff.renames", "false")
@@ -249,7 +254,7 @@ def test_sha256_repo_sha64_agrees_across_both_entries(tmp_path: Path) -> None:
     by_commit = fingerprint_of_commit(repo, base, head)
 
     assert by_branch.kind == by_sha.kind == "patch"
-    assert by_sha.value is not None and len(by_sha.value) == 64
+    assert by_sha.value is not None and len(by_sha.value) == 40  # sha256(内容行) 取前 40 位
     assert PATCH_ID_RE.fullmatch(by_sha.value) is not None, by_sha.value
     assert by_branch.value == by_sha.value  # 分支名与裸 sha 是同一份内容
     assert by_commit is not None

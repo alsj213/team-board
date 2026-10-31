@@ -476,7 +476,10 @@ def unfetchable(head_sha: str, bodies: Sequence[str], *, base: str = "") -> Repo
     ``REVIEW-PATCH``，不是去补双问。
     """
 
-    fp = Fingerprint(kind="unfetchable", value=None, merge_base="", paths=())
+    fp = Fingerprint(
+        kind="unfetchable", value=None, merge_base="", paths=(),
+        algo=FINGERPRINT_ALGO,
+    )
     return _unverifiable_report(fp, bodies, head=head_sha, base=base)
 
 
@@ -653,14 +656,10 @@ FINGERPRINT_ALGO = "diff-sha256-U0-v1"
 #: 空白敏感的那一档标识：``git patch-id --verbatim`` 可用时才启用（见 :func:`patch_id_supports_verbatim`）
 FINGERPRINT_ALGO_VERBATIM = "patch-id-U0-verbatim-v1"
 
-#: ``algo == FINGERPRINT_ALGO`` 时必须随指纹一起带出的盲区说明（报告行原样引用）
-#:
-#: 旧档 patch-id 会把空白规范化掉：**本 PR 已改过的那一行**只改缩进（8 空格 → 12 空格）
-#: 会得到同一个 patch-id。所以「同指纹」只说明非空白内容相同，不许据此复用证据
-#: （本机 git 2.34.1 实测：两个分支只差已改行的缩进，patch-id 同为
-#: ``d8a66f86f17670d741a6c2ad5d0aa8577f31e382``）。
+#: 旧 patch-id 档的盲区说明（只有历史 ``patch-id-U0-v1`` 指纹才需要带出；
+#: ``diff-sha256-U0-v1`` 逐字节哈希内容行，空白/缩进改动都会换值，没有这一档盲区）。
 FINGERPRINT_LEGACY_CAVEAT = (
-    f"algo={FINGERPRINT_ALGO}：同指纹 ≠ 内容相同（空白类改动看不见），"
+    "algo=patch-id-U0-v1：同指纹 ≠ 内容相同（空白类改动看不见），"
     "消费方不得据此复用证据"
 )
 
@@ -695,6 +694,9 @@ DIFF_PREFIX_PIN = ("--src-prefix=a/", "--dst-prefix=b/")
 
 #: 单次 git 调用的硬超时（秒）：一次卡住的 git 不许把整张卡拖到 worker 超时
 GIT_TIMEOUT_SECONDS = 120
+
+#: patch-id 的形态（历史 patch-id 档的解析器仍用它；40 或 64 位小写十六进制）
+PATCH_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
 
 #: 指纹的线格式：40 位小写十六进制（sha256 取前 40 位；与 ``REVIEW-PATCH:`` 的
 #: 40 hex 契约一致，160 bit 足够防碰撞）
@@ -800,9 +802,11 @@ class Fingerprint:
 
     @property
     def caveat(self) -> str:
-        """报告行要带出的盲区说明：旧档给 :data:`FINGERPRINT_LEGACY_CAVEAT`，verbatim 档给空串。"""
+        """报告行要带出的盲区说明：sha256 / verbatim 档给空串，旧 patch-id 档给 legacy 文案。"""
 
-        return "" if self.algo == FINGERPRINT_ALGO_VERBATIM else FINGERPRINT_LEGACY_CAVEAT
+        if self.algo in (FINGERPRINT_ALGO, FINGERPRINT_ALGO_VERBATIM):
+            return ""
+        return FINGERPRINT_LEGACY_CAVEAT
 
 
 def _git_env(*, keep_config_carriers: bool = False) -> dict[str, str]:
@@ -903,6 +907,7 @@ def _run_git(
     repo: str | Path,
     argv: Sequence[str],
     *,
+    input_bytes: bytes | None = None,
     what: str = "",
     keep_config_carriers: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
@@ -921,6 +926,7 @@ def _run_git(
         # 列表传入、shell=False；repo 与 rev 都是调用方给的实参，不经 shell。
         return subprocess.run(  # nosec B603 B607
             cmd,
+            input=input_bytes,
             capture_output=True,
             check=False,
             shell=False,
@@ -1023,31 +1029,80 @@ def _content_digest(diff_bytes: bytes, label: str) -> str:
     return hashlib.sha256(b"\n".join(kept)).hexdigest()[:40]
 
 
+#: 探针结果的进程内缓存（键 = repo 路径）：同一 repo 只探一次
+_VERBATIM_SUPPORT: dict[str, bool] = {}
+
+
+def patch_id_supports_verbatim(repo: str | Path) -> bool:
+    """``git patch-id --verbatim`` 在本机是否可用（保留给历史 patch-id 档的测试）。
+
+    ``diff-sha256-U0-v1`` 已是默认指纹，不再依赖 patch-id；本函数只回答探针问题，
+    供旧档测试与诊断使用。判据仍是探针 rc，不按版本号猜。
+    """
+
+    key = os.fspath(repo)
+    cached = _VERBATIM_SUPPORT.get(key)
+    if cached is None:
+        proc = _run_git(
+            repo,
+            ("patch-id", "--verbatim"),
+            input_bytes=b"",
+            what="git patch-id --verbatim",
+        )
+        cached = proc.returncode == 0
+        _VERBATIM_SUPPORT[key] = cached
+    return cached
+
+
 def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
     """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（``FINGERPRINT_ALGO``）。
 
-    1. ``merge-base`` 取分叉点：rc≠0（无共同祖先 / 未知 rev）→
-       :class:`UnrelatedHistoryError`（内容取不到，不是环境故障）；
-    2. ``diff --numstat -U0``：空输出 → ``kind="empty"``；任一行以
-       ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
-    3. 否则 ``diff -U0`` 的内容行 sha256 前 40 位 → ``kind="patch"``。
+    1. ``merge-base --all`` 取分叉点：rc≠0（无共同祖先 / 未知 rev）→
+       :class:`UnrelatedHistoryError`；候选 ≠1（criss-cross）→ :class:`PatchIdError`；
+    2. ``diff --numstat -U0``（钉 :data:`DIFF_CONFIG_PIN` + ``--no-renames``）：空输出 →
+       ``kind="empty"``；任一行以 ``-\t-\t`` 开头 → ``kind="binary"``（paths 收全）；
+    3. 否则 ``diff -U0`` 的内容行 sha256 前 40 位 → ``kind="patch"``
+       （逐字节，空白/缩进改动都会换值；见 :func:`_content_digest`）。
     """
 
-    mb_label = f"git merge-base {base_ref} {head_rev}"
-    mb_proc = _run_git(repo, ("merge-base", base_ref, head_rev), what=mb_label)
+    base = _check_rev_shape(base_ref, "base_ref")
+    head = _check_rev_shape(head_rev, "head_rev")
+    algo = FINGERPRINT_ALGO
+
+    mb_label = f"git merge-base --all {base} {head}"
+    mb_proc = _run_git(repo, ("merge-base", "--all", base, head), what=mb_label)
     if mb_proc.returncode != 0:
         raise UnrelatedHistoryError(
             f"{mb_label} 失败 rc={mb_proc.returncode}: {_stderr_first(mb_proc)}"
             f"（两条历史没有共同祖先，取不到可比的基线）"
         )
-    merge_base = _stdout_text(mb_proc, "git merge-base").strip()
-    if not merge_base:
-        raise UnrelatedHistoryError(f"{mb_label} 无输出（空 merge base，取不到可比基线）")
+    candidates = [
+        line.strip()
+        for line in _stdout_text(mb_proc, mb_label).splitlines()
+        if line.strip()
+    ]
+    if len(candidates) != 1:
+        raise PatchIdError(
+            f"{mb_label} 得到 {len(candidates)} 个候选 merge base（应为 1 个；"
+            "criss-cross 历史没有唯一分叉点，不猜）"
+        )
+    merge_base = candidates[0]
 
-    numstat_label = "git diff --numstat -U0 --no-color"
+    numstat_label = "git diff --numstat -U0 --no-color --no-renames"
     numstat_raw = _stdout_text(
         _expect_and_get(
-            repo, ("diff", "--numstat", "-U0", "--no-color", merge_base, head_rev), numstat_label
+            repo,
+            (
+                *DIFF_CONFIG_PIN,
+                "diff",
+                "--numstat",
+                "-U0",
+                "--no-color",
+                "--no-renames",
+                merge_base,
+                head,
+            ),
+            numstat_label,
         ),
         numstat_label,
     )
@@ -1063,15 +1118,27 @@ def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
             kind="binary", value=None, merge_base=merge_base, paths=paths, algo=algo
         )
 
-    diff_label = "git diff -U0 --no-color"
+    diff_label = "git diff -U0 --no-color --no-renames"
     diff_bytes = _expect_and_get(
-        repo, ("diff", "-U0", "--no-color", merge_base, head_rev), diff_label
+        repo,
+        (
+            *DIFF_CONFIG_PIN,
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-renames",
+            *DIFF_PREFIX_PIN,
+            merge_base,
+            head,
+        ),
+        diff_label,
     ).stdout
     value = _content_digest(diff_bytes, diff_label)
     if FINGERPRINT_RE.fullmatch(value) is None:  # 不可达：hexdigest 恒为 hex
         raise PatchIdError(f"{diff_label} 算出的指纹形态不对：{value!r}")
-    return Fingerprint(kind="patch", value=value, merge_base=merge_base, paths=paths)
-
+    return Fingerprint(
+        kind="patch", value=value, merge_base=merge_base, paths=paths, algo=algo
+    )
 
 def _has_commit(repo: str | Path, rev: str) -> bool:
     """本地是否已有该 commit 对象（``cat-file -e <rev>^{commit}``，rc≠0 即没有）。"""
