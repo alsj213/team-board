@@ -796,7 +796,9 @@ def audit(
     ``rev`` 解析 → 方向断言（基线必须是 ``rev`` 的祖先，否则 rc2，不让空区间假绿）。
 
     ``only_card`` 只过滤两段的**记录清单**，不吞掉已判出的问题（有问题的合并
-    即使不属于该卡也照样红）。``require=True`` 时：区间内有该卡零问题的
+    即使不属于该卡也照样红）：判据② 的覆盖面是过滤前生成的 ``order[switch:]``
+    全段（切换点之后的别卡非 repo 合并照样报，不许被 ``--card`` 吞成 rc0）。
+    ``require=True`` 时：区间内有该卡零问题的
     ``source="trailer"`` 记录 → 通过；只有历史段命中 → 追加
     ``缺认账字段（历史，基线前）``；两段都没命中 → 追加 ``缺认账字段``。
 
@@ -931,10 +933,10 @@ def audit(
     )
     if switch is not None:
         actor_switch = order[switch].sha
-        enforced = {record.sha for record in order[switch:]}
-        for record in judged:
-            if record.sha in enforced:
-                problems.extend(check_actor(record))
+        # 覆盖面是**完整判定段**（``order`` 在 only_card 过滤之前生成）：``--card``
+        # 只过滤记录清单，不许把别卡的非 repo 合并吞成 rc0（qa run470 的假绿）。
+        for record in order[switch:]:
+            problems.extend(check_actor(record))
 
     if require:
         bad_shas = {problem.sha for problem in problems}

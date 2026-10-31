@@ -1385,10 +1385,44 @@ class TestActorSwitchPoint:
         # 记录只留该卡那条，但分界仍是区间里最早的 repo 合并（第 1 条）
         assert [record.sha for record in report.records] == [shas[2]]
         assert report.actor_switch == shas[0]
-        # 该卡这条在切换点之后 → 判 actor（同时判据① 也照旧）
+        # 该卡这条在切换点之后 → 判 actor（同时判据① 也照旧）；
+        # 判据② 遍历完整判定段，别卡在切换点之后的那条（shas[1]）照样报
         kinds_here = [problem.kind for problem in report.problems]
         assert KIND_ACTOR_NOT_REPO in kinds_here
+        assert [p.sha for p in report.problems if p.kind == KIND_ACTOR_NOT_REPO] == [
+            shas[1],
+            shas[2],
+        ]
+
+    def test_card_filter_does_not_swallow_other_card_actor_problem(
+        self, tmp_path: Path
+    ) -> None:
+        """``--card`` 指向一张干净的 repo 卡：别卡切换点之后的非 repo 合并仍报。
+
+        切换点**之前**的别卡非 repo 合并不报（历史不追溯），且这两条都不进
+        ``report.records`` —— 记录清单照旧只留该卡。
+        """
+
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(
+            repo,
+            [
+                _pr_msg(13, "t_cccc3333", "pm/run3"),
+                _pr_msg(11, "t_aaaa1111", "repo/run1"),
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+            ],
+        )
+        board = make_board(tmp_path / "board.db", {"t_aaaa1111": "repo"})
+
+        report = audit(repo=repo, baseline=baseline, only_card="t_aaaa1111", db_path=board)
+
+        assert report.actor_switch == shas[1]
+        # 记录清单仍只留该卡这条
+        assert [record.sha for record in report.records] == [shas[1]]
+        # 判据②：只看切换点之后的别卡非 repo 合并（shas[2]），shas[0] 不追溯
         assert [p.sha for p in report.problems if p.kind == KIND_ACTOR_NOT_REPO] == [shas[2]]
+        assert [p.kind for p in report.problems] == [KIND_ACTOR_NOT_REPO]
+        assert not report.ok
 
     def test_actor_problem_is_not_swallowed_by_require(self, tmp_path: Path) -> None:
         """非 repo 的合并不算「零问题的认账合并」：``--require`` 不许把它糊成通过。"""

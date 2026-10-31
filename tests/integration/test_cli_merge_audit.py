@@ -1233,3 +1233,50 @@ def test_actor_switch_point_does_not_drift_with_card_filter(
     # 判据① 照旧：该卡 assignee=pm、merged-by=pm/run9 → PASS
     assert "merged-by=pm/run9 → PASS" in out
 
+
+def test_actor_other_card_not_swallowed_by_card_filter(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """``--card`` 指向一张干净的 repo 卡：别卡切换点之后的非 repo 合并仍判红。
+
+    qa run470 的假绿：判据② 只遍历被 ``--card`` 过滤后的记录，别卡的非 repo 合并
+    被吞成 rc0。覆盖面必须是**完整判定段**（切换点之前的不追溯）。
+    """
+
+    base = head(repo)
+    before = merge_in(
+        repo, _message(3, "t_aaaaaaaa", "pm/run3"), branch="zero", name="zero.txt"
+    )
+    switch = merge_in(
+        repo, _message(4, "t_ad5e7ff6", "repo/run1"), branch="one", name="one.txt"
+    )
+    bad = merge_in(
+        repo, _message(5, "t_11112222", "pm/run9"), branch="two", name="two.txt"
+    )
+    board_path = make_board(tmp_path / "board.db", {"t_ad5e7ff6": "repo"})
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            "t_ad5e7ff6",
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 1, (rc, out, err)
+    assert err == ""
+    assert f"合并权切换点（首次 repo 合并）：{switch}" in out
+    # 别卡在切换点之后的那条照样红
+    assert f"{bad[:7]} merged-by 的 profile 不是 repo" in out
+    # 切换点之前的不追溯
+    assert f"{before[:7]} merged-by 的 profile 不是 repo" not in out
+    assert "结论：发现 1 个问题" in out
+    # 记录清单照旧只留该卡（只改判定覆盖面，不改 report.records 的过滤）
+    assert "判定（1 条）" in out
+
