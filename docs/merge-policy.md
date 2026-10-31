@@ -99,7 +99,7 @@ $ gh pr checks <n> -R alsj213/team-board; echo rc=$?
 ③ R3 证据（R6 ②）：见 <卡号> 验收段，每条 PASS 一条本机命令 + 真实退出码
 ④ head 分支（R6 ③）：
 $ gh pr view <n> -R alsj213/team-board --json headRefName
-⑤ 双问结论已贴 PR（缺陷视角 / 回归视角两条 review 记录，写明评论 id 或时间）
+⑤ 双问结论已贴 PR（缺陷视角 / 回归视角两条 review 记录，写明评论 id 或时间）；标记两行写法与判据见 docs/review-patch.md
 ⑥ R7 判档：A / B / C 三档选一名 + 四条素材（CI rc、本地全量测试 rc、`--json files` 路径清单与 nfiles、是否碰 .github/依赖/迁移/凭据）
    B 档另附 R9 夜间五条：CI rc=0 且非 no checks reported / 双问无 P1P2 / nfiles≤10 / 不碰凭据迁移删库且删除≤100 行 / R3 证据齐；夜间自合标 B·night
    C 档（或夜间撞「绝不做」四条）：不合并，标 [night-queue]，写「第 N 条不满足 + 实测输出」
