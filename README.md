@@ -968,8 +968,6 @@ $ PYTHONPATH=src python3 -m team_board.cli gate --gate pytest --card t_eaa81611 
 （零命中时）`末尾行（n/m，≤20）:` / `log:` 几行，格式的唯一实现是
 `team_board.gatelog.render_summary`。
 
-用法、退出码与真实样例见 [`docs/gate-logs.md`](docs/gate-logs.md)。
-
 ## PR 认领唯一性稽核（pr-claim-audit）
 
 一张 PR 只许**一张未结卡**认领，否则两张卡各自发 `gh` 写操作，谁在合就说不清了。
