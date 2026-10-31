@@ -579,8 +579,10 @@ def fingerprint(
     2. ``diff --numstat --no-color --no-renames -U0 mb head``（前面带
        :data:`DIFF_CONFIG_PIN`）：空输出 → ``kind="empty"``；任一行以
        ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
-    3. 否则 ``diff -U0 --no-color --no-renames mb head | patch-id --stable [--verbatim]``
-       的第一列 40 hex → ``kind="patch"``。
+    3. 否则 ``diff -U0 --no-color --no-renames mb head | patch-id <档位旗标>`` 的第一列
+       40 hex → ``kind="patch"``。档位旗标只有两个形态：旧档 ``--stable``、verbatim 档
+       ``--verbatim``（``--verbatim`` 隐含 ``--stable``，两者**不能同时显式给** ——
+       新 git 实测 rc=129 ``options '--verbatim' and '--stable' cannot be used together``）。
 
     算法档由 :func:`patch_id_supports_verbatim` 的探针结果决定（不按版本号猜）：
 
@@ -662,13 +664,26 @@ def fingerprint(
     )
     # ``patchid.verbatim`` 也钉死：老 git 上没有这个键（``-c`` 设置未知键是合法的空操作），
     # 新 git 上它能把默认档悄悄翻成 verbatim，必须压住，否则 algo 与实际算法不一致。
-    pid_label = "git patch-id --stable" + (" --verbatim" if verbatim else "")
-    pid_argv = (
-        "-c",
-        f"patchid.verbatim={'true' if verbatim else 'false'}",
-        "patch-id",
-        "--stable",
-    ) + (("--verbatim",) if verbatim else ())
+    #
+    # ``--stable`` 与 ``--verbatim`` **不能同时显式给**（新 git 实测 rc=129：
+    # ``error: options '--verbatim' and '--stable' cannot be used together``；
+    # ``--verbatim`` 本身已隐含 ``--stable``），所以两档各给一个旗标。
+    if verbatim:
+        pid_label = "git patch-id --verbatim"
+        pid_argv = (
+            "-c",
+            "patchid.verbatim=true",
+            "patch-id",
+            "--verbatim",
+        )
+    else:
+        pid_label = "git patch-id --stable"
+        pid_argv = (
+            "-c",
+            "patchid.verbatim=false",
+            "patch-id",
+            "--stable",
+        )
     pid_proc = _run_git(
         repo, pid_argv, input_bytes=diff_proc.stdout, what=pid_label
     )
