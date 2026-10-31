@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +16,9 @@ import pytest
 from team_board import cli
 
 CARD = "t_eaa81611"
+
+#: 仓库 ``src/`` —— 起真 CLI 子进程时用它拼 ``PYTHONPATH``（不依赖安装态）
+SRC = Path(__file__).resolve().parents[2] / "src"
 
 
 def run(
@@ -93,6 +98,43 @@ def test_rc1_is_transparent_and_log_still_written(
     path = log_of(out)
     assert path.exists()
     assert "FAILED tests/x.py::t" in path.read_text(encoding="utf-8")
+
+
+def test_child_exit_2_is_transparent_like_any_other_rc(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """子命令自己 ``sys.exit(2)``：rc2 透传，但走的是正常路径 —— 日志与摘要照写、stderr 空。
+
+    与 ``test_rc2_when_child_cannot_start`` 的 rc2 区分：那是 (a) gate 自身错误
+    （stderr 恰一行 ``错误: …``、stdout 空、不写日志）；这里是 (b) 子命令的退出码
+    （stdout 有摘要、日志照写、stderr 空）。
+    """
+    log_dir = tmp_path / "g"
+    code, out, err = run(
+        capsys,
+        "gate",
+        "--gate",
+        "pytest",
+        "--card",
+        CARD,
+        "--log-dir",
+        str(log_dir),
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; print('ERROR boom'); sys.exit(2)",
+    )
+
+    assert err == ""
+    assert code == 2
+    lines = out.splitlines()
+    assert lines[0] == "gate: pytest"
+    assert lines[2] == "exit: 2"
+    assert "  ERROR boom" in lines
+
+    path = log_of(out)
+    assert path == log_dir / f"pytest-{CARD}.log"
+    assert path.read_text(encoding="utf-8") == "ERROR boom\n"
 
 
 def test_child_stderr_is_merged_into_the_log(
@@ -382,3 +424,87 @@ def test_unwritable_log_dir_is_rc2_without_stdout(
     assert out == ""
     assert err.startswith("错误: 写日志失败")
     assert err.count("\n") == 1
+
+
+def test_non_utf8_bytes_from_child_are_replaced_not_raised(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """子进程吐 GBK 字节：按 utf-8 + ``errors="replace"`` 解码 —— rc 透传、不冒 traceback。
+
+    解码不随 locale 漂移，所以非 UTF-8 字节只变成替换字符（U+FFFD），
+    日志照写、``exit:`` 照常是子命令自己的 0。
+    """
+
+    script = (
+        "import sys\n"
+        "sys.stdout.buffer.write('中文'.encode('gbk'))\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    code, out, err = run(
+        capsys,
+        "gate",
+        "--gate",
+        "gbk",
+        "--card",
+        CARD,
+        "--log-dir",
+        str(tmp_path),
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    )
+
+    assert err == ""
+    assert code == 0
+    assert "exit: 0" in out.splitlines()
+    assert "Traceback" not in out
+    text = log_of(out).read_text(encoding="utf-8")
+    assert "\ufffd" in text
+    assert "中文" not in text
+
+
+def test_child_reading_stdin_gets_immediate_eof(tmp_path: Path) -> None:
+    """子命令读 stdin：调用方 stdin 一直开着也不能挂 —— 子进程拿 ``DEVNULL``，立刻 EOF。
+
+    这里必须起**真 CLI 子进程**：把管道写端一直开着当它的 stdin，子进程若还继承
+    这份 stdin，读 ``sys.stdin.read()`` 就会阻塞到 ``timeout``（用例失败而不是挂死）。
+    """
+
+    log_dir = tmp_path / "g"
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONIOENCODING"}
+    env["PYTHONPATH"] = str(SRC)
+
+    read_fd, write_fd = os.pipe()  # 写端刻意不关：继承它的读会阻塞
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "team_board.cli",
+                "gate",
+                "--gate",
+                "stdin",
+                "--card",
+                CARD,
+                "--log-dir",
+                str(log_dir),
+                "--",
+                sys.executable,
+                "-c",
+                "import sys; print(len(sys.stdin.read()))",
+            ],
+            stdin=read_fd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "exit: 0" in proc.stdout.splitlines()
+    assert (log_dir / f"stdin-{CARD}.log").read_text(encoding="utf-8") == "0\n"

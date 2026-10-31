@@ -44,11 +44,13 @@
 
 ``gate`` 子命令（包装外部检查器：全量落盘 + stdout 只回摘要）：
 - 0 / 1 / 其他：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``）
-- 2：参数或环境错误（``--gate`` / ``--card`` 形态非法、``--`` 之后没有命令、
-  子进程起不来（``FileNotFoundError`` / ``PermissionError`` /
-  ``NotADirectoryError``）、日志写不进去、stdout 编码表示不了中文 →
-  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback）。子命令自己返回 2 时
-  同样透传为 2（两个语义同码，不冲突）
+- 2 有两个来源：(a) gate 自身参数/环境错误 (b) 子命令自己返回 2
+- (a) 的清单：``--gate`` / ``--card`` 形态非法、``--`` 之后没有命令、子进程起不来
+  （``FileNotFoundError`` / ``PermissionError`` / ``NotADirectoryError``）、日志写不进去、
+  stdout 编码表示不了中文 → stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback
+- (b) 只是透传：子命令返回 2 时走正常路径，日志与摘要照写
+- 子进程 stdin 固定 ``DEVNULL``（不继承调用方 stdin，读 stdin 的检查器立刻 EOF）；
+  输出按 ``utf-8`` + ``errors="replace"`` 解码（不随 locale 漂移，非 UTF-8 字节变替换字符）
 - 全量输出（stdout + stderr 按写入顺序）落 ``<log-dir>/<gate>-<卡号>.log``，
   ``--log-dir`` 默认 ``evidence``（相对 CWD）；子命令没起来时不写日志
 - stdout 只有摘要（``gate:`` / ``card:`` / ``exit:`` / ``counts:`` /
@@ -476,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
         "gate",
         help=(
             "包一层检查器命令：全量输出落 <log-dir>/<gate>-<卡号>.log、stdout 只回摘要"
-            "（rc 透传子命令 / 2 = 参数或环境错误）"
+            "（rc 透传子命令；2 = gate 自身参数/环境错误，或子命令自己返回 2）"
         ),
     )
     gate_cmd.add_argument(
@@ -1241,10 +1243,10 @@ def _run_body_audit(args: argparse.Namespace) -> int:
 def _run_gate(args: argparse.Namespace) -> int:
     """``gate`` 子命令：跑一条外部检查器，全量输出落盘、stdout 只回摘要。
 
-    退出码分工：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``），
-    ``2`` 专门留给「参数或环境错误」—— 形态非法、``--`` 之后没有命令、
-    起不来、日志写不进去、stdout 编码表示不了中文。正因为 2 被工具自己占用，
-    子命令自己返回 2 时本命令也返回 2（透传优先，两者同码不冲突）。
+    退出码分工：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``）；
+    2 有两个来源：(a) gate 自身参数/环境错误 (b) 子命令自己返回 2
+    （(a) 的清单在模块 docstring 的 ``gate`` 节；形态非法、``--`` 之后没有命令、
+    起不来、日志写不进去、stdout 编码表示不了中文都在 (a)，(b) 只是透传，同码不冲突）。
 
     落盘与摘要的**唯一实现**在 :mod:`team_board.gatelog`：这里只负责
     「去掉 REMAINDER 里的 ``--``」「跑子进程」「顺序：先落盘再打印摘要」。
@@ -1271,12 +1273,16 @@ def _run_gate(args: argparse.Namespace) -> int:
 
     try:
         # 被包装的命令就是命令行里 `--` 之后的那些参数（操作员自己给的，不是远端输入）；
-        # 不经 shell、参数按列表传，故按下 B603/B607（与 merge_guard / branches 同一口径）
+        # 不经 shell、参数按列表传，故按下 B603/B607（与 merge_guard / branches 同一口径）。
+        # stdin 固定 DEVNULL：读 stdin 的检查器拿不到调用方的管道/tty，立刻 EOF 而不是挂住；
+        # 解码固定 utf-8 + errors="replace"：不随 locale 漂移（GBK 字节变替换字符、不抛）。
         completed = subprocess.run(  # nosec B603 B607
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
             errors="replace",
         )
     except OSError as exc:

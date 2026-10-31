@@ -962,8 +962,12 @@ $ PYTHONPATH=src python3 -m team_board.cli gate --gate pytest --card t_eaa81611 
 ```
 
 `--` 之后是要执行的命令（`--` 本身不是命令），**退出码原样透传**（被信号杀记
-`128 + (-rc)`）；`2` 专留给参数或环境错误（`--gate` / `--card` 形态非法、`--` 之后没有
-命令、命令起不来、日志写不进去）。全量输出（stdout + stderr 按写入顺序）落
+`128 + (-rc)`）；2 有两个来源：(a) gate 自身参数/环境错误 (b) 子命令自己返回 2
+—— (a) 含 `--gate` / `--card` 形态非法、`--` 之后没有命令、命令起不来、日志写不进去、
+stdout 编码表示不了中文（stderr 恰一行 `错误: …`、stdout 空、不冒 traceback），
+(b) 走正常路径、日志与摘要照写。子进程 stdin 固定 `/dev/null`、输出按 `utf-8` +
+`errors="replace"` 解码（不随 locale 漂移；非 UTF-8 字节显示成替换字符、不冒 traceback）。
+全量输出（stdout + stderr 按写入顺序）落
 `<log-dir>/<gate>-<卡号>.log`，`--log-dir` 默认 `evidence`（相对 CWD，不存在就建）。
 摘要恒为 `gate:` / `card:` / `exit:` / `counts:` / `失败行（n/m，≤20）:` /
 （零命中时）`末尾行（n/m，≤20）:` / `log:` 几行，格式的唯一实现是
