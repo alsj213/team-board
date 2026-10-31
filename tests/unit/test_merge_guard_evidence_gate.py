@@ -287,6 +287,17 @@ def run_main(
     monkeypatch.setattr(
         reviewhead, "fetch_bodies", lambda pr: review_bodies() if bodies is None else bodies
     )
+    # #73 起双问闸门按内容指纹判：本文件只测证据闸门，指纹层用固定值打桩，
+    # 旧 REVIEW-HEAD 标记经 fingerprint_of_commit 也解析成同一个值（LEGACY-OK）。
+    fixed = reviewhead.Fingerprint(
+        kind="patch",
+        value="c" * 40,
+        merge_base="d" * 40,
+        paths=(),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
+    monkeypatch.setattr(reviewhead, "fingerprint", lambda *a, **k: fixed)
+    monkeypatch.setattr(reviewhead, "fingerprint_of_commit", lambda *a, **k: fixed)
     rc = mg.main(cli_argv(tmp_path, db=path, branch=branch, verify_only=verify_only))
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
