@@ -320,7 +320,10 @@ class TestBatchJson:
 
         # 结构：§5 的字段一个不少，逐 unit 带 log
         assert payload["batch_id"] == groups[0].batch_id
-        assert payload["kind"] == "patch"
+        # 两个 unit 同 head → 契约 §3.3 判 kind="head"（不是 "patch"：
+        # "patch" 只给同 tree、不同 head 的 ≥2 个 unit）
+        assert payload["kind"] == "head"
+        assert payload["kind"] == groups[0].kind
         assert payload["key"] == groups[0].key
         assert payload["base"] == repo.base
         assert payload["head_sha"] == repo.first
