@@ -28,7 +28,9 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 `--` 严格说可省，但**一律带上**：首个 token 不像选项时 parser 直接把它当位置参数 —— 实测
 `gate --gate nosep --card t_facc5c45 --log-dir /tmp/gl472 /bin/echo hi` → 摘要齐全、rc0；
 首个 token **像选项**（`-q`、`--foo`）时会被**顶层** parser 吞掉，落的是顶层文案而不是
-`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行 240 字节**，
+`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行**（本卡树 253
+字节；主 checkout @ `21d40b9` 少了 `output-audit` 子命令 → 240 字节 —— 字节数随 usage 那一行的
+子命令列表变，**别拿它当判据**，判据只有「3 行 + 首末行原文」），
 首行 `usage: team-board [-h]`、末行 `team-board: error: unrecognized arguments: -q`、
 stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: error:`」的例外里）。
 
