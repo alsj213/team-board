@@ -3,7 +3,15 @@ from pathlib import Path
 
 import pytest
 
-from team_board.db import BoardError, connect, load_rework_counts, load_tasks
+from team_board import bodylimit
+from team_board.db import (
+    BoardError,
+    connect,
+    iter_body_rows,
+    iter_body_text_rows,
+    load_rework_counts,
+    load_tasks,
+)
 from tests.fixtures.make_board import FIXTURE_NOW, build_board
 
 
@@ -179,3 +187,98 @@ def test_load_tasks_allows_started_at_null_when_created_at_present(
     assert len(tasks) == 1
     assert tasks[0].started_at is None
     assert tasks[0].duration_minutes(now) == 90
+
+
+def _make_body_db(path: Path, rows: list[tuple[object, ...]]) -> Path:
+    """建含 ``body`` 列的最小库（``iter_body_text_rows`` 要读正文原文）。"""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT,"
+            " status TEXT, created_at INTEGER, started_at INTEGER, completed_at INTEGER,"
+            " body TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO tasks (id, title, assignee, status, created_at, body)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _body_db(tmp_path: Path) -> Path:
+    return _make_body_db(
+        tmp_path / "body.db",
+        [
+            ("t_a_running", "a", "engineer", "running", 1_793_400_000, "TEMPLATE: card-template.md#v3"),
+            ("t_b_done", "b", None, "done", 1_793_400_100, "## 完成契约"),
+            ("t_c_archived", "c", "pm", "archived", 1_793_400_200, "正文"),
+            ("t_d_null_body", "d", "qa", "ready", None, None),
+        ],
+    )
+
+
+def test_iter_body_text_rows_returns_created_at_and_raw_body(tmp_path: Path) -> None:
+    conn = connect(_body_db(tmp_path))
+    try:
+        rows = iter_body_text_rows(conn, False)
+    finally:
+        conn.close()
+
+    # 默认只取未结卡（archived / done 都不在），按 id 升序
+    assert rows == [
+        (
+            "t_a_running",
+            "running",
+            "engineer",
+            1_793_400_000,
+            "TEMPLATE: card-template.md#v3",
+        ),
+        ("t_d_null_body", "ready", "qa", None, None),
+    ]
+    # body 是**原文**（不是字节数）：字节口径归 iter_body_rows
+    assert rows[0][4] is not None and bodylimit.body_bytes(rows[0][4]) == len(
+        "TEMPLATE: card-template.md#v3"
+    )
+
+
+def test_iter_body_text_rows_include_done_skips_archived(tmp_path: Path) -> None:
+    conn = connect(_body_db(tmp_path))
+    try:
+        rows = iter_body_text_rows(conn, True)
+    finally:
+        conn.close()
+
+    assert [row[0] for row in rows] == ["t_a_running", "t_b_done", "t_d_null_body"]
+    # status / assignee 的 NULL 归成空串（与 iter_body_rows 同口径）
+    assert rows[1][1:] == ("done", "", 1_793_400_100, "## 完成契约")
+
+
+def test_iter_body_text_rows_is_readonly(tmp_path: Path) -> None:
+    conn = connect(_body_db(tmp_path))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at)"
+                " VALUES ('t_new', 'x', 'pm', 'todo', 1)"
+            )
+    finally:
+        conn.close()
+
+
+def test_iter_body_rows_signature_and_shape_unchanged(tmp_path: Path) -> None:
+    """``iter_body_rows`` 仍是 ``(id, status, assignee, 字节数|None)`` —— 多消费者，不许跟着改。"""
+    conn = connect(_body_db(tmp_path))
+    try:
+        rows = iter_body_rows(conn, include_done=False)
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("t_a_running", "running", "engineer", len("TEMPLATE: card-template.md#v3")),
+        ("t_d_null_body", "ready", "qa", None),
+    ]
+
