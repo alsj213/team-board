@@ -49,6 +49,7 @@ EXPECTED_SUBCOMMANDS = (
     "pr-claim-audit",
     "pr-review-head-audit",
     "evidence",
+    "merge-owner-audit",
     "serve",
 )
 
@@ -66,6 +67,7 @@ CN_DIGITS = {
     14: "十四",
     15: "十五",
     16: "十六",
+    17: "十七",
 }
 
 

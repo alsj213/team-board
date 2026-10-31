@@ -237,6 +237,43 @@ def iter_claim_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]
 _BODY_COLUMNS_CARD = "id, status, assignee, title, body"
 
 
+def load_card_text(
+    conn: sqlite3.Connection, card_id: str
+) -> tuple[str, str, tuple[str, ...]]:
+    """``(status, body, comments)``：一张卡的正文与全部评论正文（评论按 id 升序）。
+
+    ``merge-owner-audit`` 的取数口：判定要「正文或任意评论里出现的 PR 号」，
+    所以评论必须一起取；``comments`` 里 ``task_comments.body`` 为 NULL 的归成空串
+    （没有正文 = 没有 PR 号，渲染层不必再判空），顺序固定 ``ORDER BY id``
+    （渲染与测试共用同一份顺序，不靠 SQLite 的返回顺序碰巧）。
+
+    卡不存在 → :class:`BoardError`（一句话，``卡不存在: <卡号>``）；读 ``tasks`` 或
+    ``task_comments`` 失败同样包装成 :class:`BoardError`（沿用本模块既有的
+    ``读取 … 失败: …`` 文案），由 CLI 渲染成 ``错误: …`` + rc2。
+    """
+    try:
+        row = conn.execute(
+            "SELECT status, body FROM tasks WHERE id = ?", (card_id,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.status/body 失败: {exc}") from exc
+    if row is None:
+        raise BoardError(f"卡不存在: {card_id}")
+
+    try:
+        rows = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (card_id,)
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 task_comments 失败: {exc}") from exc
+
+    return (
+        "" if row[0] is None else str(row[0]),
+        "" if row[1] is None else str(row[1]),
+        tuple("" if item[0] is None else str(item[0]) for item in rows),
+    )
+
+
 def iter_pending_cards(conn: sqlite3.Connection) -> list[tuple[str, str, str, str, str]]:
     """``(id, status, assignee, title, body)`` 的未结卡，按 id 升序。
 

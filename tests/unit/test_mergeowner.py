@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from team_board import mergeowner as mo
@@ -411,3 +413,110 @@ class TestParse:
                 mo.parse_timeout(bad)
         with pytest.raises(MergeOwnerError):
             mo.parse_timeout(20)  # type: ignore[arg-type]
+
+
+class TestSources:
+    """``extract_prs_sources``：抽取不变，另标每个号从正文 / 评论哪儿来（P2，2026-10-31）。"""
+
+    def test_body_only(self) -> None:
+        assert mo.extract_prs_sources("PR #50\nPR #12") == {
+            12: ("正文",),
+            50: ("正文",),
+        }
+
+    def test_comment_only_and_both(self) -> None:
+        assert mo.extract_prs_sources(None, ["PR #77"]) == {77: ("评论",)}
+        assert mo.extract_prs_sources("PR #77", ["PR #77 还开着"]) == {
+            77: ("正文", "评论")
+        }
+
+    def test_keys_ascending_and_non_hits(self) -> None:
+        assert list(mo.extract_prs_sources("PR #53 /pull/9", ["PR #0"])) == [9, 53]
+        assert mo.extract_prs_sources(None) == {}
+        assert mo.extract_prs_sources(None, [None, ""]) == {}
+
+    def test_agrees_with_extract_prs(self) -> None:
+        body, comments = "PR #52 与 /pull/7", ["PR #52", "PR #1234567890"]
+        assert tuple(mo.extract_prs_sources(body, comments)) == mo.extract_prs(body, *comments)
+
+
+class TestUnownedDetail:
+    """``UNOWNED`` 行的来源后缀与补豁免行的提示（判定不变，只多一句）。"""
+
+    def test_body_source_has_no_hint(self) -> None:
+        report = mo.judge(
+            CARD,
+            "running",
+            [77],
+            gh={77: GhResult(status="OPEN")},
+            sources={77: ("正文",)},
+        )
+        assert mo.render(report).splitlines()[1] == "PR #77 UNOWNED 来源: 正文"
+
+    def test_comment_source_hints_exempt_line(self) -> None:
+        report = mo.judge(
+            CARD,
+            "running",
+            [77],
+            gh={77: GhResult(status="OPEN")},
+            sources={77: ("评论",)},
+        )
+        line = mo.render(report).splitlines()[1]
+        assert line.startswith("PR #77 UNOWNED 来源: 评论")
+        assert "需在本卡正文写 PR-MERGE-EXEMPT: #77" in line
+        assert mo.exit_code(report) == 1
+
+    def test_no_sources_keeps_old_line(self) -> None:
+        """老调用方不传 ``sources`` 时行文不变（输入侧兼容，不强制改所有调用点）。"""
+        report = mo.judge(CARD, "running", [77], gh={77: GhResult(status="OPEN")})
+        assert mo.render(report).splitlines()[1] == "PR #77 UNOWNED"
+
+    def test_non_unowned_kinds_have_no_source(self) -> None:
+        report = mo.judge(
+            CARD,
+            "running",
+            [50],
+            gh={50: GhResult(status="MERGED")},
+            sources={50: ("评论",)},
+        )
+        assert mo.render(report).splitlines()[1] == "PR #50 MERGED"
+
+
+class TestFenceAndLogRendering:
+    """围栏不配对与降级日志没写成：两处都只改结论行，不加行、不改 rc。"""
+
+    def test_fence_note_only_on_conclusion_line(self) -> None:
+        report = mo.judge(
+            CARD,
+            "running",
+            [12],
+            gh={12: GhResult(status="OPEN")},
+            sources={12: ("正文",)},
+            fence_unbalanced=True,
+        )
+        lines = mo.render(report).splitlines()
+        assert "围栏不配对，豁免未生效" in lines[-1]
+        assert lines[-1].startswith("结论: 1 个 PR / 通过 0 / 无归属 1 → ")
+        assert len(lines) == 3  # 结论行不加行：1 头 + 1 判定 + 1 结论
+        assert mo.exit_code(report) == 1
+
+    def test_no_fence_note_when_balanced(self) -> None:
+        report = mo.judge(CARD, "running", [50], gh={50: GhResult(status="MERGED")})
+        assert "围栏不配对" not in mo.render(report)
+
+    def test_degraded_logged_says_logged(self) -> None:
+        report = mo.judge(CARD, "running", [55], gh={55: GhResult(error="gh rc=1")})
+        assert mo.render(report).splitlines()[-1] == (
+            "结论: gh 不可用（gh rc=1）→ 降级放行（日志已写），晨报须列"
+        )
+
+    def test_degraded_unlogged_does_not_claim_logged(self) -> None:
+        judged = mo.judge(CARD, "running", [55], gh={55: GhResult(error="gh rc=1")})
+        # 同一份判定、只把「日志没写成」这一位翻过去（CLI 层就是这么做的）
+        report = dataclasses.replace(judged, log_written=False)
+        rendered = mo.render(report).splitlines()[-1]
+        assert "（日志已写）" not in rendered
+        assert rendered == (
+            "结论: gh 不可用（gh rc=1）→ 降级放行（日志写入失败，见 stderr），晨报须列"
+        )
+        assert mo.exit_code(report) == 0
