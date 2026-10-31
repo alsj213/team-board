@@ -38,7 +38,7 @@ from team_board import cli, merges
 from team_board import merge_guard as mg
 
 CARD = "t_ad5e7ff6"
-BY = "pm/run137"
+BY = "repo/run137"
 PR = "15"
 #: 该 PR 的 head 分支（生成模式必填；形态取 ``wt/t_<卡号>``）
 BRANCH = "wt/t_bbeab29f"
@@ -1089,9 +1089,11 @@ def _fill_doc_placeholders(args: list[str], tmp_path: Path) -> list[str]:
 
     body = str(tmp_path / "doc-body.txt")
     mapping = (
-        ("pm/runNNN", "pm/run1"),
-        ("pm/run<NNN>", "pm/run1"),
-        ("<profile>/run<NNN>", "pm/run1"),
+        ("repo/runNNN", "repo/run1"),
+        ("repo/run<NNN>", "repo/run1"),
+        ("pm/runNNN", "repo/run1"),
+        ("pm/run<NNN>", "repo/run1"),
+        ("<profile>/run<NNN>", "repo/run1"),
         ("t_xxxxxxx", _CARD_TOKEN),
         ("t_xxx", _CARD_TOKEN),
         ("<卡号>", _CARD_TOKEN),
