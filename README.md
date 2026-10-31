@@ -1020,7 +1020,7 @@ $ echo $?
 `${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`（`~/.hermes` 实为
 `get_default_hermes_root()`，另受 `HERMES_HOME` 影响；**不是** `~/.hermes/kanban/…`）。
 #65 脚本未设 `HERMES_KANBAN_HOME` 时的默认 dest 仍差一层 `kanban`，怎么收口归 `t_7e847105` 的 pm 裁定，
-落地前显式传 `--dest`。合并顺序 **#63 → #65 → #62**。
+落地前显式传 `--dest`。`#63` / `#65` 已合；本 PR `#62` 合入后即可执行。
 
 实现卡的 `## 验收标准` 段与 `QA-SPEC: qa` 签署闸门见 [`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
 

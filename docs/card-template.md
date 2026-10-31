@@ -7,7 +7,7 @@
 > ① **PR #63**（`wt/t_7c17f775`）：`src/team_board/cardtemplate.py`（`TARGET_BYTES` / `WARN_BYTES` /
 >    `FIXED_HEADING_RE` / `scan` / 切点 `FIXED_SECTION_EPOCH`）；
 > ② **PR #65**（`wt/t_eb47566b`）：`scripts/install-card-template.sh`。
-> **合并顺序固定：`#63 → #65 → #62`。** 三者合一前 `main` 上没有这两个可执行物，下文凡引用
+> **`#63` 与 `#65` 已合入；本 PR `#62` 合入后**下文引用的可执行物才全部就位，凡引用
 > 它们都按「合入后生效」读；今天照做是 `No such file`（rc=127）。
 
 ## 一、引用行（新卡正文第一行）
@@ -144,5 +144,5 @@ $ wc -c < /tmp/sample-v3.md
   （与内核差一层 `kanban`；已设 `HERMES_KANBAN_HOME` 时两边一致）。**怎么收口归 `t_7e847105` 的 pm 裁定**
   （改脚本默认 / 改内核 fallback 二选一），本文件只锁「装就装到内核 `_card_template_path()` 读的那一份」；
   裁定落地前一律显式传 `--dest "${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md"`。
-- 合并顺序：**#63 → #65 → #62**（本文件引用的两张未合 PR 合入后，上面这条才可执行）。
+- 依赖：**`#63` / `#65` 已合**；本 PR `#62` 合入后，上面这条即可执行。
 - 2048 上限的条文、实测与边界：[`docs/card-limit.md`](card-limit.md)；建卡闸门与 `body-audit`：README「卡正文上限」节。
