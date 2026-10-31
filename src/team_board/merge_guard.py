@@ -45,6 +45,7 @@ head 变了 gh 直接拒，本工具拿不到 rc0。老版本 gh 报 ``unknown f
 
 ```
 # ① 取远端真身：一次 fetch 两个 refspec（base 用预检读到的 baseRefName，不是写死的 main）
+#    这一份取数由 ensure_pr_refs 提供，双问绑定闸门与 rebase 闸门各调一次（两次 fetch）
 git -C <repo> fetch --no-tags --no-recurse-submodules --quiet <remote> \
     '+refs/heads/<base>:refs/merge-guard/<pr>/base' \
     '+refs/heads/<branch>:refs/merge-guard/<pr>/head'
@@ -89,13 +90,19 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
    正则、不另写一份 —— 与 ``team-board pr-claim-audit`` 共用同一份实现。三种拒绝文案
    一眼可分：``无未结卡认领该 PR`` / ``重复认领`` / ``认领卡 ≠ --card``。这一步一次 gh
    都不调（只读本地库）。
-2. **双问绑定 head sha**（R18④）：用 ``--pr`` 与预检读到的 ``headRefOid`` 调
-   :func:`team_board.reviewhead.fetch_bodies` / ``analyze``，要求该 sha 上 ``defect`` +
-   ``regression`` 各 ≥1 条结构化标记（``REVIEW-HEAD`` / ``REVIEW-KIND``）。只发两条
-   ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，``--paginate``），
-   取数失败 / 证据不齐一律 rc2。三种拒绝文案：``双问缺证``（一条标记都没有） /
-   ``双问陈旧``（有标记但都不是当前 head，即 head 变了没重跑双问） / ``双问缺类``
-   （当前 head 上缺某一类）。
+2. **双问绑定内容指纹**（R18④）：先与 rebase 闸门共用一次 :func:`ensure_pr_refs`
+   （``git fetch`` 到 ``refs/merge-guard/<pr>/{base,head}``）、核对该 head ref 逐字等于预检
+   读到的 ``headRefOid``，再用 :func:`team_board.reviewhead.fingerprint` 算这一轮的内容指纹
+   （``git diff -U0 <mb> <head> | git patch-id --stable``），最后用
+   :func:`team_board.reviewhead.fetch_bodies` / ``analyze`` 要求该指纹上 ``defect`` +
+   ``regression`` 各 ≥1 条结构化标记（``REVIEW-PATCH`` / ``REVIEW-KIND``；旧 ``REVIEW-HEAD``
+   按内容复用）。只发两条 ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，
+   ``--paginate``），取数失败 / 指纹算不出 / 证据不齐一律 rc2。四种拒绝文案：``双问缺证``
+   （一条标记都没有） / ``双问陈旧``（有标记但都不在当前内容指纹上，即内容变了没重跑双问）
+   / ``双问缺类``（当前指纹上缺某一类） / ``双问不可复用``（分支含二进制文件或相对 base
+   无差异 —— 这两种内容算不出可比指纹，不许当 PASS）。
+   为什么绑内容不绑 sha：纯 rebase 改父提交不改内容，绑 sha 会让每次 rebase 都要重跑双问；
+   真改内容（换文件 / 改行）仍然换指纹 → 仍然拒绝。
    取数前还有一道**仓库核对**：``reviewhead`` 的 ``gh api`` 路径前缀写死
    ``REPO = alsj213/team-board``、不看 ``--repo``，所以先用
    ``git config --get remote.<name>.url`` 解析 ``--repo`` 的 ``owner/name``，与 ``REPO`` 不一致
@@ -1445,14 +1452,83 @@ def claim_gate(opts: Options, info: Preflight) -> str:
     )
 
 
+def ensure_pr_refs(opts: Options, base: str) -> None:
+    """一次 ``git fetch`` 把远端 ``base`` 与 ``--branch`` 抓进私有 ref（两道闸门共用）。
+
+    这是双问绑定闸门（:func:`review_head_gate`）与 rebase 闸门（:func:`rebase_gate`）
+    **共用的一份取数**：两次 fetch 是刻意接受的代价（每道闸门都判「这一轮看到的远端」），
+    换的是 STEP_ORDER 与闸门顺序（认领 → 双问 → rebase）一个字节不动 —— 两条闸门各自
+    都在自己的位置上、用自己的判据去读同一组私有 ref，谁也不依赖谁先跑过。
+
+    argv 由 :func:`rebase_fetch_argv` 给出（``+refs/heads/<x>:refs/merge-guard/<pr>/…``，
+    ``+`` 强制覆盖上一轮的 ref），一个字都不在这里重拼。``base`` 形态非法
+    （空串 / 含空白 / 带 ``refs/`` 前缀）在 fetch 之前就拦（:func:`check_base_ref_shape`）。
+
+    失败文案与接线前**逐字相同**（``取远端提交失败（git fetch rc=…）``）：rebase 闸门的
+    文案不改，双问闸门复用同一句 —— 两处报的是同一件事（抓不到远端真身）。
+    """
+
+    # 畸形 baseRefName 在 fetch 之前拦：这里不发任何 git 调用
+    # （此前已跑过一次 ls-remote 存在性探针，那是合并前的源分支存在闸门）
+    check_base_ref_shape(base)
+    base_text = base if opts.remote == "origin" else f"{opts.remote}/{base}"
+
+    fetch = _run(
+        rebase_fetch_argv(opts.repo, opts.remote, opts.pr, base, opts.branch),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    if fetch.returncode != 0:
+        raise MergeGuardError(
+            f"取远端提交失败（git fetch rc={fetch.returncode}）：{key_line(fetch)}；"
+            f"无法判定 head 是否已 rebase 到 {base_text}，拒绝合并"
+        )
+
+
+def _remote_head_sha(opts: Options) -> str:
+    """读 ``refs/merge-guard/<pr>/head``（抓下来的远端 head）；读不到返回关键输出行。
+
+    rev-parse 失败时拿不到 sha：把它的关键输出填进「远端 head 提交」这一格，于是调用方
+    仍然落同一条「不一致」文案（比编一个新退出码路径好判）。
+    """
+
+    rev = _run(
+        rebase_rev_parse_argv(opts.repo, rebase_head_ref(opts.pr)),
+        cwd=opts.repo,
+        timeout=opts.command_timeout,
+    )
+    return rev.stdout.strip() if rev.returncode == 0 else key_line(rev)
+
+
 def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
-    """**合并前双问绑定闸门**（R18④）：该 head sha 上 defect + regression 各 ≥1 条。
+    """**合并前双问绑定闸门**（R18④）：当前**内容指纹**上 defect + regression 各 ≥1 条。
+
+    为什么绑内容而不是绑 head sha：纯 rebase（内容一个字节没改、只是换了个父提交）会把
+    head sha 换掉，于是按 sha 绑的双问每次 rebase 都要重跑一遍 —— 判的不再是「这段改动
+    被双问过没有」，而是「这条 sha 被双问过没有」。改绑 :func:`reviewhead.fingerprint`
+    （``git diff -U0 <mb> <head> | git patch-id --stable``）之后，纯 rebase 复用同一份
+    双问证据，真改内容（换文件 / 改行）仍然换指纹 → 仍然拒绝。
+
+    取数顺序固定（拒绝时 stdout 0 字节、零 gh 写操作）：
+
+    1. :func:`ensure_pr_refs` —— 与 rebase 闸门共用的那次 fetch（``refs/merge-guard/<pr>/{base,head}``）；
+    2. :func:`rebase_rev_parse_argv` —— ``refs/merge-guard/<pr>/head`` 必须**逐字等于**预检
+       读到的 ``headRefOid``（预检之后分支被推送时判的必须是预检看到的那条 sha；否则就是
+       「判 A 合 B」）；
+    3. :func:`reviewhead.fingerprint` —— 算这一轮远端的内容指纹（算不出来一律 rc2，**不许**
+       被读成「双问没做」）；
+    4. :func:`reviewhead.analyze` —— 纯判定，``repo`` / ``base`` 给全（旧 ``REVIEW-HEAD``
+       标记按内容复用，见 :mod:`team_board.reviewhead`）。
 
     取数与判定全调 :mod:`team_board.reviewhead`（``pr-review-head-audit`` 子命令的同一份
-    实现）：``fetch_bodies(pr)`` 只发两条 ``gh api GET``（``--paginate``，只看 body），
-    ``analyze(head_oid, bodies)`` 是纯函数。取数失败（gh 不在 PATH / 非 0 / 超时 / 输出
-    不是 JSON）一律 rc2 —— 「读不到评审」不许被读成「双问没做」（那是 rc1 语义，本工具
-    只有 rc2 这一档拒绝）。
+    实现）：``fetch_bodies(pr)`` 只发两条 ``gh api GET``（``--paginate``，只看 body）。
+
+    四种拒绝文案一眼可分：
+
+    - 一条结构化标记都没有 → ``双问缺证``；
+    - 有标记但都不在当前内容指纹上 → ``双问陈旧``（内容变了没重跑双问）；
+    - 当前内容指纹上缺某一类 → ``双问缺类``（附缺的类）；
+    - 指纹本身不可复用 → ``双问不可复用``（二进制 patch-id 盲 / 分支相对 base 无差异）。
 
     ``repo_slug`` 由调用方在**预检 gh 调用之前**算好（:func:`remote_repo_slug`，即
     ``--repo`` 的 ``git config --get remote.<name>.url`` 解析出的 ``owner/name``）：
@@ -1463,12 +1539,6 @@ def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
     ``reviewhead.REPO`` 对齐，不一致（或 URL 解析不出 GitHub 形态）就 rc2 拒绝。
     同一个 slug 也正是调用方钉进 ``gh pr view -R`` / ``gh pr merge -R`` 的那个值：
     「核对的是 A、操作的是 B」不许成立。
-
-    三种拒绝文案一眼可分：
-
-    - 一条结构化标记都没有 → ``双问缺证``；
-    - 有标记但都不在当前 head 上 → ``双问陈旧``（head 变了没重跑双问）；
-    - 当前 head 上缺某一类 → ``双问缺类``（附缺的类）。
     """
 
     if repo_slug != reviewhead.REPO.lower():
@@ -1479,14 +1549,47 @@ def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
         )
     head = info.head_oid
     short = head[:12]
+    base = info.base_ref
+    base_ref = rebase_base_ref(opts.pr)
+    head_ref = rebase_head_ref(opts.pr)
+    # ① 取远端真身（与 rebase 闸门共用同一份 fetch）
+    ensure_pr_refs(opts, base)
+    # ② 交叉核对：抓下来的 head 必须就是预检看到的那条 sha
+    remote_head = _remote_head_sha(opts)
+    if remote_head != info.head_oid:
+        raise MergeGuardError(
+            f"远端 head 提交 {remote_head} 与 gh pr view 的 headRefOid "
+            f"{info.head_oid} 不一致：预检之后分支被推送，拒绝合并"
+        )
+    # ③ 这一轮远端的内容指纹（算不出来 = rc2，不许降级成「双问缺证」）
+    try:
+        current = reviewhead.fingerprint(opts.repo, base_ref, head_ref)
+    except reviewhead.PatchIdError as exc:
+        raise MergeGuardError(
+            f"算不出 PR #{opts.pr} 的内容指纹（{base_ref}..{head_ref}）：{exc}；"
+            "无法判定双问绑在哪份内容上，拒绝合并"
+        ) from exc
+    # ④ 指纹不可复用：二进制（patch-id 对内容盲）/ 空 diff（没有可比内容）
+    if current.kind == "binary":
+        raise MergeGuardError(
+            "双问不可复用：分支含二进制文件 "
+            f"{','.join(current.paths)}（patch-id 对二进制内容盲，换文件也换不了指纹）；拒绝合并"
+        )
+    if current.kind == "empty":
+        base_text = base if opts.remote == "origin" else f"{opts.remote}/{base}"
+        raise MergeGuardError(
+            f"双问不可复用：分支相对 {base_text} 无差异（空 diff 没有可比内容）；拒绝合并"
+        )
     try:
         bodies = reviewhead.fetch_bodies(opts.pr)
     except reviewhead.ReviewHeadError as exc:
         raise MergeGuardError(
-            f"取 PR #{opts.pr} 的评审正文失败，无法判定双问是否绑定 head {short}："
-            f"{exc}；拒绝合并"
+            f"取 PR #{opts.pr} 的评审正文失败，无法判定双问是否绑定内容指纹 "
+            f"{(current.value or '')[:12]}（head {short}）：{exc}；拒绝合并"
         ) from exc
-    report = reviewhead.analyze(head, bodies)
+    report = reviewhead.analyze(
+        current, bodies, repo=opts.repo, base=base_ref, remote=opts.remote
+    )
     if not report.ok:
         if not report.marks:
             raise MergeGuardError(
@@ -1494,14 +1597,15 @@ def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
                 "没有任何 REVIEW-HEAD / REVIEW-KIND 标记"
                 f"（{reviewhead.CONCLUSION_NO_MARK}）；拒绝合并"
             )
-        if not report.kinds_on_head:
+        if not report.kinds_on_patch:
             raise MergeGuardError(
                 f"双问陈旧：PR #{opts.pr} 有 {len(report.marks)} 条结构化标记，"
-                f"但都不是当前 head {short}（head 变了要重跑双问）；拒绝合并"
+                f"但都不是当前 head {short}（内容指纹 {(current.value or '')[:12]}，"
+                "内容变了要重跑双问）；拒绝合并"
             )
         raise MergeGuardError(
             "双问缺类："
-            f"{reviewhead.CONCLUSION_MISSING.format(short=short, missing=','.join(report.missing))}"
+            f"{reviewhead.CONCLUSION_MISSING.format(short=(current.value or '')[:12], missing=','.join(report.missing))}"
             "；拒绝合并"
         )
     return format_step(
@@ -1513,8 +1617,9 @@ def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
         ),
         rc=0,
         key=(
-            f"head {short} 上 defect + regression 各 >=1 条"
-            f"（扫描正文 {report.bodies_scanned} 条、带标记 {len(report.marks)} 条）"
+            f"内容指纹 {(current.value or '')[:12]} 上 defect + regression 各 >=1 条"
+            f"（head {short}，扫描正文 {report.bodies_scanned} 条、"
+            f"带标记 {len(report.marks)} 条）"
         ),
     )
 
@@ -1826,9 +1931,11 @@ def rebase_gate(opts: Options, info: Preflight) -> str:
     判据是三条命令，顺序固定（全部在 ``gh pr merge`` 之前跑，拒绝时一个 ``gh`` 写操作
     都不发、stdout 保持 0 字节）：
 
-    1. :func:`rebase_fetch_argv` —— 一次 ``git fetch`` 把远端 ``base`` 与 ``branch``
-       抓进私有 ref ``refs/merge-guard/<pr>/{base,head}``；base 取 ``gh pr view`` 读到
-       的 ``baseRefName``（不写死 ``main``），``+`` 强制覆盖上一轮的 ref；
+    1. :func:`ensure_pr_refs` —— 与双问绑定闸门**共用**的那一次 ``git fetch``：把远端
+       ``base`` 与 ``branch`` 抓进私有 ref ``refs/merge-guard/<pr>/{base,head}``；base 取
+       ``gh pr view`` 读到的 ``baseRefName``（不写死 ``main``），``+`` 强制覆盖上一轮的 ref；
+       两处共用同一份 argv（:func:`rebase_fetch_argv`），各调一次 —— 两次 fetch 换
+       STEP_ORDER 与闸门顺序不动的代价；
     2. :func:`rebase_rev_parse_argv` —— 读 ``refs/merge-guard/<pr>/head``，必须**逐字
        等于**预检读到的 ``headRefOid``（预检到合并之间分支被推送时，判的就该是预检看到
        的那条 sha，与 ``--match-head-commit`` 同一个理由）；
@@ -1851,21 +1958,10 @@ def rebase_gate(opts: Options, info: Preflight) -> str:
     """
 
     base = info.base_ref
-    # 畸形 baseRefName 在 fetch 之前拦：闸门自身不发任何 git 调用
+    # 共用取数（与双问绑定闸门同一份 fetch）：畸形 baseRefName 在 fetch 之前就被拦
     # （此前已跑过一次 ls-remote 存在性探针，那是合并前的源分支存在闸门）
-    check_base_ref_shape(base)
+    ensure_pr_refs(opts, base)
     base_text = base if opts.remote == "origin" else f"{opts.remote}/{base}"
-
-    fetch = _run(
-        rebase_fetch_argv(opts.repo, opts.remote, opts.pr, base, opts.branch),
-        cwd=opts.repo,
-        timeout=opts.command_timeout,
-    )
-    if fetch.returncode != 0:
-        raise MergeGuardError(
-            f"取远端提交失败（git fetch rc={fetch.returncode}）：{key_line(fetch)}；"
-            f"无法判定 head 是否已 rebase 到 {base_text}，拒绝合并"
-        )
 
     head_ref = rebase_head_ref(opts.pr)
     rev = _run(
@@ -2078,7 +2174,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         )
     # 合并**前**的两道证据闸门（顺序固定，见模块 docstring）：
     #   ① 认领唯一性（R17⑤）——只读看板库，一次 gh 都不调；
-    #   ② 双问绑定 head sha（R18④）——只发两条 gh api GET。
+    #   ② 双问绑定内容指纹（R18④）——共用一次 fetch + 两条 gh api GET，判据是内容指纹。
     # 两者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
     claim_line = claim_gate(opts, info)
     review_line = review_head_gate(opts, info, repo_slug)

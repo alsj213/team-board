@@ -108,12 +108,16 @@ def claim_line(stub: Stub) -> str:
 
 
 def review_line(stub: Stub) -> str:
-    """双问绑定闸门通过时的那一行证据（默认 fixture：两个端点各一条标记）。"""
+    """双问绑定闸门通过时的那一行证据（默认 fixture：两个端点各一条标记）。
+
+    key 的格式由 E4 定死：``内容指纹 <pid12> 上 defect + regression 各 >=1 条（head <sha12>，
+    扫描正文 N 条、带标记 M 条）`` —— 绑定对象是内容指纹，head 只是附注。
+    """
 
     return (
         f"双问绑定 | PASS | {API_CALLS[0]} + {API_CALLS[1]} | rc=0 | "
-        f"head {HEAD_OID[:12]} 上 defect + regression 各 >=1 条"
-        "（扫描正文 2 条、带标记 2 条）"
+        f"内容指纹 {stub.pid[:12]} 上 defect + regression 各 >=1 条"
+        f"（head {HEAD_OID[:12]}，扫描正文 2 条、带标记 2 条）"
     )
 
 
@@ -153,7 +157,7 @@ GIT_STUB = """#!/bin/sh
 printf 'git %s\\n' "$*" >> "$FAKE_LOG"
 for arg in "$@"; do
   case "$arg" in
-    ls-remote|fetch|rev-parse|merge-base|config) sub="$arg"; break ;;
+    ls-remote|fetch|rev-parse|merge-base|config|diff|patch-id|cat-file) sub="$arg"; break ;;
   esac
 done
 case "$sub" in
@@ -188,8 +192,20 @@ case "$sub" in
     exit "$rc"
     ;;
   merge-base)
-    if [ -n "$FAKE_MERGE_BASE_ERR" ]; then printf '%s\\n' "$FAKE_MERGE_BASE_ERR" >&2; fi
-    exit "${FAKE_MERGE_BASE_RC:-0}"
+    # 两种用法分开：``--is-ancestor`` = rebase 闸门的判定（rc 可注入）；
+    # 其余 = 内容指纹的 merge-base，落到真 git 库上算（假脚本不伪造 patch-id）
+    case " $* " in
+      *" --is-ancestor "*)
+        if [ -n "$FAKE_MERGE_BASE_ERR" ]; then printf '%s\\n' "$FAKE_MERGE_BASE_ERR" >&2; fi
+        exit "${FAKE_MERGE_BASE_RC:-0}"
+        ;;
+    esac
+    exec "$FAKE_REAL_GIT" "$@"
+    ;;
+  diff|patch-id|cat-file)
+    # 内容指纹（``reviewhead.fingerprint``）只跑这三类命令：一律交给真 git，
+    # 作用在 fixture 造的真仓库上 —— 指纹值必须是真 patch-id，不许 stub 伪造
+    exec "$FAKE_REAL_GIT" "$@"
     ;;
   config)
     # 双问绑定闸门的仓库核对：``git config --get remote.<name>.url`` → 假 remote URL
@@ -208,6 +224,91 @@ esac
 def _write_exe(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
+
+
+#: 真 git 的绝对路径（假脚本里要代理内容指纹的三类命令，不能被 PATH 里的假 git 抢走）
+REAL_GIT = shutil.which("git") or "git"
+
+#: 内容指纹用的私有 ref（命名与 :func:`mg.rebase_base_ref` / :func:`mg.rebase_head_ref` 一致）
+MG_BASE_REF = mg.rebase_base_ref(9)
+MG_HEAD_REF = mg.rebase_head_ref(9)
+
+
+def _set_ref(repo: Path, ref: str, sha: str) -> None:
+    """把 ``ref`` 指到 ``sha``（fixture 预置 = 闸门那次 fetch 会写下的东西）。"""
+
+    subprocess.run([REAL_GIT, "-C", str(repo), "update-ref", ref, sha], check=True)
+
+
+def _commit(repo: Path, files: dict[str, bytes], message: str) -> str:
+    """在真仓库里提交一次改动（``files`` 是 路径 → 字节），返回新提交 sha。"""
+
+    for name, data in files.items():
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    subprocess.run([REAL_GIT, "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            REAL_GIT,
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@local",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--no-verify",
+            "-m",
+            message,
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        [REAL_GIT, "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _init_content_repo(repo: Path) -> tuple[str, str]:
+    """把 ``--repo`` 目录造成**真 git 库**，并预置两条私有 ref。
+
+    ``refs/merge-guard/9/{base,head}`` 就是 :func:`mg.ensure_pr_refs` 那次 ``git fetch``
+    会写下的两条 ref（fetch 本身仍是假脚本）：base = 基线提交，head = 卡分支上的改动提交。
+    内容指纹的三类命令（``merge-base`` / ``diff`` / ``patch-id`` / ``cat-file``）由假脚本
+    **代理给真 git**，于是指纹值是真 patch-id —— 桩不伪造哈希。
+    """
+
+    subprocess.run([REAL_GIT, "init", "-q", "-b", "main", str(repo)], check=True)
+    base_sha = _commit(repo, {"base.txt": b"base\n"}, "base")
+    head_sha = _commit(repo, {"feature.txt": b"feature\n"}, "feat: content")
+    _set_ref(repo, MG_BASE_REF, base_sha)
+    _set_ref(repo, MG_HEAD_REF, head_sha)
+    return base_sha, head_sha
+
+
+def _replay_on(repo: Path, parent: str, files: dict[str, bytes], message: str) -> str:
+    """把 ``files`` 那份改动**重放到** ``parent`` 上（父提交换了、内容不变）= 纯 rebase 形态。
+
+    真实 rebase 的语义就是这个：分支提交被重放，树的差异不变、提交 sha 变了。
+    """
+
+    subprocess.run(
+        [REAL_GIT, "-C", str(repo), "checkout", "-q", "-B", "rebase-probe", parent],
+        check=True,
+    )
+    return _commit(repo, files, message)
+
+
+def patch_body(pid: str, kind: str) -> str:
+    """一条绑定**内容指纹**的双问标记（``REVIEW-PATCH`` + ``REVIEW-KIND``，顶格）。"""
+
+    return f"REVIEW-PATCH: {pid}\nREVIEW-KIND: {kind}\n"
 
 
 def make_board_db(path: Path, cards: list[tuple[str, str, str]]) -> Path:
@@ -233,7 +334,7 @@ def make_board_db(path: Path, cards: list[tuple[str, str, str]]) -> Path:
 
 @dataclass
 class Stub:
-    """一次性环境：假 gh / 假 git + 调用日志 + 空仓库目录 + 认领闸门用的看板库。"""
+    """一次性环境：假 gh / 假 git + 调用日志 + 真 git 仓库 + 认领闸门用的看板库。"""
 
     bindir: Path
     log: Path
@@ -243,6 +344,12 @@ class Stub:
     #: 认领唯一性闸门读的看板库（各用例按需换成本地 fixture；缺省用真库——手搭 argv 的
     #: 用例可以显式给 ``--db``，也可以换掉这个字段）
     board_db: Path = Path(mg.DEFAULT_DB)
+    #: 真仓库里 ``refs/merge-guard/9/base`` 指向的基线提交（= 闸门那次 fetch 的结果）
+    base_sha: str = ""
+    #: 真仓库里 ``refs/merge-guard/9/head`` 指向的改动提交
+    head_sha: str = ""
+    #: 两条 ref 之间的内容指纹（``reviewhead.fingerprint`` 真算出来的 40 hex）
+    pid: str = ""
 
     def set_body(self, text: str) -> None:
         """改 body 文件内容（坏输入用例复用同一路径，``--body-file`` 不必变）。"""
@@ -273,6 +380,54 @@ class Stub:
         make_board_db(
             self.board_db, [(card, "running", body) for card, body in cards]
         )
+
+    def add_content(self, files: dict[str, bytes]) -> str:
+        """在真仓库上追加一个改动提交，把 head ref 挪过去（内容指纹随之改变）。
+
+        用途：造「真改内容」/ 二进制 / 纯 rebase 之后新 head 三种形态 —— 指纹由真 git 算，
+        stub 不伪造 patch-id。返回新 head sha。
+        """
+
+        sha = _commit(self.repo, files, f"probe: {sorted(files)}")
+        _set_ref(self.repo, MG_HEAD_REF, sha)
+        self.head_sha = sha
+        return sha
+
+    def point_head_at_base(self) -> None:
+        """把 head ref 挪到 base 提交（= 分支相对 base 无差异，空 diff 形态）。"""
+
+        _set_ref(self.repo, MG_HEAD_REF, self.base_sha)
+        self.head_sha = self.base_sha
+
+    def reset_ls_remote_count(self) -> None:
+        """清掉 ``ls-remote`` 计次文件（同一用例里跑第二次完整合并时用）。"""
+
+        Path(os.environ["FAKE_GIT_COUNT"]).unlink(missing_ok=True)
+
+    def alias_pr(self, pr: int) -> None:
+        """把 fixture 的两条私有 ref 复制到另一个 PR 号下（``--pr`` 换号的用例用）。
+
+        闸门读的是 ``refs/merge-guard/<pr>/{base,head}``；fixture 预置的是 PR #9 那一份。
+        """
+
+        _set_ref(self.repo, mg.rebase_base_ref(pr), self.base_sha)
+        _set_ref(self.repo, mg.rebase_head_ref(pr), self.head_sha)
+
+    def fingerprint(self) -> str:
+        """当前两条 ref 之间的内容指纹（真 git 算；stub 只把命令代理给真 git）。
+
+        预计算走的也是假脚本，会往 ``FAKE_LOG`` 记几条调用 —— 算完把日志还原成算之前的样子，
+        免得用例的「调用序列」断言被 fixture 自身的预计算污染。
+        """
+
+        before = self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+        value = mg.reviewhead.fingerprint(self.repo, MG_BASE_REF, MG_HEAD_REF).value
+        if before:
+            self.log.write_text(before, encoding="utf-8")
+        else:
+            self.log.unlink(missing_ok=True)
+        assert value is not None, "fixture 的 head ref 应能算出 patch 指纹"
+        return value
 
     def git_calls(self) -> list[str]:
         return [call for call in self.calls() if call.startswith("git ")]
@@ -322,6 +477,8 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_GIT_COUNT", str(tmp_path / "git.count"))
     monkeypatch.setenv("FAKE_MERGED_MARK", str(tmp_path / "merged.mark"))
+    # 假 git 里「内容指纹」那三类命令代理给真 git（绝对路径，绕开 PATH 上的假脚本）
+    monkeypatch.setenv("FAKE_REAL_GIT", REAL_GIT)
     monkeypatch.setenv("FAKE_VIEW_RC", "0")
     monkeypatch.setenv("FAKE_MERGE_RC", "0")
     # 默认：合并前的「源分支存在」闸门通过（分支在），合并后的探针报「没有这个 ref」
@@ -337,6 +494,9 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     monkeypatch.setenv("FAKE_REMOTE_URL", "git@github.com:alsj213/team-board.git")
     monkeypatch.setenv("FAKE_REMOTE_RC", "0")
     monkeypatch.setenv("FAKE_API_RC", "0")
+    # ``--repo`` 是**真 git 库**（E4 起双问闸门绑内容指纹）：基线提交 + 改动提交，
+    # 两条私有 ref 预置好（= 闸门那次 fetch 的结果）
+    base_sha, head_sha = _init_content_repo(repo)
     out = Stub(
         bindir=bindir,
         log=log,
@@ -344,11 +504,17 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
         body_file=body_file,
         setenv=monkeypatch.setenv,
         board_db=board_db,
+        base_sha=base_sha,
+        head_sha=head_sha,
     )
     out.view()
-    # 默认：双问绑定闸门通过 —— 两个端点各一条标记，都绑在预检的 head sha 上
+    # 指纹由**真 git** 算出（假脚本只把 merge-base / diff / patch-id / cat-file 代理过去）：
+    # 预计算这几条命令也会被假脚本记进 FAKE_LOG，算完清掉，免得污染用例的调用断言
+    out.pid = out.fingerprint()
+    log.unlink(missing_ok=True)
+    # 默认：双问绑定闸门通过 —— 两个端点各一条标记，都绑在 fixture 那份内容的指纹上
     out.set_review_bodies(
-        [mark_body(HEAD_OID, "defect")], [mark_body(HEAD_OID, "regression")]
+        [patch_body(out.pid, "defect")], [patch_body(out.pid, "regression")]
     )
     return out
 
@@ -1057,6 +1223,8 @@ def test_pr_boundary_accepted(stub: Stub, capsys: pytest.CaptureFixture[str]) ->
     )
     # 认领闸门要读到「恰好一张卡认领 #999999999，且就是 --card」
     stub.set_claims([(MERGE_CARD, "PR-CLAIM: #999999999\n")])
+    # 双问闸门读的是 refs/merge-guard/<pr>/*：把 fixture 的两条私有 ref 复制到这个 PR 号下
+    stub.alias_pr(999999999)
 
     rc, out, _err = run(
         [
@@ -2109,8 +2277,6 @@ PROBE_BRANCH = f"wt/{PROBE_CARD}"
 PROBE_PR = 20
 #: 探针库写进 remote 配置的 URL（GitHub 形态；真实传输由 url.<裸库>.insteadOf 改写到本地）
 PROBE_REMOTE_URL = "git@github.com:alsj213/team-board.git"
-#: 真 git 的绝对路径（假 gh 内部要造 merge commit，不能被 PATH 里的假 git 抢走）
-REAL_GIT = shutil.which("git") or "git"
 
 #: 假 gh：收到 ``pr merge`` 时**真的**按 ``--subject`` / ``--body-file`` 造一个 merge commit，
 #: 再删远端分支（本地裸库当 origin）。--subject / --body-file 缺一个就退出 9。
@@ -2382,7 +2548,11 @@ def test_rebase_gate_rejects_stale_branch_rc2(
 def test_rebase_gate_fetch_failure_rc2(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``git fetch`` 抓不到远端提交 → rc2；后面两条命令一条都不跑。"""
+    """``git fetch`` 抓不到远端提交 → rc2；后面两条命令一条都不跑。
+
+    E4 起这次 fetch 由 :func:`mg.ensure_pr_refs` 提供、双问闸门先调：所以拒绝发生在
+    **双问闸门**里（两条 ``gh api`` 都还没发），文案仍是同一句 rebase 口径的原话。
+    """
 
     stub.setenv("FAKE_FETCH_RC", "128")
     stub.setenv("FAKE_FETCH_ERR", "fatal: could not read from remote repository")
@@ -2395,14 +2565,19 @@ def test_rebase_gate_fetch_failure_rc2(
     assert "取远端提交失败（git fetch rc=128）" in err
     assert "could not read from remote repository" in err
     assert "无法判定 head 是否已 rebase 到 main" in err
-    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
+    # 取数失败就停：既没发 gh api（双问闸门在 fetch 之后就停），也没往下判祖先关系
+    assert stub.gh_calls() == [VIEW_CALL]
     assert not [c for c in stub.git_calls() if " rev-parse " in c or " merge-base " in c]
 
 
-def test_rebase_gate_head_pushed_after_preflight_rc2(
+def test_review_head_gate_head_pushed_after_preflight_rc2(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """预检到合并之间分支被推送（远端 head ≠ headRefOid）→ rc2，判的就是预检那条 sha。"""
+    """预检到合并之间分支被推送（远端 head ≠ headRefOid）→ rc2「预检之后分支被推送」。
+
+    E4 起这条交叉核对在**双问闸门**里（认领 → 双问 → rebase，双问先跑），文案沿用
+    rebase 闸门那一份原话；判了不一致就不许再算指纹、也不许判祖先关系。
+    """
 
     stub.setenv("FAKE_REV_PARSE_OUT", "0055aa66bb77cc88dd99ee00112233445566778899")
 
@@ -2414,9 +2589,9 @@ def test_rebase_gate_head_pushed_after_preflight_rc2(
     assert "0055aa66bb77cc88dd99ee00112233445566778899" in err
     assert f"headRefOid {HEAD_OID}" in err
     assert "预检之后分支被推送" in err
-    # 判了「不一致」就不许再往下判祖先关系
-    assert not [c for c in stub.git_calls() if " merge-base " in c]
-    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
+    # 判了「不一致」就不许再往下判祖先关系，也不许拿新 ref 算指纹后放行
+    assert not [c for c in stub.git_calls() if " merge-base " in c or " patch-id " in c]
+    assert stub.gh_calls() == [VIEW_CALL]
 
 
 def test_rebase_gate_undetermined_rc2(
@@ -2468,7 +2643,8 @@ def test_rebase_gate_rejects_malformed_base_ref_name(
         if " fetch " in c or " rev-parse " in c or " merge-base " in c
     ]
     assert len([c for c in stub.git_calls() if " ls-remote " in c]) == 1
-    assert stub.gh_calls() == [VIEW_CALL, *API_CALLS]
+    # 形态检查在 :func:`mg.ensure_pr_refs` 里、双问闸门先调：所以连 gh api 都没发
+    assert stub.gh_calls() == [VIEW_CALL]
 
 
 def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
@@ -2500,8 +2676,12 @@ def test_rebase_gate_docs_name_the_rebaser_and_drop_zero_git_claim() -> None:
 def test_rebase_gate_git_subcommand_order_passing(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """通过路径的 git 子命令顺序必须是：存在性探针 → remote get-url（仓库核对）→ fetch →
-    rev-parse → merge-base → rev-parse(base，只用于证据行) → 删除探针。
+    """通过路径的 git 子命令顺序（E4 起双问闸门先跑、共用一次 fetch）：
+
+    存在性探针 → remote get-url（仓库核对）→ ①双问闸门的 fetch → rev-parse（交叉核对）
+    → 内容指纹（merge-base --all / diff --numstat / diff -U0，sha256 内容行）→ ②rebase 闸门的
+    fetch → rev-parse（交叉核对）→ merge-base --is-ancestor → rev-parse(base，只用于证据行）
+    → 删除探针。
     """
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
@@ -2509,18 +2689,40 @@ def test_rebase_gate_git_subcommand_order_passing(
     rc, out, _err = run(args_for(stub), capsys)
 
     assert rc == 0
-    subs = [call.split()[3] for call in stub.git_calls()]
-    assert subs[:6] == [
+    def git_sub(call: str) -> str:
+        """取 git 子命令：跳过全局 ``-c key=value``（指纹那一路会带配置钉死）。"""
+        parts = call.split()
+        i = 3
+        while i < len(parts):
+            if parts[i] == "-c":
+                i += 2
+                continue
+            if parts[i].startswith("-"):
+                i += 1
+                continue
+            return parts[i]
+        return ""
+
+    subs = [git_sub(call) for call in stub.git_calls()]
+    assert subs[:11] == [
         "ls-remote",
         "config",
-        "fetch",
-        "rev-parse",
-        "merge-base",
-        "rev-parse",
+        "fetch",       # 双问闸门：与 rebase 闸门共用的那一份取数
+        "rev-parse",   # 双问闸门：远端 head 必须 == headRefOid
+        "merge-base",  # 内容指纹：merge-base --all（真 git）
+        "diff",        # 内容指纹：diff --numstat -U0（真 git）
+        "diff",        # 内容指纹：diff -U0（sha256 内容行，无 patch-id 调用）
+        "fetch",       # rebase 闸门：同一份取数再跑一次
+        "rev-parse",   # rebase 闸门：远端 head 必须 == headRefOid
+        "merge-base",  # rebase 闸门：merge-base --is-ancestor
+        "rev-parse",   # rebase 闸门：读 base 的前 7 位拼证据行
     ]
-    assert set(subs[6:]) == {"ls-remote"}  # 后面全是删除探针
+    assert set(subs[11:]) == {"ls-remote"}  # 后面全是删除探针
+    assert " --is-ancestor " in stub.git_calls()[9]  # 第 10 条才是 rebase 判定
+    assert " --is-ancestor " not in stub.git_calls()[4]  # 第 5 条是指纹的 merge-base
     assert REMOTE_CALL.format(repo=stub.repo) in stub.git_calls()
     assert rebase_line(stub) in out.splitlines()
+    assert review_line(stub) in out.splitlines()
 
 
 def test_verify_only_never_emits_rebase_step(
@@ -2551,8 +2753,10 @@ def test_verify_only_never_emits_rebase_step(
 
 #: 另一个合法卡号（用来造「重复认领」与「认领卡≠--card」）
 OTHER_CARD = "t_aaaa0001"
-#: 另一条 sha（用来造「双问陈旧」：标记绑在别的 head 上）
+#: 另一条 sha（用来造「旧 REVIEW-HEAD 标记」的 legacy 形态）
 STALE_OID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00a1b2c3d"
+#: 另一份内容指纹（40 hex，合法形态但不是当前那份 → 用来造「双问陈旧」）
+STALE_PID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00a1b2c3d"
 
 
 def merged(stub: Stub) -> bool:
@@ -2670,29 +2874,130 @@ def test_claim_gate_db_unreadable_rc2(stub: Stub, capsys: pytest.CaptureFixture[
 def test_review_head_gate_missing_kind_rc2(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """当前 head 上只有 defect → rc2「双问缺类」并点出缺 regression。"""
+    """当前内容指纹上只有 defect → rc2「双问缺类」并点出缺 regression。"""
 
-    stub.set_review_bodies([mark_body(HEAD_OID, "defect")], [])
+    stub.set_review_bodies([patch_body(stub.pid, "defect")], [])
 
     rc, out, err = run(args_for(stub), capsys)
 
     assert_rejected(rc, out, err, text="双问缺类")
     assert "regression" in err
+    assert stub.pid[:12] in err  # 缺类结论行点的是内容指纹，不是 head sha
     assert stub.api_calls() == API_CALLS  # 两条只读 GET 都发了
     assert not merged(stub)
 
 
 def test_review_head_gate_stale_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
-    """标记绑在别的 sha 上（head 变了没重跑双问）→ rc2「双问陈旧」。"""
+    """标记绑在**别的内容**上（内容变了没重跑双问）→ rc2「双问陈旧」。"""
 
     stub.set_review_bodies(
-        [mark_body(STALE_OID, "defect")], [mark_body(STALE_OID, "regression")]
+        [patch_body(STALE_PID, "defect")], [patch_body(STALE_PID, "regression")]
     )
 
     rc, out, err = run(args_for(stub), capsys)
 
     assert_rejected(rc, out, err, text="双问陈旧")
     assert HEAD_OID[:12] in err
+    assert stub.pid[:12] in err  # 当前内容指纹也在文案里（便于对账）
+    assert not merged(stub)
+
+
+def test_review_head_gate_pure_rebase_passes(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**纯 rebase 放行**：父提交换了、内容一字未改 → 双问证据按内容复用，仍 PASS。
+
+    三步：① main 前进一次（新 base）；② 分支那份改动重放到新 base 上（= 真 rebase，
+    提交 sha 变了）；③ 先断言指纹没变，再分别用 ``REVIEW-PATCH`` 与旧 ``REVIEW-HEAD``
+    两种标记跑一遍合并路径 —— 都该走到 ``双问绑定 | PASS``。
+    """
+
+    pid_before = stub.pid
+    old_head = stub.head_sha
+
+    # ① main 前进一次：只在 main 上出现一个无关改动
+    subprocess.run(
+        [REAL_GIT, "-C", str(stub.repo), "checkout", "-q", "-B", "main-side", stub.base_sha],
+        check=True,
+    )
+    new_base = _commit(stub.repo, {"main-only.txt": b"main\n"}, "main: unrelated change")
+    # ② 分支改动重放到新 base 上（树差异不变，提交 sha 换了）
+    rebased_head = _replay_on(stub.repo, new_base, {"feature.txt": b"feature\n"}, "feat: rebased")
+    _set_ref(stub.repo, MG_BASE_REF, new_base)
+    _set_ref(stub.repo, MG_HEAD_REF, rebased_head)
+    stub.base_sha, stub.head_sha = new_base, rebased_head
+    assert rebased_head != old_head  # 确实是 rebase 之后的新 sha
+    assert stub.fingerprint() == pid_before  # 内容指纹一个字节都没变
+
+    # ③a 新口径：REVIEW-PATCH 绑的就是这份内容
+    stub.setenv("FAKE_LS_REMOTE_RC", "2")
+    stub.set_review_bodies(
+        [patch_body(pid_before, "defect")], [patch_body(pid_before, "regression")]
+    )
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert rc == 0, (out, err)
+    assert err == ""
+    assert review_line(stub) in out.splitlines()
+    assert f"内容指纹 {pid_before[:12]}" in out
+
+    # ③b 旧口径：REVIEW-HEAD 绑的是 rebase 前的 sha —— 按内容复用（不是「双问陈旧」）
+    stub.set_review_bodies(
+        [mark_body(old_head, "defect")], [mark_body(old_head, "regression")]
+    )
+    stub.reset_ls_remote_count()  # 第二次跑完整合并：ls-remote 计次从 1 重新开始
+    rc2, out2, err2 = run(args_for(stub), capsys)
+
+    assert rc2 == 0, (out2, err2)
+    assert err2 == ""
+    assert review_line(stub) in out2.splitlines()
+
+
+def test_review_head_gate_binary_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """分支含二进制文件 → rc2「双问不可复用」并点名路径（patch-id 对二进制内容盲）。"""
+
+    stub.add_content({"assets/blob.bin": b"\x00\x01\x02\x03\xff"})
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="双问不可复用")
+    assert "assets/blob.bin" in err  # 点名路径
+    assert "双问陈旧" not in err and "双问缺证" not in err and "双问缺类" not in err
+    assert stub.api_calls() == []  # 指纹不可复用：一条 gh api 都不发
+    assert not merged(stub)
+
+
+def test_review_head_gate_empty_diff_rc2(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
+    """分支相对 base 无差异（空 diff）→ rc2「双问不可复用」，不许当 PASS。"""
+
+    stub.point_head_at_base()
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="双问不可复用")
+    assert "无差异" in err and "main" in err
+    assert "双问陈旧" not in err and "双问缺证" not in err and "双问缺类" not in err
+    assert stub.api_calls() == []
+    assert not merged(stub)
+
+
+def test_review_head_gate_fingerprint_failure_rc2(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """内容指纹算不出来（这里把 head ref 删掉 → merge-base 指不到对象）→ rc2「算不出…内容指纹」。
+
+    绝不许被读成「双问缺证」（那是 rc1 语义 / 没做双问）。
+    """
+
+    subprocess.run(
+        [REAL_GIT, "-C", str(stub.repo), "update-ref", "-d", MG_HEAD_REF], check=True
+    )
+
+    rc, out, err = run(args_for(stub), capsys)
+
+    assert_rejected(rc, out, err, text="算不出 PR #9 的内容指纹")
+    assert "双问缺证" not in err and "双问陈旧" not in err
+    assert stub.api_calls() == []
     assert not merged(stub)
 
 
