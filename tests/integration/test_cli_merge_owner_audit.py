@@ -570,6 +570,47 @@ class TestExemptEscapeHatch:
         assert "PR #12 UNOWNED" in out
         assert "PR #12 EXEMPT" not in out
 
+    def test_tilde_fence_exempt_does_not_count(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """~~~ 也是 CommonMark 围栏：里面的豁免行不是本卡声明（评审 fail-open）。"""
+        states(stub, {12: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(
+            db,
+            [(CARD, "running", "PR #12 是别的卡\n~~~\nPR-MERGE-EXEMPT: #12\n~~~\n")],
+        )
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        assert "PR #12 UNOWNED" in out
+        assert "PR #12 EXEMPT" not in out
+        assert "围栏不配对" not in out
+
+    def test_longer_fence_swallows_shorter_fence(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """```` 围栏里的 ``` 行是内容不是闭合：里面的豁免行同样不算。"""
+        states(stub, {12: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(
+            db,
+            [
+                (
+                    CARD,
+                    "running",
+                    "PR #12 是别的卡\n````\n```\nPR-MERGE-EXEMPT: #12\n```\n````\n",
+                )
+            ],
+        )
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        assert "PR #12 UNOWNED" in out
+        assert "PR #12 EXEMPT" not in out
+
     def test_indented_exempt_line_does_not_count(
         self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

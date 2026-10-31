@@ -201,6 +201,10 @@ MERGE_OWNER_REPO = "alsj213/team-board"
 #: ``merge-owner-audit`` 降级日志的文件名：``<log-dir>/merge-owner-audit-<卡号>.log``
 MERGE_OWNER_LOG_PREFIX = "merge-owner-audit-"
 
+#: CommonMark 围栏的**起始行**：≤3 空格缩进 + 3 个以上同种字符（``` 或 ~~~）。
+#: 闭合行另判：同种字符、长度不短于开围栏、其后只允许空白（CommonMark §4.5）。
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
 
 def _parse_date(value: str) -> date:
     """按 YYYY-MM-DD 严格解析；非法时交给 argparse 报错（退出码 2）。"""
@@ -1770,26 +1774,40 @@ def _fence_split(body: str | None) -> tuple[str, bool]:
     """拆成 ``(围栏外的行, 围栏是否配对)``。
 
     豁免面是「本卡**正文**的顶格一行」：评论里的示例不算（P2-a），正文里贴进
-    代码围栏的示例也不算 —— 围栏是引用写法，不是本卡声明。围栏不配对（行首 ```
-    奇数）时按「从第一个 ``` 起到文末都在围栏内」处理（宁严不宽），同时把
-    ``False`` 交给 :func:`mergeowner.judge` 渲染进结论行 —— 否则豁免行被围栏吞掉
-    只会留一个无声的 rc1。剥完只用于 :func:`mergeowner.exempt_prs`；PR 号提取
+    代码围栏的示例也不算 —— 围栏是引用写法，不是本卡声明。围栏按 CommonMark
+    §4.5 识别（``` 或 ~~~、≤3 空格缩进、闭围栏不短于开围栏且其后只允许空白）；
+    只认 ``` 会把标准 Markdown 的 ~~~ 围栏当正文，围栏里的 ``PR-MERGE-EXEMPT``
+    就被误当成真豁免（fail-open，2026-11-01 评审实测）。不配对时按「从开围栏起到
+    文末都在围栏内」处理（宁严不宽），同时把 ``False`` 交给
+    :func:`mergeowner.judge` 渲染进结论行 —— 否则豁免行被围栏吞掉只会留一个
+    无声的 rc1。剥完只用于 :func:`mergeowner.exempt_prs`；PR 号提取
     （``mergeowner.extract_prs_sources``）仍吃全文。
     """
 
     if not body:
         return "", True
     kept: list[str] = []
-    in_fence = False
-    fences = 0
+    fence: tuple[str, int] | None = None  # (围栏字符, 开围栏长度)
     for line in body.splitlines():
-        if line.lstrip().startswith("```"):
-            fences += 1
-            in_fence = not in_fence
+        match = _FENCE_RE.match(line)
+        if match is not None:
+            marker, info = match.group(1), match.group(2)
+            if fence is None:
+                # 开围栏：反引号围栏的 info 串不许再含反引号（CommonMark §4.5）
+                if marker[0] == "`" and "`" in info:
+                    kept.append(line)
+                    continue
+                fence = (marker[0], len(marker))
+                continue
+            char, length = fence
+            if marker[0] == char and len(marker) >= length and not info.strip():
+                fence = None
+                continue
+            # 围栏内「像围栏但闭不上」的行仍是内容，一并丢掉
             continue
-        if not in_fence:
+        if fence is None:
             kept.append(line)
-    return "\n".join(kept), fences % 2 == 0
+    return "\n".join(kept), fence is None
 
 
 def _append_degrade_log(
