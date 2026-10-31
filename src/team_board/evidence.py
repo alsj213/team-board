@@ -104,7 +104,7 @@ REVIEW_VERDICTS: frozenset[str] = frozenset({"pass", "block"})
 
 # ---- 七个 VERDICT 字面量（全仓只此七种，不出现第八个判定词）----
 
-VERDICT_PASS = "PASS"
+VERDICT_PASS = "PASS"  # nosec B105 - 判定字面量不是口令，bandit 误报
 VERDICT_MISSING = "缺证据"
 VERDICT_HEAD_MISMATCH = "证据对新 head 无效"
 VERDICT_BLOCKED = "双问阻塞"
