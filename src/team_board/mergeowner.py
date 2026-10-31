@@ -2,7 +2,9 @@
 
 口径唯一源是需求卡 ``t_6fca5f99`` 冻结的契约 v1（见本卡评论 #1），返工轮按契约 v2
 增量改了两处：``UNOWNED`` 结论行代入真实最小无归属号、``others`` 同时吃三元组与
-``db.iter_claim_rows`` 的四元组。本模块**不读库、
+``db.iter_claim_rows`` 的四元组；契约 v3 增量再补四处在**输入侧**归一（超长数字串、
+gh 状态大小写/空白、detail 换行与长度、CRLF 正文的豁免行），判定方向不变。
+本模块**不读库、
 不调 gh、不写文件、不 print**：取数（db 取正文与评论、gh 判状态、降级写日志）全在
 CLI 层，本模块只吃字符串与 :class:`GhResult`，吐 :class:`Report`。
 
@@ -17,8 +19,9 @@ CLI 层，本模块只吃字符串与 :class:`GhResult`，吐 :class:`Report`。
 5. gh 取数失败 → ``WARN``，``detail`` 一句话。
 
 **本卡自己认领不算**（本卡未结、正文里写了自己的 ``PR-CLAIM: #n`` 仍判 ``UNOWNED``）
-—— 防「自认自关」。gh 只产出 ``MERGED`` / ``CLOSED`` / ``OPEN`` 三态或一条错误；
-非 ``MERGED`` / ``CLOSED`` 一律走 ``OPEN`` 分支。
+—— 防「自认自关」。gh 只有 ``MERGED`` / ``CLOSED`` / ``OPEN`` 三态有效：状态先去空白
+并转大写再比，空串 / 全空白 / 归一后不是三态的一律按取数失败（``WARN`` + ``gh 无结果``），
+不是 ``MERGED`` / ``CLOSED`` 的合法三态走 ``OPEN`` 分支。
 
 ``MAX_PR`` 从 :mod:`team_board.prclaim` 导入，本模块不定义第二份 PR 号口径。
 """
@@ -79,8 +82,9 @@ PR_RE = re.compile(r"PR #([1-9][0-9]{0,8})(?![0-9])")
 #: 正文里引用 PR 的第二种形态：URL 的 ``/pull/<n>`` 段（同样不许截短长数字）
 URL_RE = re.compile(r"/pull/([1-9][0-9]{0,8})(?![0-9])")
 
-#: 豁免行：顶格、行尾无尾随字符（与 :data:`team_board.prclaim.CLAIM_RE` 同口径）
-EXEMPT_RE = re.compile(r"^PR-MERGE-EXEMPT: #([1-9][0-9]{0,8})$", re.MULTILINE)
+#: 豁免行：顶格、行尾无尾随字符（与 :data:`team_board.prclaim.CLAIM_RE` 同口径）。
+#: ``\r?`` 认 CRLF —— 本板正文经 Windows 侧写入，``\r`` 属现实路径，不算尾随字符。
+EXEMPT_RE = re.compile(r"^PR-MERGE-EXEMPT: #([1-9][0-9]{0,8})\r?$", re.MULTILINE)
 
 #: ``--timeout`` 的取值域（秒）
 TIMEOUT_MIN = 1
@@ -98,6 +102,12 @@ WARN = "WARN"
 #: 「已结」卡：这些状态的卡认领 PR 不算归属（本卡自身的状态也照此判）
 DONE_STATUSES = ("done", "archived")
 
+#: gh 的合法三态之一（不是 :class:`Verdict` 的 kind，故不导出）
+_GH_OPEN = "OPEN"
+
+#: ``detail`` 的展示上限（字符）：超过就截断加 ``…``，保证整块输出远低于 output-audit 的 8192 字节
+_DETAIL_MAX = 80
+
 #: 四选一的结论行（``{n}`` / ``{k}`` / ``{m}`` 是整数；其余字面照抄，不许改写）
 VERDICT_NO_PR = "结论: 抽取到 0 个 PR 号 → 无合并归属需要（直接通过）"
 VERDICT_ALL_OK = "结论: {n} 个 PR 全部有归属 → 可关"
@@ -110,18 +120,46 @@ VERDICT_DEGRADED = "结论: gh 不可用（{detail}）→ 降级放行（日志�
 #: 只认 ASCII 十进制数字、不带前导零：``int()`` 会静默接受 ``" 20"`` / ``"+20"``
 _TIMEOUT_DIGITS = re.compile(r"[1-9][0-9]*", re.ASCII)
 
+#: CPython 对十进制串的 ``int()`` 有位数额度（默认 4300 位，3.11+ 起），超了抛裸
+#: ``ValueError``。那是**环境异常不是参数异常**，CLI 只捕 :class:`MergeOwnerError`，
+#: 漏出去就是 traceback + rc1（应当是 ``错误: …`` + rc2），所以这里先量位数再转换。
+_MAX_INT_DIGITS = 4300
+
+#: 报错里回显输入的上限：4301 位原文塞进 ``错误: …`` 会撞 output-audit 的 8192 字节
+_ECHO_MAX = 16
+
 
 class MergeOwnerError(Exception):
     """参数错误（卡号 / 仓库 / 超时取值非法）→ CLI 渲染成 ``错误: …`` + rc2。"""
 
 
+def _one_line(text: str) -> str:
+    """把 ``detail`` 压成单行短句：空白折叠成一个空格、去首尾、超长截断加 ``…``。
+
+    目的有二：``render`` 的每一行恒为「一条判定」（detail 里带换行会把结论行顶碎），
+    以及整块输出不被超长 gh 报错撑破（``output-audit`` 上限 8192 字节）。
+    结果长度恒 ``<= _DETAIL_MAX``。
+    """
+    collapsed = re.sub(r"\s+", " ", text or "").strip()
+    if len(collapsed) > _DETAIL_MAX:
+        return collapsed[: _DETAIL_MAX - 1] + "…"
+    return collapsed
+
+
 @dataclass(frozen=True)
 class Verdict:
-    """一个 PR 的判定结论；``detail`` 只在 ``CLAIMED`` / ``WARN`` 时非空。"""
+    """一个 PR 的判定结论；``detail`` 只在 ``CLAIMED`` / ``WARN`` 时非空。
+
+    ``detail`` 在构造时就归一成单行（见 :func:`_one_line`），所以 ``Report`` 里存的
+    已经是可展示形态，CLI 层拿它拼别的文案也不会带出换行。
+    """
 
     pr: int
     kind: str
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detail", _one_line(self.detail))
 
 
 @dataclass(frozen=True)
@@ -145,7 +183,11 @@ class Report:
 
 @dataclass(frozen=True)
 class GhResult:
-    """CLI 层一次 ``gh`` 取数的结果：成功填 ``status``，失败填一句话的 ``error``。"""
+    """CLI 层一次 ``gh`` 取数的结果：成功填 ``status``，失败填一句话的 ``error``。
+
+    ``status`` 不要求已经归一 —— 大小写、首尾空白都容忍（``"merged\\n"`` / ``"MERGED "``
+    都算 ``MERGED``）；归一后不是三态则按取数失败处理（见 :func:`_judge_one`）。
+    """
 
     status: str = ""
     error: str = ""
@@ -153,6 +195,11 @@ class GhResult:
     @property
     def failed(self) -> bool:
         return bool(self.error)
+
+    @property
+    def state(self) -> str:
+        """归一后的状态：去首尾空白 + 转大写（空值给空串）。"""
+        return (self.status or "").strip().upper()
 
 
 def extract_prs(*texts: str | None) -> tuple[int, ...]:
@@ -228,10 +275,14 @@ def _judge_one(
         return Verdict(pr, WARN, "gh 无结果")
     if result.failed:
         return Verdict(pr, WARN, result.error)
-    if result.status == MERGED:
+    state = result.state
+    if state == MERGED:
         return Verdict(pr, MERGED)
-    if result.status == CLOSED:
+    if state == CLOSED:
         return Verdict(pr, CLOSED)
+    if state != _GH_OPEN:
+        # 空串 / 全空白 / 归一后不是三态 → 没取到状态，按取数失败算（契约 v3 ②）
+        return Verdict(pr, WARN, "gh 无结果")
     claimers = sorted(cid for cid, body in pool if claims(body, pr))
     if claimers:
         return Verdict(pr, CLAIMED, ",".join(claimers))
@@ -264,8 +315,10 @@ def render(report: Report) -> str:
 
 
 def _render_verdict(verdict: Verdict) -> str:
+    """一行一条判定；``detail`` 再归一一次（防手工构造的 ``Report`` 带出换行）。"""
     line = f"PR #{verdict.pr} {verdict.kind}"
-    return f"{line} {verdict.detail}" if verdict.detail else line
+    detail = _one_line(verdict.detail)
+    return f"{line} {detail}" if detail else line
 
 
 def exit_code(report: Report) -> int:
@@ -293,12 +346,27 @@ def parse_repo(value: str) -> str:
 
 
 def parse_timeout(value: str) -> int:
-    """``--timeout``：``1``–``600`` 的 ASCII 十进制整数秒，否则抛 :class:`MergeOwnerError`。"""
+    """``--timeout``：``1``–``600`` 的 ASCII 十进制整数秒，否则抛 :class:`MergeOwnerError`。
+
+    位数超过 :data:`_MAX_INT_DIGITS` 的串也抛 :class:`MergeOwnerError` —— 不许把
+    ``int()`` 的裸 ``ValueError`` 漏给 CLI（那会让 rc 从 2 变成 1）。
+    """
     if not isinstance(value, str) or _TIMEOUT_DIGITS.fullmatch(value) is None:
         raise MergeOwnerError(
             f"超时非法：{value!r}（应为 {TIMEOUT_MIN}-{TIMEOUT_MAX} 的整数秒）"
         )
-    seconds = int(value)
+    if len(value) > _MAX_INT_DIGITS:
+        raise MergeOwnerError(
+            f"超时非法：{value[:_ECHO_MAX]}…（{len(value)} 位数字，"
+            f"应为 {TIMEOUT_MIN}-{TIMEOUT_MAX} 的整数秒）"
+        )
+    try:
+        seconds = int(value)
+    except ValueError:  # 位数额度被 sys.set_int_max_str_digits 调低时的兜底
+        raise MergeOwnerError(
+            f"超时非法：{value[:_ECHO_MAX]}…（整数转换失败，"
+            f"应为 {TIMEOUT_MIN}-{TIMEOUT_MAX} 的整数秒）"
+        ) from None
     if not TIMEOUT_MIN <= seconds <= TIMEOUT_MAX:
         raise MergeOwnerError(
             f"超时超出范围：{value!r}（应为 {TIMEOUT_MIN}-{TIMEOUT_MAX} 的整数秒）"

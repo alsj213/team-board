@@ -3,7 +3,7 @@
 这里只测纯函数（不连库、不调 gh、不碰 stdout）；CLI 的 rc 三态与降级日志在
 ``tests/integration/test_cli_merge_owner_audit.py``（子卡 E2）。
 
-15 条用例对应契约 v1 + v2 增量（t_6fca5f99 冻结）的清单；每条内部覆盖多个边界值
+19 条用例对应契约 v1 + v2 + v3 增量（t_6fca5f99 冻结）的清单；每条内部覆盖多个边界值
 （``0`` / 负数 / 13 位毫秒 / 天文数字 / 空串），不再拆成更多函数。
 """
 
@@ -57,6 +57,24 @@ class TestExempt:
         assert mo.exempt_prs("PR-MERGE-EXEMPT: #52 ") == frozenset()
         assert mo.exempt_prs("PR-MERGE-EXEMPT: #52（临时）") == frozenset()
         assert mo.exempt_prs(None) == frozenset()
+
+    def test_crlf_body_still_counts(self) -> None:
+        """CRLF 正文（Windows 侧写入）命中豁免；``\\r`` 不算尾随字符，缩进仍不算。"""
+        assert mo.exempt_prs("目标\r\nPR-MERGE-EXEMPT: #52\r\n") == frozenset({52})
+        assert mo.exempt_prs(
+            "PR-MERGE-EXEMPT: #52\r\nPR-MERGE-EXEMPT: #7\r\n"
+        ) == frozenset({52, 7})
+        assert mo.exempt_prs("目标\r\n  PR-MERGE-EXEMPT: #52\r\n") == frozenset()
+        assert mo.exempt_prs("PR-MERGE-EXEMPT: #52 \r\n") == frozenset()
+        # 豁免在判定里照样压过 gh（契约优先级 1），不因 CRLF 掉回 UNOWNED
+        report = mo.judge(
+            CARD,
+            "running",
+            [52],
+            exempt=mo.exempt_prs("目标\r\nPR-MERGE-EXEMPT: #52\r\n"),
+            gh={52: GhResult(status="OPEN")},
+        )
+        assert report.verdicts[0].kind == mo.EXEMPT
 
 
 class TestJudge:
@@ -130,6 +148,45 @@ class TestJudge:
         missing = mo.judge(CARD, "running", [7], gh={})
         assert missing.verdicts[0].kind == mo.WARN
         assert missing.verdicts[0].detail
+
+    def test_status_normalization_and_illegal_status(self) -> None:
+        """状态归一：大小写/首尾空白容忍；四种非法 status → ``WARN`` + ``gh 无结果``。"""
+        for status, kind in (
+            ("MERGED", mo.MERGED),
+            ("merged\n", mo.MERGED),
+            ("MERGED ", mo.MERGED),
+            ("\tmerged\r\n", mo.MERGED),
+            ("Closed", mo.CLOSED),
+            ("closed  ", mo.CLOSED),
+        ):
+            report = mo.judge(CARD, "running", [55], gh={55: GhResult(status=status)})
+            assert (report.verdicts[0].kind, report.verdicts[0].detail) == (kind, "")
+        # ``open`` 归一后仍是合法三态 → 走认领分支（有人认领 CLAIMED，没人认领 UNOWNED）
+        claimed = mo.judge(
+            CARD,
+            "running",
+            [55],
+            gh={55: GhResult(status=" open ")},
+            others=[(OTHER_A, "running", "PR-CLAIM: #55")],
+        )
+        assert claimed.verdicts[0].kind == mo.CLAIMED
+        assert mo.judge(
+            CARD, "running", [55], gh={55: GhResult(status="open")}
+        ).verdicts[0].kind == mo.UNOWNED
+        # 空串 / 全空白 / 非三态拼写 → 按取数失败算：WARN，不是 UNOWNED；rc 仍是 0
+        for status in ("", "   ", "\t\n", "UNKNOWN", "OPENED", "MERGED,"):
+            report = mo.judge(CARD, "running", [55], gh={55: GhResult(status=status)})
+            assert (report.verdicts[0].kind, report.verdicts[0].detail) == (
+                mo.WARN,
+                "gh 无结果",
+            )
+            assert mo.exit_code(report) == 0
+            assert mo.render(report).splitlines()[-1] == (
+                "结论: gh 不可用（gh 无结果）→ 降级放行（日志已写），晨报须列"
+            )
+        # 空 GhResult（status / error 都空）也算没取到
+        empty = mo.judge(CARD, "running", [55], gh={55: GhResult()})
+        assert (empty.verdicts[0].kind, empty.verdicts[0].detail) == (mo.WARN, "gh 无结果")
 
     def test_others_accepts_iter_claim_rows_four_tuples(self) -> None:
         """``db.iter_claim_rows`` 直出的 4 元组 ``(id, status, assignee, body)`` 也判 CLAIMED。"""
@@ -251,6 +308,42 @@ class TestRender:
         assert "#<最小无归属号>" not in rendered
 
 
+    def test_detail_collapsed_to_one_line_and_bounded(self) -> None:
+        """detail 带换行 / 超长 → 仍「一行一条」，末行恒为结论；整块远低于 8192 字节。"""
+        multiline = mo.judge(
+            CARD,
+            "running",
+            [55],
+            gh={55: GhResult(error="gh rc=1\nfatal: could not read Username\n\n第二段")},
+        )
+        detail = multiline.verdicts[0].detail
+        assert "\n" not in detail and "\r" not in detail
+        assert detail == "gh rc=1 fatal: could not read Username 第二段"
+        assert mo.render(multiline).splitlines() == [
+            f"卡 {CARD} [running]",
+            f"PR #55 WARN {detail}",
+            "结论: gh 不可用（gh rc=1 fatal: could not read Username 第二段）"
+            "→ 降级放行（日志已写），晨报须列",
+        ]
+
+        long = mo.judge(CARD, "running", [55], gh={55: GhResult(error="gh 失败 " * 500)})
+        long_detail = long.verdicts[0].detail
+        assert 0 < len(long_detail) <= 80
+        assert long_detail.endswith("…")
+        rendered = mo.render(long)
+        assert len(rendered.splitlines()) == 3
+        assert rendered.splitlines()[-1].startswith("结论: gh 不可用（")
+        assert len(rendered.encode()) < 8192
+
+        # 手工构造的 Verdict 也一样归一（render 再兜一次）
+        handmade = mo.Report(
+            card=CARD,
+            status="running",
+            verdicts=(mo.Verdict(55, mo.WARN, "第一行\n第二行"),),
+        )
+        assert mo.render(handmade).splitlines()[1] == "PR #55 WARN 第一行 第二行"
+
+
 class TestExitCode:
     def test_three_states(self) -> None:
         """``UNOWNED`` → 1；无 PR / 全通过 / 降级 → 0；本模块永不返回 2。"""
@@ -295,6 +388,19 @@ class TestParse:
                 mo.parse_repo(bad)
         with pytest.raises(MergeOwnerError):
             mo.parse_repo(None)  # type: ignore[arg-type]
+
+    def test_parse_timeout_huge_digit_string(self) -> None:
+        """4301 位数字串 → ``MergeOwnerError``（不许漏 ``int()`` 的裸 ``ValueError``）。"""
+        huge = "9" * 4301
+        with pytest.raises(MergeOwnerError) as excinfo:
+            mo.parse_timeout(huge)
+        message = str(excinfo.value)
+        assert "4301 位数字" in message
+        assert huge not in message  # 不回显原文（撞 output-audit 的 8192 字节）
+        assert len(message.encode()) < 200
+        # 4300 位（未超额度）也要是参数错误，不是裸异常
+        with pytest.raises(MergeOwnerError):
+            mo.parse_timeout("9" * 4300)
 
     def test_parse_timeout(self) -> None:
         assert mo.parse_timeout("1") == mo.TIMEOUT_MIN
