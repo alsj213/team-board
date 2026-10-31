@@ -133,11 +133,16 @@ $ wc -c < /tmp/sample-v3.md
 
 - 装到内核读的模板目录 + 漂移检查：`bash scripts/install-card-template.sh [--check]`（**PR #65，未合**）
   （`main` 上没有该文件，今天执行是 `No such file`，rc=127；`--check` rc1 = 漂移或缺目标，见 `t_eb47566b`）。
-  落点以 `--dest` 为准，**默认必须等于内核 `kanban_home()/templates/card-template.md`** ——
+  落点以 `--dest` 为准，**默认必须等于内核 `_card_template_path()` 读的那一份** ——
   即 `${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`
-  （`kanban_home()` = `HERMES_KANBAN_HOME` else `~/.hermes`，**不是** `~/.hermes/kanban`；
-  内核 `_card_template_path()` 另有 `${HERMES_CARD_TEMPLATE}` 绝对路径覆盖）。
-  #65 脚本默认 dest 目前写成 `$HOME/.hermes/kanban/templates/…`（差一层 `kanban`），偏差归该卡返工
-  `t_7e847105`；在它修正前显式传 `--dest "${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md"`。
+  （`kanban_home()` = `HERMES_KANBAN_HOME`（先 strip，空串视同未设）else `get_default_hermes_root()`，
+  常规安装下 = `~/.hermes`，**不是** `~/.hermes/kanban`；该 fallback 另受 `HERMES_HOME` 影响
+  —— 自定义 root / 容器里是 `<root>`，不止 `~/.hermes` 一种取法）。
+  内核 `_card_template_path()` 另认 `${HERMES_CARD_TEMPLATE}`：`expanduser` 后是**普通文件**就优先
+  （相对路径也接受），不存在或不是普通文件时**静默**回落默认落点。
+  #65 脚本在 `HERMES_KANBAN_HOME` 未设时的默认 dest 是 `$HOME/.hermes/kanban/templates/…`
+  （与内核差一层 `kanban`；已设 `HERMES_KANBAN_HOME` 时两边一致）。**怎么收口归 `t_7e847105` 的 pm 裁定**
+  （改脚本默认 / 改内核 fallback 二选一），本文件只锁「装就装到内核 `_card_template_path()` 读的那一份」；
+  裁定落地前一律显式传 `--dest "${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md"`。
 - 合并顺序：**#63 → #65 → #62**（本文件引用的两张未合 PR 合入后，上面这条才可执行）。
 - 2048 上限的条文、实测与边界：[`docs/card-limit.md`](card-limit.md)；建卡闸门与 `body-audit`：README「卡正文上限」节。
