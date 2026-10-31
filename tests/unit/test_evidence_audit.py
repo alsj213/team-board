@@ -258,11 +258,46 @@ class TestRender:
         assert "impl_done | 角色不符 | 1 |" in "\n".join(lines)
 
     def test_parse_failures_line_only_when_positive(self) -> None:
-        """``解析失败`` 只在 >0 时出一行，正常库里不留噪音。"""
+        """``解析失败`` 只在 >0 时出结论行，且逐条点名坏事件 id（返工 t_39c86400）。"""
         judgment = evidence.judge([], HEAD)
         assert not any(line.startswith("解析失败") for line in evidence.render(judgment, CARD, HEAD))
         lines = evidence.render(judgment, CARD, HEAD, parse_failures=2)
-        assert "解析失败: 2" in lines
+        assert lines[0] == "解析失败 2 条（坏事件 id: -）；无法确认槽位的最新证据"
+        named = evidence.render(
+            judgment, CARD, HEAD, parse_failures=2, parse_failure_ids=(7, 9)
+        )
+        assert named[0] == "解析失败 2 条（坏事件 id: 7,9）；无法确认槽位的最新证据"
+
+    def test_review_kind_out_of_domain_is_named(self) -> None:
+        """``review.kind`` 域外被 ``_latest`` 静默滤掉 → 报告点名该事件 id（返工 t_39c86400 P3）。"""
+        events = [
+            evidence.Event(
+                id=5,
+                kind="review",
+                payload={"kind": "defectt", "head_sha": HEAD, "verdict": "pass"},
+                run_id=101,
+                profile="pm",
+            )
+        ]
+        lines = evidence.render(evidence.judge(events, HEAD), CARD, HEAD, events=events)
+        assert (
+            "review kind 域外: 事件 id=5 kind='defectt'（不在 defect/regression 之一，已丢弃）"
+            in lines
+        )
+        # 良性 review 事件不出这一行（正常库里不留噪音）
+        good = [
+            evidence.Event(
+                id=6,
+                kind="review",
+                payload={"kind": "defect", "head_sha": HEAD, "verdict": "pass"},
+                run_id=101,
+                profile="pm",
+            )
+        ]
+        assert not any(
+            line.startswith("review kind 域外")
+            for line in evidence.render(evidence.judge(good, HEAD), CARD, HEAD, events=good)
+        )
 
 
 class TestCliAcceptance:
@@ -480,14 +515,22 @@ class TestCliAcceptance:
     def test_broken_payload_does_not_crash(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """库里一条坏 JSON：整次稽核照跑，报告里出「解析失败: 1」。"""
+        """四槽齐 + 一条坏 JSON：整次稽核照跑，但 **rc1** 且结论行点名坏事件 id。
+
+        返工 t_39c86400（P2）：旧实现四槽齐就 rc0 —— 同库的 ``merge_guard`` 证据闸门
+        对同一份库判「拒绝」，两个入口给出相反结论。「解析不了」不等于「没有证据」，
+        结论行必须点名是哪条事件（id=5 是追加的那条坏 payload）。
+        """
+
         rows = [*four_slots(), ("qa_pass", "{坏", 202)]
         board = make_board(tmp_path / "board.db", rows)
         rc, out, _err = self.run_cli(
             capsys, ["evidence", "audit", "--card", CARD, "--head", HEAD, "--db", str(board)]
         )
-        assert rc == 0
-        assert "解析失败: 1" in out
+        assert rc == 1
+        assert out.splitlines()[0] == (
+            "解析失败 1 条（坏事件 id: 5）；无法确认槽位的最新证据"
+        )
 
     def test_bare_evidence_without_subcommand_rc2(self, capsys: pytest.CaptureFixture[str]) -> None:
         """``evidence`` 后面不跟动词 → argparse rc2（子命令必填）。"""

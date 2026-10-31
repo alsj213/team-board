@@ -911,6 +911,134 @@ class TestJudgeOptionalKnobs:
         assert judgment.verdict == evidence.VERDICT_PASS
 
 
+class TestReviewVerdictDomain:
+    """review 槽 ``payload['verdict']`` 的取值域（返工 t_39c86400 P1）。
+
+    旧实现只比 ``== "block"``：缺 ``verdict`` 键、写 ``BLOCK``、写 ``Block`` 全被读成
+    通过（PASS）。判据：只有 ``pass`` 算通过、``block`` 算阻塞，**域外一律「缺证据」**。
+    """
+
+    @staticmethod
+    def _replaced(payload: dict[str, object]) -> list[evidence.Event]:
+        """把基线里 ``review:defect`` 那条换成给定的 payload（id/角色不变）。"""
+        events = base_events()
+        events[2] = evidence.Event(
+            id=3, kind="review", payload=payload, run_id=101, profile="pm"
+        )
+        return events
+
+    def test_missing_verdict_key_is_missing_evidence(self) -> None:
+        judgment = evidence.judge(
+            self._replaced({"kind": "defect", "head_sha": HEAD}), HEAD, PR
+        )
+        assert judgment.verdict == evidence.VERDICT_MISSING
+        assert states(judgment)["review:defect"] == evidence.SLOT_MISSING
+        assert judgment.missing == ("review:defect",)
+        assert "verdict" in judgment.detail
+
+    def test_uppercase_verdict_block_is_missing_evidence(self) -> None:
+        """``BLOCK`` 不在取值域里 —— 不许被读成阻塞，更不许被读成通过。"""
+        judgment = evidence.judge(
+            self._replaced({"kind": "defect", "head_sha": HEAD, "verdict": "BLOCK"}),
+            HEAD,
+            PR,
+        )
+        assert judgment.verdict == evidence.VERDICT_MISSING
+        assert states(judgment)["review:defect"] == evidence.SLOT_MISSING
+        assert "'BLOCK'" in judgment.detail
+
+    def test_titlecase_verdict_is_missing_evidence(self) -> None:
+        """``Block`` / ``Pass`` 混写同样域外（取值域是逐字比较，不做 casefold）。"""
+        for value in ("Block", "Pass", "pass ", "blocked"):
+            judgment = evidence.judge(
+                self._replaced({"kind": "defect", "head_sha": HEAD, "verdict": value}),
+                HEAD,
+                PR,
+            )
+            assert judgment.verdict == evidence.VERDICT_MISSING, value
+            assert states(judgment)["review:defect"] == evidence.SLOT_MISSING
+
+    def test_non_string_verdict_is_missing_evidence(self) -> None:
+        for value in (1, None, ["block"], True):
+            judgment = evidence.judge(
+                self._replaced({"kind": "defect", "head_sha": HEAD, "verdict": value}),
+                HEAD,
+                PR,
+            )
+            assert judgment.verdict == evidence.VERDICT_MISSING, value
+            assert states(judgment)["review:defect"] == evidence.SLOT_MISSING
+
+    def test_lowercase_block_still_blocks(self) -> None:
+        """域校验不得把基线行为改掉：``block`` 仍是「双问阻塞」。"""
+        judgment = evidence.judge(
+            self._replaced({"kind": "defect", "head_sha": HEAD, "verdict": "block"}),
+            HEAD,
+            PR,
+        )
+        assert judgment.verdict == evidence.VERDICT_BLOCKED
+        assert states(judgment)["review:defect"] == evidence.SLOT_BLOCKED
+
+    def test_lowercase_pass_still_passes(self) -> None:
+        judgment = evidence.judge(
+            self._replaced({"kind": "defect", "head_sha": HEAD, "verdict": "pass"}),
+            HEAD,
+            PR,
+        )
+        assert judgment.verdict == evidence.VERDICT_PASS
+
+
+class TestTierKeyCompleteness:
+    """tier 槽按 ``REQUIRED_KEYS["tier"]`` 三键齐（返工 t_39c86400 P2）。
+
+    旧实现只查 ``payload['tier']`` 的值：``{"tier":"B","head_sha":…}`` 缺 ``reason``
+    仍 PASS。判据：tier/reason/head_sha 三键缺一个就记「缺证据」。
+    """
+
+    @staticmethod
+    def _replaced(payload: dict[str, object]) -> list[evidence.Event]:
+        events = base_events()
+        events[0] = evidence.Event(
+            id=1, kind="tier", payload=payload, run_id=101, profile="pm"
+        )
+        return events
+
+    def test_tier_payload_without_reason_key_is_missing_evidence(self) -> None:
+        judgment = evidence.judge(
+            self._replaced({"tier": "B", "head_sha": HEAD}), HEAD, PR
+        )
+        assert judgment.verdict == evidence.VERDICT_MISSING
+        assert states(judgment)["tier"] == evidence.SLOT_MISSING
+        assert judgment.missing == ("tier",)
+        assert "缺键 reason" in judgment.detail
+        assert "tier/reason/head_sha" in judgment.detail
+
+    def test_tier_payload_without_head_key_is_missing_evidence(self) -> None:
+        """缺 ``head_sha`` 记「缺证据」（不是「证据对新 head 无效」）：缺键比绑错 head 更靠前。"""
+        judgment = evidence.judge(
+            self._replaced({"tier": "B", "reason": "常规改动"}), HEAD, PR
+        )
+        assert judgment.verdict == evidence.VERDICT_MISSING
+        assert states(judgment)["tier"] == evidence.SLOT_MISSING
+        assert "缺键 head_sha" in judgment.detail
+
+    def test_tier_three_keys_all_present_passes(self) -> None:
+        """三键齐的基线不受影响（钉住「三键齐」不误伤正常证据）。"""
+        judgment = evidence.judge(
+            self._replaced({"tier": "B", "reason": "常规改动", "head_sha": HEAD}), HEAD, PR
+        )
+        assert judgment.verdict == evidence.VERDICT_PASS
+        assert states(judgment)["tier"] == evidence.SLOT_OK
+
+    def test_tier_reason_key_present_but_tier_out_of_domain_still_missing(self) -> None:
+        """reason 补上了也不等于齐：档位取值域外照样「缺证据」（两道判据并存）。"""
+        judgment = evidence.judge(
+            self._replaced({"tier": "D", "reason": "常规改动", "head_sha": HEAD}), HEAD, PR
+        )
+        assert judgment.verdict == evidence.VERDICT_MISSING
+        assert states(judgment)["tier"] == evidence.SLOT_MISSING
+        assert "A/B/C" in judgment.detail
+
+
 class TestZeroIo:
     def test_module_does_not_import_io_modules(self) -> None:
         """零 IO 是契约：本模块不 import sqlite3 / subprocess，也不读环境变量。

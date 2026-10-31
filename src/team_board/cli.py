@@ -1428,9 +1428,10 @@ def _check_branch_for_command(branch: str) -> None:
     含空白 / 带 ``refs/`` 前缀三种输入各自的错误文案都在那里）。这里只把它的
     ``MergeGuardError`` 折成本子命令既有的 ``MergeAuditError`` 口径（stderr
     ``错误: …`` + rc2）。惰性 import：只在真要拼命令时才加载 ``merge_guard`` —— 它现在
-    连带依赖 ``db`` / ``prclaim`` / ``reviewhead``（认领与双问两道闸门），而 ``team-board``
-    的其余子命令（含 ``merge-record`` 的生成路径）都不需要这些。无循环导入：
-    ``merge_guard`` 只 import ``team_board.{db,prclaim,reviewhead,merges,model}``。
+    连带依赖 ``db`` / ``evidence`` / ``prclaim`` / ``reviewhead``（认领 → 证据状态机 → 双问
+    三道闸门），而 ``team-board`` 的其余子命令（含 ``merge-record`` 的生成路径）都不需要
+    这些。无循环导入：``merge_guard`` 只 import ``team_board.{db,evidence,prclaim,reviewhead,
+    merges,model}``。
     """
 
     from . import merge_guard
@@ -2004,8 +2005,10 @@ def _run_pr_claim_audit(args: argparse.Namespace) -> int:
 def _run_evidence_audit(args: argparse.Namespace) -> int:
     """``evidence audit`` 子命令：只读取数 + 调 :func:`evidence.judge`，不重写判定。
 
-    三个码的分工：0 四槽齐且全绑 ``--head`` / 1 判定不通过（缺证据、head 变了、
-    双问阻塞、缺老板点头、证据串卡、角色不符）/ 2 参数或环境错误（``--card`` /
+    三个码的分工：0 四槽齐且全绑 ``--head`` **且没有解析失败的事件** / 1 判定不通过
+    （缺证据、head 变了、双问阻塞、缺老板点头、证据串卡、角色不符）**或有事件的 payload
+    解析失败**（``Collection.parse_failures > 0``，结论行逐条点名坏事件 id —— 与
+    ``merge_guard`` 的证据闸门同一口径，返工 t_39c86400）/ 2 参数或环境错误（``--card`` /
     ``--head`` / ``--pr`` 形态非法、库不存在或不是合法 SQLite、没有 ``task_events``
     或 ``task_runs`` 表）。
 
@@ -2052,10 +2055,14 @@ def _run_evidence_audit(args: argparse.Namespace) -> int:
         head,
         parse_failures=collection.parse_failures,
         events=collection,
+        parse_failure_ids=collection.parse_failure_ids,
     )
     if not _write_stdout("\n".join(lines) + "\n"):
         return 2
-    return 0 if judgment.ok else 1
+    # 两侧口径一致（返工 t_39c86400 P2）：坏 payload > 0 一律 rc1，与
+    # ``merge_guard`` 的证据闸门同一判据 —— 「解析不了」不等于「没有证据」，
+    # 剩下的槽位再齐也不许 rc0（否则同库两个入口给出相反的结论）。
+    return 0 if judgment.ok and not collection.parse_failures else 1
 
 
 def _gh_pr_state(pr: int, repo: str, timeout: int) -> tuple[str | None, str]:
