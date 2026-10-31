@@ -99,6 +99,21 @@
   父目录不存在、body 文件不存在 / 是目录 / 无权限 / 非 UTF-8 / 空、stdout 编码表示
   不了中文）
 
+``evidence audit`` 子命令（只读，判一张卡的「四槽证据」齐不齐、绑不绑当前 head）：
+- 0：四槽（``tier`` / ``qa_pass`` / ``review:defect`` / ``review:regression``）齐全、
+  角色合法、全绑 ``--head``
+- 1：判定不通过 —— 缺证据 / 证据对新 head 无效 / 双问阻塞 / 缺老板点头 / 证据串卡 /
+  角色不符（判定一律交 :func:`team_board.evidence.judge`，本层不重写一遍）
+- 2：参数或环境错误（stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含
+  ``--card`` 不是 ``t_<8 位小写十六进制>``、``--head`` 不是 40/64 位小写十六进制
+  （39 位 / 大写 / 空白都不算）、``--pr`` 为 0 / 负数 / 13 位毫秒 / 非 ASCII 数字、
+  ``--db`` 不存在或不是合法 SQLite、库里没有 ``task_events`` / ``task_runs`` 表
+  （``evidence.EvidenceReadError``）、stdout 编码表示不了中文）
+- 报告行序：非 PASS 时先出结论行（缺证据时首行逐字 ``缺证据：<槽位>``）→ 表头
+  ``evidence audit card=<卡> head=<sha> verdict=<判定>`` → 四槽各一行 → 非必需槽位
+  （``spec_sign`` / ``impl_done`` / ``boss_approve`` 有才出，不参与 rc）→ 末行
+  ``missing: <逗号分隔槽位名>`` / ``missing: -``
+
 ``--subject`` 以 ``-`` 开头时（``-h`` / ``--fix …``），打印行改用
 ``--subject=<值>`` 形式：``shlex.quote('-h')`` 原样返回，``--subject -h`` 会被
 argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=value`` 形式的
@@ -124,6 +139,7 @@ from . import (
     commands,
     commits,
     db,
+    evidence,
     gatelog,
     merges,
     outputaudit,
@@ -209,7 +225,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十三个**子命令。
+    """建 CLI 前端：prog=team-board，共**十六个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -236,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
       认领 / 2 参数或环境错误），吃 ``--pr``（必填）/ ``--db``；
     - ``pr-review-head-audit``：判双问结论是否绑定该 head sha（0 绑定成立 / 1 缺证据 /
       2 参数或环境错误），只吃 ``--pr`` / ``--head``，**只读**（只发 ``gh api``）；
+    - ``evidence``：``evidence audit`` 判一张卡的四槽证据（0 四槽齐且绑该 head /
+      1 判定不通过 / 2 参数或环境错误），吃 ``--card`` / ``--head`` / ``--pr`` /
+      ``--db``，**只读**（``mode=ro`` 一条 SELECT）；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -610,6 +629,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SHA",
         help="要绑定的 head sha（40 或 64 位小写十六进制；41-63 位一律 rc2）",
+    )
+
+    evidence_cmd = subparsers.add_parser(
+        "evidence",
+        help="evidence 事件（四槽证据）只读稽核：audit 判「四槽齐不齐、是否绑当前 head」",
+    )
+    evidence_sub = evidence_cmd.add_subparsers(dest="evidence_command", required=True)
+    evidence_audit = evidence_sub.add_parser(
+        "audit",
+        help=(
+            "判一张卡的四槽证据（0 四槽齐且绑该 head / 1 判定不通过 / 2 参数或环境错误）"
+        ),
+    )
+    evidence_audit.add_argument(
+        "--card",
+        required=True,
+        default=None,
+        metavar="ID",
+        help="卡号（必须是 t_<8 位小写十六进制>，例 t_2ad370ff；其它形态 rc2）",
+    )
+    evidence_audit.add_argument(
+        "--head",
+        required=True,
+        default=None,
+        metavar="SHA",
+        help="要绑定的 head sha（40 或 64 位小写十六进制；39 位 / 大写一律 rc2）",
+    )
+    evidence_audit.add_argument(
+        "--pr",
+        default=None,
+        metavar="N",
+        help=(
+            f"被合并的 PR 号（1-{evidence.PR_MAX} 的 ASCII 十进制正整数；缺省不判 "
+            "impl_done 串卡，给了就必须合法，否则 rc2）"
+        ),
+    )
+    evidence_audit.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
     )
 
     serve = subparsers.add_parser(
@@ -1477,6 +1537,63 @@ def _run_pr_claim_audit(args: argparse.Namespace) -> int:
     return prclaim.exit_code(report)
 
 
+def _run_evidence_audit(args: argparse.Namespace) -> int:
+    """``evidence audit`` 子命令：只读取数 + 调 :func:`evidence.judge`，不重写判定。
+
+    三个码的分工：0 四槽齐且全绑 ``--head`` / 1 判定不通过（缺证据、head 变了、
+    双问阻塞、缺老板点头、证据串卡、角色不符）/ 2 参数或环境错误（``--card`` /
+    ``--head`` / ``--pr`` 形态非法、库不存在或不是合法 SQLite、没有 ``task_events``
+    或 ``task_runs`` 表）。
+
+    rc2 时 stdout **一个字节都不写**（参数与取数都在拼报告之前完成，文案走 stderr 一行
+    ``错误: …``，不冒 traceback）；判定一律交给 ``evidence.judge``，本函数只做参数
+    校验、取数、渲染三件事。
+    """
+
+    card = args.card
+    if evidence.CARD_RE.fullmatch(card) is None:
+        _write_stderr_error(
+            f"--card 非法：{card!r}（应为 t_<8 位小写十六进制>，例 t_2ad370ff）"
+        )
+        return 2
+    head = args.head
+    if evidence.HEAD_RE.fullmatch(head) is None:
+        _write_stderr_error(
+            f"--head 非法：{head!r}（应为 40 或 64 位小写十六进制的提交 sha）"
+        )
+        return 2
+    pr: int | None = None
+    if args.pr is not None:
+        try:
+            pr = prclaim.parse_pr(args.pr)
+        except prclaim.ClaimAuditError as exc:
+            _write_stderr_error(str(exc))
+            return 2
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        collection = evidence.collect(conn, card)
+    except (db.BoardError, evidence.EvidenceReadError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    judgment = evidence.judge(collection, head, pr)
+    lines = evidence.render(
+        judgment,
+        card,
+        head,
+        parse_failures=collection.parse_failures,
+        events=collection,
+    )
+    if not _write_stdout("\n".join(lines) + "\n"):
+        return 2
+    return 0 if judgment.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1507,6 +1624,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pr-claim-audit":
         return _run_pr_claim_audit(args)
+
+    if args.command == "evidence":
+        return _run_evidence_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)
