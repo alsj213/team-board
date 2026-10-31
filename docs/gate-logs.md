@@ -6,8 +6,8 @@
 
 ## 0. 为什么要有 gate
 
-需求卡 `t_023f2827` 的契约给的原话：一张 QA 卡单次上下文 15.6 万 tok 里，130KB 是 terminal
-输出；全量落盘后上下文只收判定值。gate 就是把这句落地的包装器 —— 它不判定检查器过没过，
+需求卡 `t_023f2827` 的契约给的原话：一张 QA 卡单次上下文 15.6 万 tok 里，terminal 输出 **60 次共
+130KB**；全量落盘后上下文只收判定值。gate 就是把这句落地的包装器 —— 它不判定检查器过没过，
 只负责「全量进文件、摘要进上下文」。本节的数字出自该契约，**不是**本文档自己测的。
 
 ## 1. 命令签名
@@ -51,7 +51,8 @@ stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: er
    `…/team-board/src/team_board/gatelog.py`；外层 `…/tb-wt/t_facc5c45/src` →
    `…/tb-wt/t_facc5c45/src/team_board/gatelog.py`。
 2. **解释器写绝对路径**。`.venv` 在 checkout 根目录**不保证存在**：`t_eaa81611` 根目录就没有
-   （个别 worktree 有，2026-10-31 当日 29 个里 6 个），所以下面外层跑 `gate` 与 `--` 之后跑检查器，
+   （个别 worktree 有：2026-10-31 14:14 CST 当日实跑，`/home/liu/project/tb-wt` 下 41 个里 6 个有
+   `.venv`），所以下面外层跑 `gate` 与 `--` 之后跑检查器，
    都用 `/home/liu/project/team-board/.venv/bin/python`。照抄 `.venv/bin/python` 在没有 `.venv`
    的 checkout 里会得到 `No such file or directory`、rc=127（2026-10-31 实测）。
 3. **cwd = 本卡 worktree**，不是主 checkout。日志本身合法不代表验的是本卡：在主 checkout 里
@@ -75,9 +76,9 @@ stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: er
 ### 三个可复制样例（pytest / ruff / body-audit）
 
 把 `t_facc5c45` 换成自己那张卡的卡号、`cd` 换成本卡的 worktree，**三处一起换**（卡号、`cd`、
-`PYSRC`；只换卡号不改 cwd 就是前置第 3 条的假证据）。下面是 2026-10-31 CST 在**本卡 worktree**
-`/home/liu/project/tb-wt/t_facc5c45` 里的本机实跑原文，摘要逐字照贴（`log:` 指向该 worktree
-的 `evidence/`）。三个样例共用下面四行环境准备（`PYSRC` 写绝对路径，理由见前置第 4 条）：
+`PYSRC`；只换卡号不改 cwd 就是前置第 3 条的假证据）。下面是 2026-10-31 14:14–14:17 CST 在**本卡
+worktree**`/home/liu/project/tb-wt/t_facc5c45` 里的同一轮本机实跑原文，摘要逐字照贴（`log:` 指向
+该 worktree 的 `evidence/`）。三个样例共用下面四行环境准备（`PYSRC` 写绝对路径，理由见前置第 4 条）：
 
 ```
 $ cd /home/liu/project/tb-wt/t_facc5c45                  ← 换成你自己卡的 worktree
@@ -97,7 +98,7 @@ counts: passed=49 failed=0 error=0 skipped=0
 失败行（0/0，≤20）:
 末尾行（2/2，≤20）:
   .................................................                        [100%]
-  49 passed in 14.03s
+  49 passed in 5.36s
 log: /home/liu/project/tb-wt/t_facc5c45/evidence/pytest-t_facc5c45.log
 ```
 
@@ -128,13 +129,10 @@ card: t_facc5c45
 exit: 1
 counts: 未解析
 失败行（0/0，≤20）:
-末尾行（20/292，≤20）:
-    t_9515987a  done       pm         1067  ok
-    t_f51328fe  done       pm         1025  ok
-    t_b42125ae  todo       pm         1014  ok
+末尾行（20/338，≤20）:
     t_e0866bd4  done       ops        1008  ok
     t_216a3cf7  done       qa          963  ok
-    t_a5b444fc  running    qa          959  ok
+    t_a5b444fc  done       qa          959  ok
     t_9abe2b3b  done       pm          951  ok
     t_f0a27fe4  done       pm          944  ok
     t_facc5c45  done       engineer    929  ok
@@ -142,19 +140,24 @@ counts: 未解析
     t_472f2d63  done       engineer    876  ok
     t_341e9163  done       pm          874  ok
     t_5158a9e8  done       pm          861  ok
+    t_958b2a89  running    pm          846  ok
+    t_cbed201b  running    pm          846  ok
     t_bd5e3f2b  done       pm          773  ok
     t_efe6f4aa  done       pm          772  ok
     t_c8465af4  done       pm          738  ok
     t_985dbba8  done       pm          726  ok
     t_f487b347  done       pm          336  ok
+    t_e1578f19  blocked    pm          124  ok
     t_c3ec3d54  done       pm           90  ok
   超限清单（142 张）：t_f43fa954 t_df640caa t_c836202a t_f3a4fb31 t_41195fb3 t_51f5fad0 t_705687b9 t_4dbf3ae2 t_025de8fe t_069dff27 t_0630a104 t_c9f5866a t_bbeab29f t_3e2a3582 t_991ae40f t_bb6600d8 t_6d5fcf9d t_416057c4 t_5dcafcc7 t_d558ed1e t_b5fde972 t_86f4ab63 t_1e795562 t_ec05d75d t_18713037 t_7ec9e801 t_66c5bac9 t_bbdb794a t_11ef8cf3 t_27daff67 t_86bc3d77 t_f27fbe62 t_12a95eed t_aed80ce3 t_1b200562 t_406be0e8 t_8886ae85 t_631b3f59 t_8f6d5e62 t_9c7f4103 t_927ebb83 t_d2e53461 t_a867da93 t_55009247 t_38509317 t_daba51a7 t_a847ee8f t_68b0a37a t_ecfebe60 t_b78582d0 t_38895c77 t_6b5564aa t_e4656674 t_5d631291 t_e8523c7b t_d22c6399 t_e1cffdca t_7605bfde t_0f09a2b9 t_322e3086 t_8fdc0fbe t_37a51cf3 t_02ad8064 t_cf6bea8e t_8d3291e8 t_0c70c181 t_bd1ced18 t_c07fc14f t_dab6af03 t_668b1909 t_244c0f44 t_1b4d66ff t_2df659ad t_c4302856 t_3e9448f7 t_589cc33a t_c0b674f7 t_3ff92267 t_67cd6c50 t_06c7b458 t_eeefcd01 t_7623a70a t_5154323b t_c6e1f623 t_ce436613 t_c51b7da5 t_476de4a5 t_ad5e7ff6 t_ea915a70 t_c34fbc5e t_8f1ef2f4 t_b9e29152 t_d5149e95 t_35eb0568 t_3700f2a2 t_50013602 t_4b9d456d t_59be4c53 t_90ee3bb7 t_b43ab8a5 t_a8c95560 t_a0ceb572 t_a5c2f894 t_270b9cbf t_4e0e8df4 t_11587ce8 t_58ecad09 t_63785d45 t_2001f0c2 t_dfdbf806 t_ceea0ac2 t_ab3f9b30 t_2e0098fe t_c9787079 t_24015d59 t_439d06bf t_da18937f t_f1e56147 t_e32041c1 t_09100683 t_59c0eae1 t_98ce4cf7 t_9d27934d t_ad16e55a t_c9148b7c t_24e43d1a t_29fbd64c t_d637dca6 t_17550b03 t_40fa5375 t_0b2fd9a3 t_c4ce9108 t_f37aecba t_1b965ab5 t_6a97c910 t_6efb3105 t_6fab0d6e t_90c4f66d t_a65d7674 t_5a465efb t_d804b545 t_946b6472
 log: /home/liu/project/tb-wt/t_facc5c45/evidence/body-audit-t_facc5c45.log
 ```
 
-注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算（当日 `合计：278 张；超限：142 张`）；
-**不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：当日 18 张、超限 0 张）时 rc=0 ——
-两者都是 rc 原样透传。上面与这里的数字是 **2026-10-31 CST 当日快照**，真板卡数会漂移，复跑以当场输出为准。
+注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算（同日 `合计：324 张；超限：142 张`）；
+**不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：同日 `合计：37 张；超限：0 张`、
+`末尾行（20/51）`）时 rc=0 ——两者都是 rc 原样透传。上面与这里的数字是
+**2026-10-31 14:14 CST 当日实跑**；真板卡数会漂移，复跑以当场输出为准（拿旧数字对不上当场输出
+就是漂移，不是证据）。
 **别整行贴「超限清单」**：它是**单行**、随卡数线性增长（实测 142 张 = 1590 字节 ≈ 11.2 字节/卡），
 卡再多几百张就顶到 8192 的单条上限（§4 第 5 条）。卡上只贴到「末尾行」节，或把该行截成
 `超限清单（142 张）：t_f43fa954 …` 再给 `log:` 路径。
@@ -208,29 +211,32 @@ $ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名
 - **名字形态在落盘之前校验**（唯一判据 `team_board.gatelog.log_filename`）：`--gate a/b`、
   空串、`--card t_XYZ` 一律 rc2 且**不产生文件** —— 路径分隔符必须在拼路径之前被拦住，
   否则一次 `--gate a/b` 就会在日志目录下造出子目录。
-- **落盘内容**：子命令的 stdout 与 stderr **合流**（`stderr=subprocess.STDOUT`），先按**解释器的文本
-  编码**解码（`subprocess.run(..., text=True, errors="replace")`），再以 UTF-8 写文件
-  （`gatelog.write_log` 里 `encoding="utf-8"`）。三条边界：
-  - **默认就是 UTF-8**，但来源有两个，**都不是**「Python 3.7+ 的 UTF-8 mode 默认开」：① locale 本身
-    是 UTF-8（本机 `LANG=C.UTF-8`，`sys.flags.utf8_mode == 0`）；② locale 是 `C`/POSIX 时 **PEP 538**
-    把 C locale 协同成 `C.UTF-8`，并借 **PEP 540** 打开 UTF-8 mode —— 实测 `LC_ALL=C` 下
-    `sys.stdout.encoding == 'utf-8'`、`sys.flags.utf8_mode == 1`。UTF-8 mode **默认开**要到
-    **PEP 686 / Python 3.15**（PEP 原文 `Python will enable UTF-8 mode by default from Python 3.15`）；
-    本机解释器是 3.14.7，仍靠上面两条。两条任一成立时，检查器输出的**非 ASCII 字节**不被替换为
-    `U+FFFD`；**但换行符会被规范化** —— `subprocess.run(..., text=True)` 隐含 universal newlines，
-    CRLF（`0d 0a`）与单独 CR（`0d`）落盘时都变成 LF（`0a`），**日志不是逐字节原件**。实测（本卡
-    worktree）：`gate --gate rep-pm1 --card t_b42125ae -- /bin/sh -c 'printf "a\r\nb\r\n"'` → rc0、
-    摘要 `末尾行（2/2，≤20）:` 下两行 `a` / `b`，日志 `evidence/rep-pm1-t_b42125ae.log` 的
-    `od -An -tx1` 是 `61 0a 62 0a`（4 字节），而子命令真正发出的字节是 `61 0d 0a 62 0d 0a`（6 字节，
-    `od -An -tx1 <(printf 'a\r\nb\r\n')`）—— 差的 2 个 `0d` 就是被规范化掉的 CR；
-  - **显式 `PYTHONUTF8=0` / `-X utf8=0` 且 locale 非 UTF-8**（例 `LC_ALL=C`，实测 `-X utf8=0` 下
-    `sys.stdout.encoding == 'ascii'`）时解码用 `ascii`，非 ASCII 字节全变 `U+FFFD` —— 实测
-    `printf '中文ok\n'` 落成 `ef bf bd`×6 + `ok`；此时 gate 自己的 stdout 也编不出中文摘要，
-    **必然 rc2**（摘要恒含中文，不是「多以」）—— `PYTHONIOENCODING=ascii` 与 `PYTHONUTF8=0 LC_ALL=C`
-    两次实测都是 rc2、stderr 恰一行 `错误: 当前 stdout 编码 'ascii' 无法表示输出里的中文…`，而日志
-    在退出**之前**已写好（两次都留下 3 字节 `hi\n`）—— 读到 U+FFFD 先看卡上 rc 是不是 2，别当
-    检查器的输出坏了；
-  - 检查器输出里的**非 UTF-8 字节**同样替换为 `U+FFFD`，不截断。
+- **落盘内容**：子命令的 stdout 与 stderr **合流**（`stderr=subprocess.STDOUT`），stdin 固定
+  `/dev/null`（`stdin=subprocess.DEVNULL`），输出按**固定 `utf-8` + `errors="replace"`** 解码
+  （`subprocess.run(..., text=True, encoding="utf-8", errors="replace")`），再以 UTF-8 写文件
+  （`gatelog.write_log` 里 `encoding="utf-8"`）。四条边界：
+  - **stdin 是 `/dev/null`，不是调用方的管道 / tty**：读 stdin 的检查器立刻拿到 EOF，不会挂住。
+    实测（本卡 worktree）`printf 'hi from pipe\n' | … gate --gate stdin2 --card t_facc5c45 -- /bin/cat`
+    → rc0、摘要只有 `gate:` / `card:` / `exit:` / `counts:` / `log:`（零非空行，没有「末尾行」一节）、
+    日志 `evidence/stdin2-t_facc5c45.log` **0 字节** —— 管道里的 `hi from pipe` 一个字节都没进日志。
+  - **非 UTF-8 字节一律变 `U+FFFD`，与 locale / `PYTHONUTF8` / `PYTHONIOENCODING` 无关，也不截断**：
+    解码源是写死的 `utf-8`，不是解释器的文本编码，所以同样的字节在任何 locale 下落盘结果都相同。
+    实测同一子命令 `/usr/bin/printf '\377\376ok\n'`（真发 `ff fe 6f 6b 0a`）：默认 locale 与
+    `LC_ALL=C PYTHONUTF8=0` 两次日志的 `od -An -tx1` 完全相同 —— `6f 6b 0a` 之前是 2 个替换符
+    （`U+FFFD` 的 UTF-8 编码），字节级一致；差别只在 rc：前者 rc0（子命令 rc 透传），后者 rc2
+    （原因见本条最后一项，是 gate 自己的 stdout 编不出中文，与日志字节无关）。所以**日志里有替换符
+    不能反推 rc** —— 它只说明被包装命令吐了非 UTF-8 字节，rc 照 §3 那套走。
+  - **换行符会被规范化** —— `text=True` 隐含 universal newlines，CRLF（`0d 0a`）与单独 CR（`0d`）
+    落盘时都变成 LF（`0a`），**日志不是逐字节原件**。实测（本卡 worktree）：
+    `gate --gate nl --card t_facc5c45 -- /usr/bin/printf 'a\r\nb\r\n'` → rc0、
+    摘要 `末尾行（2/2，≤20）:` 下两行 `a` / `b`，日志 `evidence/nl-t_facc5c45.log` 的
+    `od -An -tx1` 是 `61 0a 62 0a`（4 字节），而子命令真正发出的字节是 `61 0d 0a 62 0d 0a`（6 字节）——
+    差的 2 个 `0d` 就是被规范化掉的 CR；
+  - **locale 只影响 gate 自己的 stdout，不影响日志字节**：`PYTHONIOENCODING=ascii`（或
+    `LC_ALL=C PYTHONUTF8=0`）把 `sys.stdout` 压成 ascii，而摘要恒含中文 → gate 自身 **rc2**、
+    stderr 恰一行 `错误: 当前 stdout 编码 'ascii' 无法表示输出里的中文…`。此时日志**在退出之前
+    已经写好**：实测 `printf '中文ok\n'` 在上述两种环境下 rc 都是 2，日志 `od -An -tx1` 都是
+    `e4 b8 ad e6 96 87 6f 6b 0a`（就是 `中文ok\n`，没有任何替换符）。
   跨流的严格时序**不保证** —— 合流只保证同一个 fd 上的先后，子进程自己的
   stdout 缓冲会让两流相对顺序与程序逻辑顺序不同。
 - **命令起不来时不写日志**：没有输出可落，日志目录也不会被创建。
@@ -330,8 +336,9 @@ log: <日志文件的绝对路径>
    （JSON dump、长 lint 行、`body-audit --all` 的超限清单单行）时摘要**自己**就超 8192，
    照第 1 条贴照样违规。实测一条 200000 字符的单行：摘要与日志**各约 200 KB**（摘要总共才 8 行）。
    **这两个数别照抄**：它们只是**当次实测**，随命令输出量与 `log:` 路径长度漂移 —— 同一条命令
-   只把 `--log-dir` 换成更长的目录名，摘要字节数就等量跟着变（实测 `/tmp/a1` 200154 字节 vs
-   `/tmp/a1234567890` 200163 字节，目录名长 9 字节、摘要也长 9 字节）。复跑以当场 `wc -c` 为准：
+   只把 `--log-dir` 换成更长的目录名，摘要字节数就等量跟着变（2026-10-31 14:18 CST 实跑：
+   `/tmp/a1` 200144 字节 vs `/tmp/a1234567890` 200153 字节，目录名长 9 字节、摘要也长 9 字节；
+   日志两次都是 200001 字节）。复跑以当场 `wc -c` 为准：
    先量再贴，摘要 `| wc -c` 超 8192 就只贴 `log:` 路径 + `sed -n '<a>,<b>p' <日志>` 取段；
 5. 同一条边界也管**评论 / `tasks.result` 本身**：UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
    全文贴法一超就违规。这一条由 `output-audit` 子命令**机器判定**（已合入 `main`，实现在
@@ -382,7 +389,7 @@ log: <日志文件的绝对路径>
 | 通过 | `pytest tests/unit/test_gatelog.py -q` | 0 |
 | 通过 | `ruff check src tests` | 0 |
 | 通过 | `mypy src` | 0 |
-| 有历史存量 | `body-audit --all` | 1（`counts: 未解析`，`末尾行（20/292）`，142 张超限） |
+| 有历史存量 | `body-audit --all` | 1（`counts: 未解析`，`末尾行（20/338）`，142 张超限） |
 | 失败透传 | `pytest` 一个必失败用例 | 1（`counts: passed=0 failed=1`） |
 | 透传 2 | `/bin/sh -c 'echo hi; exit 2'` | 2（有摘要、无 stderr） |
 | 被信号杀 | `/bin/sh -c 'kill -9 $$'` | 137（`128 + 9`，摘要里不带负数） |
