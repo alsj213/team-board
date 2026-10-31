@@ -284,8 +284,12 @@ NUMSTAT_BINARY_PREFIX = "-\t-\t"
 
 #: ``--numstat`` 的一行：``<added|->\t<deleted|->\t<path>``。
 #: 注意 ``git diff --numstat -U0``（git 2.34.1 实测）会把 numstat 行**接着**打一份完整
-#: patch 出来（``-U<n>`` 本身隐含 -p），所以只能按行筛 numstat，不能整段当路径用。
+#: patch 出来（``-U<n>`` 本身隐含 -p），所以只能从混排流里先切出 numstat 段，
+#: 不能整段当路径用，也不能只按行筛（见 :func:`_numstat_rows`）。
 NUMSTAT_ROW_RE = re.compile(r"(?:[0-9]+|-)\t(?:[0-9]+|-)\t.*", re.ASCII)
+
+#: 混排输出里 patch 段的起始行前缀（``--numstat`` 之后紧跟的整份 patch）。
+PATCH_SECTION_PREFIXES = ("diff --git ", "diff --cc ", "diff --combined ")
 
 
 class PatchIdError(Exception):
@@ -380,6 +384,37 @@ def _expect_and_get(
     return proc
 
 
+def _numstat_rows(raw: str, label: str) -> list[str]:
+    """从 ``diff --numstat -U0`` 的混排输出里只取 numstat 段。
+
+    git 2.34.1 实测：``git diff --numstat -U0`` 的 stdout = numstat 行 + 空行 + 一整份
+    patch（``-U<n>`` 本身隐含 ``-p``；``--numstat -U0 --no-patch`` 会把 numstat 一起关掉，
+    不可用）。patch 正文的删除行本身就长成 ``-\\t5\\tghost`` / ``-\\t-\\tpayload``，逐行按
+    :data:`NUMSTAT_ROW_RE` 筛会把它当成 numstat 行 —— 后果是纯文本 diff 被报成
+    ``kind="binary"``、``paths`` 混进正文碎片。所以先按第一个 ``diff --git`` 行切段，
+    再在 numstat 段内逐行校验：段里出现解析不了的行 = 格式不认识，fail-closed 抛
+    :class:`PatchIdError`，不猜。
+    """
+
+    lines = raw.splitlines()
+    boundary = len(lines)
+    for index, line in enumerate(lines):
+        if line.startswith(PATCH_SECTION_PREFIXES):
+            boundary = index
+            break
+    rows = [line for line in lines[:boundary] if line.strip()]
+    if not rows:
+        raise PatchIdError(
+            f"{label} 有输出但解析不出 numstat 行（按取不到明细处理，不猜）"
+        )
+    for line in rows:
+        if NUMSTAT_ROW_RE.fullmatch(line) is None:
+            raise PatchIdError(
+                f"{label} 的 numstat 段有解析不了的行（不猜）: {line[:120]!r}"
+            )
+    return rows
+
+
 def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
     """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（``FINGERPRINT_ALGO``）。
 
@@ -407,14 +442,8 @@ def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
     )
     if not numstat_raw.strip():
         return Fingerprint(kind="empty", value=None, merge_base=merge_base, paths=())
-    # 只取 numstat 行（同一条命令的 stdout 后面还跟着一份完整 patch，见 NUMSTAT_ROW_RE）
-    lines = [
-        line for line in numstat_raw.splitlines() if NUMSTAT_ROW_RE.fullmatch(line)
-    ]
-    if not lines:
-        raise PatchIdError(
-            f"{numstat_label} 有输出但解析不出 numstat 行（按取不到明细处理，不猜）"
-        )
+    # 同一条命令的 stdout 里 numstat 段后面还跟着一整份 patch，先切段再逐行校验
+    lines = _numstat_rows(numstat_raw, numstat_label)
     paths = tuple(line.split("\t")[-1] for line in lines)
     if any(line.startswith(NUMSTAT_BINARY_PREFIX) for line in lines):
         return Fingerprint(
