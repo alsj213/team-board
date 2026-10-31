@@ -589,12 +589,24 @@ python3 -m team_board.merge_guard \
      逻辑与 `team-board pr-claim-audit` 同源（`prclaim.audit` / `Report.sole_claim_id`），
      本工具不复制正则。三种拒绝文案一眼可分：`无未结卡认领该 PR` / `重复认领`（附卡号
      清单） / `认领卡 <id> ≠ --card <card>`。这一步一次 gh 都不调。
-  2. **双问绑定 head sha（R18④）**：用 `--pr` 与预检读到的 `headRefOid` 调
-     `reviewhead.fetch_bodies` / `analyze`（与 `team-board pr-review-head-audit` 同源），
-     要求该 sha 上 `defect` + `regression` 各 ≥1 条 `REVIEW-HEAD` / `REVIEW-KIND` 标记。
+  2. **双问绑定内容指纹（R18④）**：`ensure_pr_refs` 一次 `git fetch` 把远端 base 与
+     `--branch` 抓进私有 ref `refs/merge-guard/<pr>/{base,head}`（与后面的 rebase 闸门共用这
+     一份，判定顺序不变），随后 `git rev-parse refs/merge-guard/<pr>/head` 必须仍等于预检读到
+     的 `headRefOid` —— 对不上就是「预检之后分支被推送」→ rc2、一个 gh 调用都不发。然后算
+     「merge-base → head」的**内容指纹**（`git diff -U0` 内容行 sha256 前 40 位，算法 / 实测表 /
+     贴法见 `docs/review-patch.md`），用 `--pr` 调 `reviewhead.fetch_bodies` / `analyze`
+     （与 `team-board pr-review-head-audit` 同源），要求该指纹上 `defect` + `regression`
+     各 ≥1 条 `REVIEW-PATCH` / `REVIEW-KIND` 标记（历史 `REVIEW-HEAD` 按内容复用，同文第五节）。
      只发两条 `gh api GET`（`pulls/<n>/reviews` + `issues/<n>/comments`，`--paginate`）。
-     三种拒绝文案：`双问缺证`（一条标记都没有） / `双问陈旧`（有标记但都不是当前 head，
-     head 变了没重跑双问） / `双问缺类`（当前 head 上缺某一类，附缺的类）。
+     **判的是内容不是 sha**：纯 rebase / 上游在别处改动 → 指纹不变、旧结论照用；内容任何改动
+     （**含只改缩进、行尾空格**）→ 指纹变、结论失效。四种拒绝文案：`双问缺证`（一条标记都
+     没有） / `双问陈旧`（有标记但都不是当前内容，内容变了没重跑双问） / `双问缺类`（当前内容
+     上缺某一类，附缺的类） / `双问不可复用`（分支含二进制文件，或相对 base 无差异 —— 这两种
+     算不出可比内容，不许当 PASS）。PASS 行形如 `双问绑定 | PASS | <fetch 命令> | rc=0 |
+     内容指纹 <前 12 位> 上 defect + regression 各 >=1 条（head <sha12>，扫描正文 N 条、
+     带标记 M 条）`；本机实跑一条（真 git + 假 gh，本地 bare 仓当远端，`#900` 是假号）：
+
+     双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/900/reviews --paginate + gh api repos/alsj213/team-board/issues/900/comments --paginate | rc=0 | 内容指纹 64c73bcd6d67 上 defect + regression 各 >=1 条（head 26950f69bad1，扫描正文 2 条、带标记 2 条）
      **取数前先核对仓库**：`reviewhead` 的 `gh api` 路径前缀写死 `alsj213/team-board`、不看
      `--repo`，所以闸门先读 `git config --get remote.<name>.url`（配置里的原始 URL，不是被
      `insteadOf` 改写后的 `git remote get-url` 结果）解析 `owner/name` 与它比对；不一致 /
@@ -1168,9 +1180,11 @@ GAP t_9f000002 [running] engineer 触发=合并卡 首行=目标：…
 （注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
 `output-audit` 与 `body-audit` 同口径：`0` 无超限 / `1` **发现**超限的评论或 result /
 `2` 参数或环境错误；详见上面「输出上限稽核（output-audit）」一节。
-`pr-review-head-audit` 同理：`1` 表示**该 head 上双问不齐**
-（缺一类 / 两类都缺 / 只有别的 sha 的标记 = head 变过没重跑）、`2` 表示参数或环境
-错误（`--head` 非 40/64 位小写十六进制、`--pr` 非正整数、`gh api` 调用失败）。
+`pr-review-head-audit` 同理：`1` 表示**该内容指纹上双问不齐**（缺一类 / 两类都缺 /
+标记都指向别的内容 = 内容变了没重跑 / head 对象取不到 / 算不出可比内容 —— 分支含二进制
+文件或相对 base 无差异）、`2` 表示参数或环境错误（`--head` 非 40/64 位小写十六进制、
+`--pr` 非正整数、`--base` 解析不到、`--repo` 不是 git 工作树、`gh` / `git` 调用失败）。
+标记写法、指纹算法与实测见 `docs/review-patch.md`。
 
 ## 口径
 
