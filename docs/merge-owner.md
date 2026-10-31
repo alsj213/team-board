@@ -55,9 +55,10 @@ PR #49 MERGED
 
 ## 退出码（三档，各一条本机真跑）
 
-下面每条都在 /home/liu/project/tb-wt/t_e12888d4（含本命令的代码，`fffdcba`）实测于
-2026-10-31 11:50 CST，原始输出见附件 `t_20b036e1-samples.log`。**看板状态会变，换张卡复跑
-口径不变，rc 可能变**。
+下面每条实测于 2026-10-31 11:57 CST，原始输出见附件 `t_20b036e1-samples.log`。跑的位置是
+**E2 分支的 worktree `/home/liu/project/tb-wt/t_e12888d4`（PR #59 head `fffdcba`）** —— 本卡
+PR 只改文档，本分支里没有该子命令的代码；`#59` 合并后同样的命令在主仓根目录直接可跑。
+**看板状态会变，换张卡复跑口径不变，rc 可能变**。
 
 `0` —— 没有 PR / 全部有归属（`MERGED`、`CLOSED`、`CLAIMED`、`EXEMPT`）/ 降级放行：
 
