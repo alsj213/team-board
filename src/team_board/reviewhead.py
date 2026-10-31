@@ -30,6 +30,7 @@ rc2 一律在取数阶段抛出 :class:`ReviewHeadError`，所以 stdout 一个�
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess  # nosec B404
 from collections.abc import Iterable, Sequence
@@ -269,9 +270,47 @@ def fetch_bodies(pr: int) -> tuple[str, ...]:
 # - 二进制**判不了**：patch-id 只哈希 ``Binary files a/x and b/x differ`` 这一行，
 #   两个不同的 blob 得到同一个 id。所以见到二进制就返回 ``kind="binary"`` 让上层
 #   拒绝复用证据，不许当成「内容没变」。
+# - **空白**：默认档（``FINGERPRINT_ALGO``）的 patch-id 会把空白规范化掉，本 PR 已
+#   改过的那一行只改缩进会得到同一个 id —— 所以返回值的 ``algo`` 必须一起看：
+#   ``algo="patch-id-U0-v1"`` 时「同指纹 ≠ 内容相同（空白类改动看不见）」，报告行要
+#   带出 ``FINGERPRINT_LEGACY_CAVEAT``。``git patch-id --verbatim`` 可用时（探针
+#   :func:`patch_id_supports_verbatim`，判据是 rc 不是版本号）走空白敏感档
+#   ``algo="patch-id-U0-verbatim-v1"``。
+# - **git 配置**：两次 diff 都钉 :data:`DIFF_CONFIG_PIN` + ``--no-renames``，
+#   ``patch-id`` 钉 ``patchid.verbatim``，所以 ``diff.renames`` / ``core.quotePath`` /
+#   ``color.ui`` 这些仓库配置都不许改变指纹或 ``paths`` 的字面（非 ASCII 名给真名字）。
 
 #: 指纹算法标识（报告行必须引用它；换算法 = 换这个字符串）
 FINGERPRINT_ALGO = "patch-id-U0-v1"
+
+#: 空白敏感的那一档标识：``git patch-id --verbatim`` 可用时才启用（见 :func:`patch_id_supports_verbatim`）
+FINGERPRINT_ALGO_VERBATIM = "patch-id-U0-verbatim-v1"
+
+#: ``algo == FINGERPRINT_ALGO`` 时必须随指纹一起带出的盲区说明（报告行原样引用）
+#:
+#: 旧档 patch-id 会把空白规范化掉：**本 PR 已改过的那一行**只改缩进（8 空格 → 12 空格）
+#: 会得到同一个 patch-id。所以「同指纹」只说明非空白内容相同，不许据此复用证据
+#: （本机 git 2.34.1 实测：两个分支只差已改行的缩进，patch-id 同为
+#: ``d8a66f86f17670d741a6c2ad5d0aa8577f31e382``）。
+FINGERPRINT_LEGACY_CAVEAT = (
+    f"algo={FINGERPRINT_ALGO}：同指纹 ≠ 内容相同（空白类改动看不见），"
+    "消费方不得据此复用证据"
+)
+
+#: 两次 diff 都钉死的配置（前缀，必须放在 ``diff`` 子命令之前）：
+#:
+#: - ``diff.renames=false`` + ``--no-renames``：rename 一律拆成 delete + add，
+#:   指纹不再取决于调用方仓库里的 ``diff.renames`` 开关（``-c`` 压过配置文件，
+#:   ``--no-renames`` 压过命令行默认）；
+#: - ``core.quotePath=false``：非 ASCII 路径在 numstat / patch 里给**真名字**
+#:   （默认会写成 ``"\\344\\270\\255…"`` 的 C 转义）。真·非 UTF-8 名字仍是
+#:   :class:`PatchIdError`（下游严格按 UTF-8 解码）。
+DIFF_CONFIG_PIN = (
+    "-c",
+    "diff.renames=false",
+    "-c",
+    "core.quotePath=false",
+)
 
 #: 单次 git 调用的硬超时（秒）：一次卡住的 git 不许把整张卡拖到 worker 超时
 GIT_TIMEOUT_SECONDS = 120
@@ -291,6 +330,27 @@ NUMSTAT_ROW_RE = re.compile(r"(?:[0-9]+|-)\t(?:[0-9]+|-)\t.*", re.ASCII)
 #: 混排输出里 patch 段的起始行前缀（``--numstat`` 之后紧跟的整份 patch）。
 PATCH_SECTION_PREFIXES = ("diff --git ", "diff --cc ", "diff --combined ")
 
+#: git 子进程环境里**必须摘掉**的键（「指向别处」类）：
+#: 留着就会让「在 B 仓算指纹」被静默搬到 A 仓上去算 —— 结果看着正常，算的是另一个仓。
+GIT_ENV_STRIP_EXACT = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_CONFIG_COUNT",
+    }
+)
+
+#: 同上，按前缀摘：``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 成对注入 git 配置
+GIT_ENV_STRIP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+#: 「按提交 sha 算指纹」时 sha 的形态：40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径）
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+
 
 class PatchIdError(Exception):
     """git 侧失败（缺 git / 超时 / 非 UTF-8 / 非 0 退出）：CLI 层映射 rc2。"""
@@ -306,13 +366,70 @@ class Fingerprint:
 
     ``kind`` ∈ ``{"patch", "binary", "empty"}``；``value`` 只在 ``kind=="patch"``
     时有值（40 hex），其余为 ``None``；``merge_base`` 是 ``merge-base`` 的 40 hex
-    （报告行要打印它做复核）；``paths`` 是 numstat 里出现过的路径（二进制时点名用）。
+    （报告行要打印它做复核）；``paths`` 是 numstat 里出现过的路径（二进制时点名用；
+    rename 已拆成 delete + add，非 ASCII 名给真名字）；``algo`` 是算出 ``value`` 的
+    算法标识（:data:`FINGERPRINT_ALGO` 或 :data:`FINGERPRINT_ALGO_VERBATIM`）。
+
+    **盲区（消费方必须看）**：``algo == FINGERPRINT_ALGO`` 时「同指纹 ≠ 内容相同
+    （空白类改动看不见）」—— 只有本 PR 已改过的那一行改缩进才会同指纹，但也足以让
+    两份内容不同的分支拿到同一个 ``value``。报告行必须原样带出
+    :attr:`caveat`（= :data:`FINGERPRINT_LEGACY_CAVEAT`），不得据此复用证据。
+    ``algo == FINGERPRINT_ALGO_VERBATIM`` 时（``git patch-id --verbatim`` 可用）
+    空白也进哈希，没有这一档盲区。
     """
 
     kind: str
     value: str | None
     merge_base: str
     paths: tuple[str, ...]
+    algo: str
+
+    @property
+    def caveat(self) -> str:
+        """报告行要带出的盲区说明：旧档给 :data:`FINGERPRINT_LEGACY_CAVEAT`，verbatim 档给空串。"""
+
+        return "" if self.algo == FINGERPRINT_ALGO_VERBATIM else FINGERPRINT_LEGACY_CAVEAT
+
+
+def _git_env() -> dict[str, str]:
+    """git 子进程的环境：复制 ``os.environ``，只摘「指向别处」的那些开关。
+
+    摘掉的键见 :data:`GIT_ENV_STRIP_EXACT` / :data:`GIT_ENV_STRIP_PREFIXES`；其余原样
+    保留 —— SSH（``GIT_SSH*`` / ``SSH_AUTH_SOCK`` / ``GIT_ASKPASS``）与代理
+    （``HTTPS_PROXY`` / ``https_proxy`` 等）凭据变量必须留着，否则 ``fetch`` 会被误判成
+    环境故障。摘 ``GIT_CONFIG_COUNT`` 那组是因为它们能把 ``color.ui=always`` 之类配置
+    注进子进程，破坏「同一份内容 ⇒ 同一指纹」。
+    """
+
+    env = dict(os.environ)
+    for key in list(env):
+        if key in GIT_ENV_STRIP_EXACT or key.startswith(GIT_ENV_STRIP_PREFIXES):
+            del env[key]
+    return env
+
+
+def _check_rev(value: object, what: str) -> str:
+    """rev 形态：非空字符串、且不以 ``-`` 开头。
+
+    ``-`` 开头的 rev 会被 git 当成选项（``--help`` / ``-n1`` / ``--output=…``），
+    等于把调用面交给调用方 —— 这里一律 :class:`PatchIdError`，不往下传。
+    """
+
+    if not isinstance(value, str):
+        raise PatchIdError(f"{what} 非法：{value!r}（应为字符串形态的 rev）")
+    if not value:
+        raise PatchIdError(f"{what} 非法：空字符串（应为非空 rev）")
+    if value.startswith("-"):
+        raise PatchIdError(f"{what} 非法：{value!r}（以 '-' 开头，会被 git 当成选项）")
+    return value
+
+
+def _check_commit_sha(value: object) -> str:
+    """提交 sha 形态：40 位小写十六进制，否则 :class:`PatchIdError`。"""
+
+    if not isinstance(value, str) or COMMIT_SHA_RE.fullmatch(value) is None:
+        raise PatchIdError(f"提交 sha 非法：{value!r}（应为 40 位小写十六进制）")
+    return value
 
 
 def _run_git(
@@ -326,6 +443,7 @@ def _run_git(
 
     只在**执行不成立**时抛 :class:`PatchIdError`（缺 git / 超时 / 其它 OSError）；
     rc 由调用方判 —— 有的调用（``merge-base`` / ``cat-file``）本来就允许非 0。
+    环境走 :func:`_git_env`（摘掉 ``GIT_DIR`` 一类「指向别处」的开关）。
     """
 
     label = what or " ".join(argv)
@@ -339,6 +457,7 @@ def _run_git(
             capture_output=True,
             check=False,
             shell=False,
+            env=_git_env(),
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
@@ -415,48 +534,158 @@ def _numstat_rows(raw: str, label: str) -> list[str]:
     return rows
 
 
-def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
-    """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（``FINGERPRINT_ALGO``）。
+#: 探针结果的进程内缓存（键 = repo 路径）：同一 repo 只探一次
+_VERBATIM_SUPPORT: dict[str, bool] = {}
 
-    1. ``merge-base`` 取分叉点，rc≠0（不是共同祖先 / 未知 rev）→ :class:`PatchIdError`；
-    2. ``diff --numstat -U0 mb head``：空输出 → ``kind="empty"``；任一行以
-       ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
-    3. 否则 ``diff -U0 --no-color mb head | patch-id --stable`` 的第一列 40 hex →
-       ``kind="patch"``。
+
+def patch_id_supports_verbatim(repo: str | Path) -> bool:
+    """``git patch-id --verbatim`` 在本机是否可用：唯一判据是探针命令的 rc。
+
+    探针逐字是 ``git patch-id --verbatim </dev/null``（``input_bytes=b""`` 即空 stdin）：
+    rc=0 → 可用（``--verbatim`` = 空白也进哈希，见 git-patch-id(1)「do not strip any
+    whitespace」）；rc≠0 → 不可用（本机 git 2.34.1 实测 rc=129，
+    ``usage: git patch-id [--stable | --unstable]``）。
+
+    **不按 git 版本号猜**：判据只有 rc。结果按 repo 路径在进程内缓存一次（同一 repo
+    不重复起子进程）。缺 git（:class:`GitMissingError`）照旧上抛 —— 环境故障，
+    不是「探针返回 False」。
     """
 
-    mb_proc = _run_git(
-        repo,
-        ("merge-base", base_ref, head_rev),
-        what=f"git merge-base {base_ref} {head_rev}",
-    )
-    _expect_ok(mb_proc, f"git merge-base {base_ref} {head_rev}")
-    merge_base = _stdout_text(mb_proc, "git merge-base").strip()
-    if not merge_base:
-        raise PatchIdError(f"git merge-base {base_ref} {head_rev} 无输出（空 merge base）")
+    key = os.fspath(repo)
+    cached = _VERBATIM_SUPPORT.get(key)
+    if cached is None:
+        proc = _run_git(
+            repo,
+            ("patch-id", "--verbatim"),
+            input_bytes=b"",
+            what="git patch-id --verbatim",
+        )
+        cached = proc.returncode == 0
+        _VERBATIM_SUPPORT[key] = cached
+    return cached
 
-    numstat_label = "git diff --numstat -U0"
+
+def fingerprint(
+    repo: str | Path,
+    base_ref: str,
+    head_rev: str,
+    *,
+    verbatim: bool | None = None,
+) -> Fingerprint:
+    """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（算法档见返回值的 ``algo``）。
+
+    1. ``merge-base --all`` 取分叉点：候选**恰好 1 个**才算数 —— rc≠0（不是共同祖先 /
+       未知 rev）或候选 ≠1（criss-cross，没有唯一分叉点）→ :class:`PatchIdError`；
+    2. ``diff --numstat --no-color --no-renames -U0 mb head``（前面带
+       :data:`DIFF_CONFIG_PIN`）：空输出 → ``kind="empty"``；任一行以
+       ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
+    3. 否则 ``diff -U0 --no-color --no-renames mb head | patch-id <档位旗标>`` 的第一列
+       40 hex → ``kind="patch"``。档位旗标只有两个形态：旧档 ``--stable``、verbatim 档
+       ``--verbatim``（``--verbatim`` 隐含 ``--stable``，两者**不能同时显式给** ——
+       新 git 实测 rc=129 ``options '--verbatim' and '--stable' cannot be used together``）。
+
+    算法档由 :func:`patch_id_supports_verbatim` 的探针结果决定（不按版本号猜）：
+
+    - 支持 → ``algo="patch-id-U0-verbatim-v1"``，patch-id 带 ``--verbatim``
+      （空白敏感，``caveat`` 为空串）；
+    - 不支持 → ``algo="patch-id-U0-v1"``，即 :data:`FINGERPRINT_ALGO`：
+      **同指纹 ≠ 内容相同（空白类改动看不见）**，报告行必须带出
+      :data:`FINGERPRINT_LEGACY_CAVEAT`，消费方不得据此复用证据。
+
+    两次 diff 都带 :data:`DIFF_CONFIG_PIN` + ``--no-renames``：指纹不随调用方仓库的
+    ``diff.renames`` 变（rename 拆成 delete + add），``paths`` 给真名字（非 ASCII 不转义）。
+    ``verbatim`` 只给测试 / 诊断用（``None`` = 走探针）；显式 ``True`` 在无
+    ``--verbatim`` 的 git 上是 :class:`PatchIdError`，不静默降级。
+    """
+
+    base = _check_rev(base_ref, "base_ref")
+    head = _check_rev(head_rev, "head_rev")
+    if verbatim is None:
+        verbatim = patch_id_supports_verbatim(repo)
+    algo = FINGERPRINT_ALGO_VERBATIM if verbatim else FINGERPRINT_ALGO
+    mb_label = f"git merge-base --all {base} {head}"
+    mb_proc = _run_git(repo, ("merge-base", "--all", base, head), what=mb_label)
+    _expect_ok(mb_proc, mb_label)
+    candidates = [
+        line.strip()
+        for line in _stdout_text(mb_proc, mb_label).splitlines()
+        if line.strip()
+    ]
+    if len(candidates) != 1:
+        raise PatchIdError(
+            f"{mb_label} 得到 {len(candidates)} 个候选 merge base（应为 1 个；"
+            "多基 = criss-cross 历史没有唯一分叉点，按取不到处理，不猜）"
+        )
+    merge_base = candidates[0]
+
+    numstat_label = "git diff --numstat --no-color --no-renames -U0"
     numstat_raw = _stdout_text(
-        _expect_and_get(repo, ("diff", "--numstat", "-U0", merge_base, head_rev), numstat_label),
+        _expect_and_get(
+            repo,
+            (
+                *DIFF_CONFIG_PIN,
+                "diff",
+                "--numstat",
+                "--no-color",
+                "--no-renames",
+                "-U0",
+                merge_base,
+                head,
+            ),
+            numstat_label,
+        ),
         numstat_label,
     )
     if not numstat_raw.strip():
-        return Fingerprint(kind="empty", value=None, merge_base=merge_base, paths=())
+        return Fingerprint(
+            kind="empty", value=None, merge_base=merge_base, paths=(), algo=algo
+        )
     # 同一条命令的 stdout 里 numstat 段后面还跟着一整份 patch，先切段再逐行校验
     lines = _numstat_rows(numstat_raw, numstat_label)
     paths = tuple(line.split("\t")[-1] for line in lines)
     if any(line.startswith(NUMSTAT_BINARY_PREFIX) for line in lines):
         return Fingerprint(
-            kind="binary", value=None, merge_base=merge_base, paths=paths
+            kind="binary", value=None, merge_base=merge_base, paths=paths, algo=algo
         )
 
-    diff_label = "git diff -U0 --no-color"
+    diff_label = "git diff -U0 --no-color --no-renames"
     diff_proc = _expect_and_get(
-        repo, ("diff", "-U0", "--no-color", merge_base, head_rev), diff_label
+        repo,
+        (
+            *DIFF_CONFIG_PIN,
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-renames",
+            merge_base,
+            head,
+        ),
+        diff_label,
     )
-    pid_label = "git patch-id --stable"
+    # ``patchid.verbatim`` 也钉死：老 git 上没有这个键（``-c`` 设置未知键是合法的空操作），
+    # 新 git 上它能把默认档悄悄翻成 verbatim，必须压住，否则 algo 与实际算法不一致。
+    #
+    # ``--stable`` 与 ``--verbatim`` **不能同时显式给**（新 git 实测 rc=129：
+    # ``error: options '--verbatim' and '--stable' cannot be used together``；
+    # ``--verbatim`` 本身已隐含 ``--stable``），所以两档各给一个旗标。
+    if verbatim:
+        pid_label = "git patch-id --verbatim"
+        pid_argv = (
+            "-c",
+            "patchid.verbatim=true",
+            "patch-id",
+            "--verbatim",
+        )
+    else:
+        pid_label = "git patch-id --stable"
+        pid_argv = (
+            "-c",
+            "patchid.verbatim=false",
+            "patch-id",
+            "--stable",
+        )
     pid_proc = _run_git(
-        repo, ("patch-id", "--stable"), input_bytes=diff_proc.stdout, what=pid_label
+        repo, pid_argv, input_bytes=diff_proc.stdout, what=pid_label
     )
     _expect_ok(pid_proc, pid_label)
     for line in _stdout_text(pid_proc, pid_label).splitlines():
@@ -467,6 +696,7 @@ def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
                 value=columns[0],
                 merge_base=merge_base,
                 paths=paths,
+                algo=algo,
             )
     raise PatchIdError(f"{pid_label} 没有输出 40 hex 的 patch-id（diff 非空却无哈希）")
 
@@ -487,9 +717,18 @@ def fingerprint_of_commit(
 
     取不到对象不是异常（调用方按「不可验证」处理）：fetch 失败（含超时 / rc≠0 /
     没有这个 remote）→ 返回 ``None``。真·环境故障（缺 git、diff 失败、非 UTF-8）
-    仍然是 :class:`PatchIdError`。
+    仍然是 :class:`PatchIdError` —— 所以 ``except GitMissingError: raise`` 必须排在
+    ``except PatchIdError: return None`` 之前，否则「PATH 里没有 git」会被静默吞成
+    「这个 sha 取不到」。
+
+    ``sha`` 必须是 40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
+    :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验 —— 两个形态
+    校验都在**入口**，早于 ``cat-file`` / ``fetch``，所以「这个 sha 取不到」的结论不会
+    把「base_ref 非法」漂成 ``None``。
     """
 
+    sha = _check_commit_sha(sha)
+    _check_rev(base_ref, "base_ref")
     if not _has_commit(repo, sha):
         fetch_label = f"git fetch --no-tags --quiet {remote} {sha}"
         try:
@@ -498,6 +737,9 @@ def fingerprint_of_commit(
                 ("fetch", "--no-tags", "--quiet", remote, sha),
                 what=fetch_label,
             )
+        except GitMissingError:
+            # 缺 git 是环境故障，不许被下面那条当成「对象取不到」
+            raise
         except PatchIdError:
             # 缺 git 之外的失败（网络 / 超时 / 没这个 remote / rc≠0）都归「对象取不到」
             return None
