@@ -212,7 +212,7 @@ class TestRc1:
         assert err == ""
         assert out.splitlines() == [
             f"卡 {CARD} [running]",
-            "PR #53 UNOWNED",
+            "PR #53 UNOWNED 来源: 正文",
             "结论: 1 个 PR / 通过 0 / 无归属 1 → "
             "先建收口卡（首行 PR-CLAIM: #53）再关本卡",
         ]
@@ -374,13 +374,17 @@ class TestDegrade:
         assert err.startswith("错误: 当前 stdout 编码 ")
         assert "warn:" not in err
 
-    def test_log_write_failure_is_rc2_not_a_lie(
+    def test_log_write_failure_keeps_rc_and_says_so(
         self,
         stub: dict[str, Any],
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """P2-c：日志真没写成时不许说「（日志已写）」，rc 反映失败（rc2 + 一行 stderr）。"""
+        """日志写不进去是**环境**问题：只 stderr 一行 warn、rc 不变、不许说「（日志已写）」。
+
+        P2（2026-10-31 返工）：旧口径把它判成 rc2，等于「日志目录不可写」这个纯环境
+        故障改写了稽核结论 —— 一个本来 rc0 的降级被翻成 rc2，卡就关不掉了。
+        """
         empty = tmp_path / "empty-bin"
         empty.mkdir()
         stub["setenv"]("PATH", str(empty))
@@ -389,13 +393,17 @@ class TestDegrade:
 
         code, out, err = run(capsys, CARD, "--db", str(db), "--log-dir", "/dev/null/x")
 
-        assert code == 2
-        assert out == ""
+        assert code == 0
+        # 结论行照旧是「降级放行」，但不许出现「（日志已写）」这句假话
+        assert out.splitlines()[-1] == (
+            "结论: gh 不可用（gh 不在 PATH）→ 降级放行（日志写入失败，见 stderr），晨报须列"
+        )
+        assert "（日志已写）" not in out
+        # stderr 恰一行 warn，且带真实 rc
         assert err.count("\n") == 1
-        assert err.startswith("错误: 日志写入失败: ")
-        lie = "降级放行（日志已写）"
-        assert lie not in out
-        assert lie not in err
+        assert err.startswith("warn: 日志写入失败: ")
+        assert "rc 仍 0" in err
+        assert "错误: " not in err
 
 
 class TestRc2Params:
@@ -513,8 +521,8 @@ class TestExemptEscapeHatch:
 
         assert code == 1
         assert err == ""
-        assert "PR #12 UNOWNED" in out
-        assert "EXEMPT" not in out
+        assert "PR #12 UNOWNED 来源: 评论" in out
+        assert "PR #12 EXEMPT" not in out
         assert out.splitlines()[-1] == (
             "结论: 2 个 PR / 通过 1 / 无归属 1 → 先建收口卡（首行 PR-CLAIM: #12）再关本卡"
         )
@@ -560,7 +568,7 @@ class TestExemptEscapeHatch:
 
         assert code == 1
         assert "PR #12 UNOWNED" in out
-        assert "EXEMPT" not in out
+        assert "PR #12 EXEMPT" not in out
 
     def test_indented_exempt_line_does_not_count(
         self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -573,4 +581,172 @@ class TestExemptEscapeHatch:
 
         assert code == 1
         assert "PR #12 UNOWNED" in out
-        assert "EXEMPT" not in out
+        assert "PR #12 EXEMPT" not in out
+
+
+class TestFenceUnbalanced:
+    """围栏不配对（行首 ``` 奇数）：豁免未生效必须在结论行点名，不许无声 rc1。"""
+
+    def test_odd_fence_names_the_cause(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {12: "OPEN"})
+        db = tmp_path / "b.db"
+        # 只有开围栏、没有闭围栏 → 后面的豁免行被当成围栏内容吞掉
+        make_board(db, [(CARD, "running", "PR #12 是别的卡\n```\nPR-MERGE-EXEMPT: #12\n")])
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        assert "PR #12 UNOWNED" in out
+        assert "PR #12 EXEMPT" not in out
+        conclusion = out.splitlines()[-1]
+        assert conclusion.startswith("结论: ")
+        assert "围栏不配对，豁免未生效" in conclusion
+
+    def test_even_fence_has_no_note(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {12: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "PR #12 是别的卡\n```\n示例\n```\n")])
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        assert "围栏不配对" not in out
+
+
+class TestUnownedSource:
+    """UNOWNED 行注明来源（正文 / 评论）；评论来源提示补豁免行才能自解。"""
+
+    def test_comment_only_pr_hints_the_exempt_line(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {77: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "## 目标\n本卡正文没有 PR 号\n")])
+        add_comment(db, CARD, "顺手提一句：PR #77 还开着\n")
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        line = next(row for row in out.splitlines() if row.startswith("PR #77 "))
+        assert line.startswith("PR #77 UNOWNED 来源: 评论")
+        assert "需在本卡正文写 PR-MERGE-EXEMPT: #77" in line
+
+    def test_body_pr_has_no_hint(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {77: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "本卡正文引用 PR #77\n")])
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        line = next(row for row in out.splitlines() if row.startswith("PR #77 "))
+        assert line == "PR #77 UNOWNED 来源: 正文"
+        assert "PR-MERGE-EXEMPT" not in out
+
+    def test_both_sources_are_named(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {77: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "本卡正文引用 PR #77\n")])
+        add_comment(db, CARD, "评论里也提 PR #77\n")
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 1
+        line = next(row for row in out.splitlines() if row.startswith("PR #77 "))
+        assert line.startswith("PR #77 UNOWNED 来源: 正文+评论")
+        # 评论来源照样给提示：补了正文豁免行这条才算解
+        assert "需在本卡正文写 PR-MERGE-EXEMPT: #77" in line
+
+
+class TestExemptSkipsGh:
+    """已判 EXEMPT 的 PR 不再发 ``gh pr view``（P3）：判定优先级 1 已经定了。"""
+
+    def test_exempt_pr_is_not_asked(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        states(stub, {50: "MERGED", 12: "OPEN"})
+        db = tmp_path / "b.db"
+        make_board(
+            db,
+            [(CARD, "running", "PR #50 已合并\nPR #12 是别的卡\nPR-MERGE-EXEMPT: #12\n")],
+        )
+
+        code, out, err = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 0
+        assert err == ""
+        assert "PR #12 EXEMPT" in out
+        assert calls(stub) == [
+            "gh pr view 50 --repo alsj213/team-board --json state,mergedAt"
+        ]
+
+
+class TestGhNotExecutable:
+    """``gh`` 存在但起不来（EACCES / ENOEXEC）不许报成「不在 PATH」（P3）。"""
+
+    @staticmethod
+    def _stub_with(tmp_path: Path, mode: int, body: str) -> Path:
+        bindir = tmp_path / "broken-bin"
+        bindir.mkdir()
+        target = bindir / "gh"
+        target.write_text(body, encoding="utf-8")
+        target.chmod(mode)
+        return bindir
+
+    def test_permission_denied_is_not_path(
+        self,
+        stub: dict[str, Any],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bindir = self._stub_with(tmp_path, 0o644, "#!/bin/sh\necho hi\n")
+        stub["setenv"]("PATH", str(bindir))
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "本卡正文引用 PR #53\n")])
+
+        code, out, err = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 0
+        assert "PR #53 WARN gh 不可执行（EACCES）" in out
+        assert "不在 PATH" not in out
+        assert "不在 PATH" not in err
+
+    def test_enoexec_is_not_path(
+        self,
+        stub: dict[str, Any],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bindir = self._stub_with(tmp_path, 0o755, "echo hi\n")
+        stub["setenv"]("PATH", str(bindir))
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "本卡正文引用 PR #53\n")])
+
+        code, out, err = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 0
+        assert "PR #53 WARN gh 不可执行（ENOEXEC）" in out
+        assert "不在 PATH" not in out
+        assert "不在 PATH" not in err
+
+    def test_missing_gh_is_still_path(
+        self, stub: dict[str, Any], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        empty = tmp_path / "empty-bin"
+        empty.mkdir()
+        stub["setenv"]("PATH", str(empty))
+        db = tmp_path / "b.db"
+        make_board(db, [(CARD, "running", "本卡正文引用 PR #53\n")])
+
+        code, out, _ = run(capsys, CARD, "--db", str(db), "--log-dir", str(tmp_path / "logs"))
+
+        assert code == 0
+        assert "PR #53 WARN gh 不在 PATH" in out

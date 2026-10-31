@@ -1141,6 +1141,78 @@ GAP t_9f000002 [running] engineer 触发=合并卡 首行=目标：…
   traceback；argparse 级错误（两个参数都不给 / 同给）由 argparse 原样打 2 行
   （`usage: …` + `…: error: …`）、stdout 为空。
 
+## PR 合并归属稽核（merge-owner-audit）
+
+R8「卡上出现 PR 号，就证明那个 PR 有主」的机器闸门：卡正文或任意评论里出现 PR 号，
+就必须回答得了「这个 PR 归谁」。只读、不写库、不合并；除已豁免的号外，每个 PR 问一次
+`gh pr view <n> --repo <repo> --json state,mergedAt`（判定优先级 1 已经定了的号不发 gh）。
+
+```
+team-board merge-owner-audit CARD [--db PATH] [--repo OWNER/REPO] [--timeout N] [--log-dir DIR]
+```
+
+- `CARD` —— 卡号，`t_` + 8 位小写十六进制；`t_0123ABC` / `t_123` / 空串 → rc2。
+- `--db PATH` —— 看板库，默认 `/home/liu/.hermes/kanban/boards/devteam/kanban.db`，
+  以 `mode=ro` 只读打开。
+- `--repo OWNER/REPO` —— gh 查 PR 用的仓库，默认 `alsj213/team-board`；形态非法 → rc2。
+- `--timeout N` —— 单次 gh 调用的超时秒数，`1`–`600`，默认 `20`；`0` / 负数 / `601` /
+  13 位毫秒（`1793160000000`）/ 天文数字 / 空串 / `20s` → rc2（不挂 `type=int`，
+  越界一律 rc2）。
+- `--log-dir DIR` —— 降级日志目录，默认 `evidence`，不存在自动建；**写不进去不改 rc**
+  （见下面「降级与日志」）。
+
+五个判定（每个 PR 只出一个，按此优先级）：
+
+- `EXEMPT` —— 本卡**正文**（围栏外）顶格一行 `PR-MERGE-EXEMPT: #<n>`。豁免只认正文：
+  评论里的豁免行不算，正文里贴进代码围栏的示例也不算。已判 `EXEMPT` 的号不发 `gh`。
+- `MERGED` / `CLOSED` —— gh 的 `state` 先归一（去首尾空白、转大写）再比这两态；
+  归一后不是三态的一律按取数失败（`WARN`）算。
+- `CLAIMED` —— gh 说 `OPEN`，且**另一张**未结卡（`status NOT IN ('done','archived')`）
+  正文顶格写了 `PR-CLAIM: #<n>`；`detail` 是那些卡号（多张也算通过）。
+  **本卡自己认领不算**（防「自认自关」）。
+- `UNOWNED` —— gh 说 `OPEN` 且没人认领。这一行注明 PR 号**来源**（`正文` / `评论` /
+  `正文+评论`）；来源含评论时另提示「需在本卡正文写 `PR-MERGE-EXEMPT: #n`」——
+  别人在评论里提的号，卡主只能靠往正文补一行来解，不用去求评论作者。
+- `WARN` —— gh 取数失败（`gh 超时 <n>s` / `gh 不在 PATH` / `gh 不可执行（EACCES|ENOEXEC）` /
+  `gh rc=<n>` / `gh 输出非 JSON`），`detail` 一句话；gh 自己的 stderr 原文**既不进报告
+  也不进日志**（一条 4KB 的 GraphQL 报错会把报告和日志全顶碎）。
+
+输出三段、顺序固定（行数恒为 `1 + 判定数 + 1`）：
+
+```
+卡 t_0123abcd [running]
+PR #12 EXEMPT
+PR #50 MERGED
+结论: 2 个 PR 全部有归属 → 可关
+```
+
+末行四种：`结论: 抽取到 0 个 PR 号 → 无合并归属需要（直接通过）` /
+`结论: N 个 PR 全部有归属 → 可关` /
+`结论: N 个 PR / 通过 K / 无归属 M → 先建收口卡（首行 PR-CLAIM: #<最小无归属号>）再关本卡` /
+`结论: gh 不可用（<原因>）→ 降级放行（日志已写），晨报须列`。
+
+两条例外说明只挂在结论行尾、**不加行**：
+
+- **围栏不配对**（正文里行首 ``` 是奇数）：豁免行可能被围栏吞掉，结论行追加
+  `；注意：正文围栏不配对，豁免未生效` —— 不给你一个看不出原因的 rc1。
+- **降级日志没写成**：结论行写「（日志写入失败，见 stderr）」而不是「（日志已写）」，
+  stderr 恰一行 `warn: 日志写入失败: …，降级照旧，rc 仍 <n>；晨报须列`。
+
+降级与日志：gh 取不到状态时**降级放行**（rc 仍是 0 或 1，不是 2），stderr 一行
+`warn: gh 不可用（<原因>）→ 降级放行，晨报须列`，并把每个 WARN 追加一行
+`<UTC ISO8601（秒精度）> warn pr=<n> <原因>` 到 `<log-dir>/merge-owner-audit-<卡号>.log`。
+降级属 `env` 类（R14 不记任何人返工），但**必须进当次晨报**一行（哪天 / 哪张卡 /
+什么原因 / 日志路径）—— 静默放行等于没跑。
+
+退出码：
+
+- `0` —— 卡上 PR 全部有归属（`MERGED` / `CLOSED` / 另一张未结卡认领 / 正文豁免）
+  或压根没有 PR 号；gh 取不到状态时降级放行仍是 `0`。
+- `1` —— 有任一 `UNOWNED`（即使同时有 `WARN`：降级不许盖掉真问题）。
+- `2` —— 参数或环境错误（卡号 / `--repo` / `--timeout` 形态非法、`--db` 不存在 /
+  不是合法 SQLite / 打不开 / 读失败、卡不存在、stdout 编码表示不了中文）：stderr 恰
+  一行 `错误: …`、stdout 为空、不冒 traceback。日志目录不可写**不是** `2`。
+
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
@@ -1186,6 +1258,7 @@ GAP t_9f000002 [running] engineer 触发=合并卡 首行=目标：…
 文件或相对 base 无差异）、`2` 表示参数或环境错误（`--head` 非 40/64 位小写十六进制、
 `--pr` 非正整数、`--base` 解析不到、`--repo` 不是 git 工作树、`gh` / `git` 调用失败）。
 标记写法、指纹算法与实测见 `docs/review-patch.md`。
+`merge-owner-audit` 同理：`0` 全部有归属或压根没有 PR 号（gh 取不到状态时**降级仍
 
 ## 口径
 

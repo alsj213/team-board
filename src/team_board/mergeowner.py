@@ -24,6 +24,11 @@ CLI 层，本模块只吃字符串与 :class:`GhResult`，吐 :class:`Report`。
 不是 ``MERGED`` / ``CLOSED`` 的合法三态走 ``OPEN`` 分支。
 
 ``MAX_PR`` 从 :mod:`team_board.prclaim` 导入，本模块不定义第二份 PR 号口径。
+
+本轮（P2/P3 返工，2026-10-31）仍是**输入侧**增量，判定方向不变：``UNOWNED`` 行注明
+PR 号来源（正文 / 评论；评论来源附「需在本卡正文写 ``PR-MERGE-EXEMPT: #n``」的提示）、
+正文围栏不配对时结论行点名（:data:`FENCE_NOTE`）、降级日志没写成时结论行不再说
+「（日志已写）」（:data:`VERDICT_DEGRADED_UNLOGGED`）。
 """
 
 from __future__ import annotations
@@ -41,15 +46,20 @@ __all__ = [
     "DONE_STATUSES",
     "EXEMPT",
     "EXEMPT_RE",
+    "FENCE_NOTE",
     "MAX_PR",
     "MERGED",
     "PR_RE",
     "REPO_RE",
+    "SOURCE_BODY",
+    "SOURCE_COMMENT",
     "TIMEOUT_DEFAULT",
     "TIMEOUT_MAX",
     "TIMEOUT_MIN",
     "UNOWNED",
+    "UNOWNED_COMMENT_HINT",
     "URL_RE",
+    "VERDICT_DEGRADED_UNLOGGED",
     "WARN",
     "ClaimRow",
     "GhResult",
@@ -59,6 +69,7 @@ __all__ = [
     "exempt_prs",
     "exit_code",
     "extract_prs",
+    "extract_prs_sources",
     "judge",
     "parse_card",
     "parse_repo",
@@ -117,6 +128,21 @@ VERDICT_UNOWNED = (
 )
 VERDICT_DEGRADED = "结论: gh 不可用（{detail}）→ 降级放行（日志已写），晨报须列"
 
+#: 降级但**日志没写成**时的同一句：「（日志已写）」只在真写成时打印（P2，2026-10-31）
+VERDICT_DEGRADED_UNLOGGED = (
+    "结论: gh 不可用（{detail}）→ 降级放行（日志写入失败，见 stderr），晨报须列"
+)
+
+#: 正文围栏不配对时挂在结论行尾的说明：豁免行可能被围栏吞掉，必须点名，不许无声 rc1
+FENCE_NOTE = "；注意：正文围栏不配对，豁免未生效"
+
+#: ``UNOWNED`` 行的来源标签（正文 / 评论；两者都有时渲染成 ``正文+评论``）
+SOURCE_BODY = "正文"
+SOURCE_COMMENT = "评论"
+
+#: 评论来源的 ``UNOWNED`` 提示尾巴：豁免只认正文，卡主要自己补一行才能自解（``{pr}`` 是号）
+UNOWNED_COMMENT_HINT = "；需在本卡正文写 PR-MERGE-EXEMPT: #{pr}"
+
 #: 只认 ASCII 十进制数字、不带前导零：``int()`` 会静默接受 ``" 20"`` / ``"+20"``
 _TIMEOUT_DIGITS = re.compile(r"[1-9][0-9]*", re.ASCII)
 
@@ -148,10 +174,11 @@ def _one_line(text: str) -> str:
 
 @dataclass(frozen=True)
 class Verdict:
-    """一个 PR 的判定结论；``detail`` 只在 ``CLAIMED`` / ``WARN`` 时非空。
+    """一个 PR 的判定结论；``detail`` 在 ``CLAIMED`` / ``WARN`` / ``UNOWNED`` 时非空。
 
     ``detail`` 在构造时就归一成单行（见 :func:`_one_line`），所以 ``Report`` 里存的
-    已经是可展示形态，CLI 层拿它拼别的文案也不会带出换行。
+    已经是可展示形态，CLI 层拿它拼别的文案也不会带出换行。``UNOWNED`` 的 ``detail``
+    是「来源: 正文 / 评论」，评论来源另带一句补豁免行的提示（P2，2026-10-31）。
     """
 
     pr: int
@@ -164,11 +191,20 @@ class Verdict:
 
 @dataclass(frozen=True)
 class Report:
-    """一次 ``merge-owner-audit`` 的全部判定数据（``verdicts`` 按 PR 号升序）。"""
+    """一次 ``merge-owner-audit`` 的全部判定数据（``verdicts`` 按 PR 号升序）。
+
+    ``fence_unbalanced`` / ``log_written`` 是**渲染输入**，不参与判定：
+
+    - ``fence_unbalanced``：本卡正文的行首 ``` 是奇数 —— 豁免行可能被围栏吞掉，
+      结论行必须点名「围栏不配对，豁免未生效」（不许无声 rc1）；
+    - ``log_written``：降级日志是否真写成 —— 只有写成了才许说「（日志已写）」。
+    """
 
     card: str
     status: str
     verdicts: tuple[Verdict, ...]
+    fence_unbalanced: bool = False
+    log_written: bool = True
 
     @property
     def unowned(self) -> tuple[Verdict, ...]:
@@ -209,11 +245,39 @@ def extract_prs(*texts: str | None) -> tuple[int, ...]:
     """
     found: set[int] = set()
     for text in texts:
-        if not text:
-            continue
-        found.update(int(n) for n in PR_RE.findall(text))
-        found.update(int(n) for n in URL_RE.findall(text))
+        found |= _scan(text)
     return tuple(sorted(found))
+
+
+def extract_prs_sources(
+    body: str | None, comments: Iterable[str | None] = ()
+) -> dict[int, tuple[str, ...]]:
+    """``{PR 号: 来源标签}``，键**升序**；来源是 ``正文`` / ``评论`` / 两者都有的 ``正文+评论``。
+
+    ``UNOWNED`` 行要注明「这个号是从哪儿来的」：本卡无法自解的典型场景是**别人**在
+    评论里提了一个未闭合 PR 号 —— 只看得到卡号不够，得让卡主知道该往正文写豁免行。
+    与 :func:`extract_prs` 共用同一份 :func:`_scan`，不复制 PR 号口径。
+    """
+    labels: dict[int, set[str]] = {}
+    if body:
+        for pr in _scan(body):
+            labels.setdefault(pr, set()).add(SOURCE_BODY)
+    for text in comments:
+        for pr in _scan(text):
+            labels.setdefault(pr, set()).add(SOURCE_COMMENT)
+    return {
+        pr: tuple(tag for tag in (SOURCE_BODY, SOURCE_COMMENT) if tag in labels[pr])
+        for pr in sorted(labels)
+    }
+
+
+def _scan(text: str | None) -> set[int]:
+    """一坨文本里的 PR 号（两种引用形态的并集）；空串 / ``None`` 给空集。"""
+    if not text:
+        return set()
+    return {int(n) for n in PR_RE.findall(text)} | {
+        int(n) for n in URL_RE.findall(text)
+    }
 
 
 def exempt_prs(body: str | None) -> frozenset[int]:
@@ -237,6 +301,8 @@ def judge(
     exempt: frozenset[int] | None = None,
     gh: Mapping[int, GhResult] | None = None,
     others: Iterable[ClaimRow] = (),
+    sources: Mapping[int, tuple[str, ...]] | None = None,
+    fence_unbalanced: bool = False,
 ) -> Report:
     """把「本卡 + PR 号集合 + gh 结果 + 其它卡的认领」判成 :class:`Report`。
 
@@ -247,18 +313,28 @@ def judge(
       ``(卡号, 状态, 负责人, 正文)``（:func:`db.iter_claim_rows` 的直出）；判定只认
       ``row[0]`` / ``row[1]`` / ``row[-1]``，中间列不参与口径。可以传全表 ——
       「另一张未结卡」的过滤（自己 / 已结）在这里做，判定口径不散到 CLI 层。
+    - ``sources``：:func:`extract_prs_sources` 的产物，只用来给 ``UNOWNED`` 行注来源；
+      缺省（``None``）时不注来源，判定与 rc 不变；
+    - ``fence_unbalanced``：正文围栏不配对 —— 只影响结论行的一句提示。
     """
     exempt_set = frozenset(exempt or ())
     gh_map: Mapping[int, GhResult] = gh or {}
+    source_map: Mapping[int, tuple[str, ...]] = sources or {}
     pool = tuple(
         (row[0], row[-1])
         for row in others
         if row[0] != card and row[1] not in DONE_STATUSES
     )
     verdicts = tuple(
-        _judge_one(pr, exempt_set, gh_map, pool) for pr in sorted(set(prs))
+        _judge_one(pr, exempt_set, gh_map, pool, source_map.get(pr, ()))
+        for pr in sorted(set(prs))
     )
-    return Report(card=card, status=status, verdicts=verdicts)
+    return Report(
+        card=card,
+        status=status,
+        verdicts=verdicts,
+        fence_unbalanced=fence_unbalanced,
+    )
 
 
 def _judge_one(
@@ -266,6 +342,7 @@ def _judge_one(
     exempt_set: frozenset[int],
     gh_map: Mapping[int, GhResult],
     pool: tuple[tuple[str, str | None], ...],
+    sources: tuple[str, ...] = (),
 ) -> Verdict:
     """单个 PR 的五条优先级（顺序即契约里的 1→5）。"""
     if pr in exempt_set:
@@ -286,31 +363,54 @@ def _judge_one(
     claimers = sorted(cid for cid, body in pool if claims(body, pr))
     if claimers:
         return Verdict(pr, CLAIMED, ",".join(claimers))
-    return Verdict(pr, UNOWNED)
+    return Verdict(pr, UNOWNED, _unowned_detail(pr, sources))
+
+
+def _unowned_detail(pr: int, sources: tuple[str, ...]) -> str:
+    """``UNOWNED`` 行尾巴：``来源: 正文`` / ``来源: 评论；需在本卡正文写 PR-MERGE-EXEMPT: #n``。
+
+    没有来源信息（老调用方不传 ``sources``）时给空串 —— 在**输入侧**兼容，判定不变。
+    评论来源必须带补行的提示：豁免只认正文，卡主光看着 rc1 无法自解（P2，2026-10-31）。
+    """
+    if not sources:
+        return ""
+    text = f"来源: {'+'.join(sources)}"
+    if SOURCE_COMMENT in sources:
+        text += UNOWNED_COMMENT_HINT.format(pr=pr)
+    return text
 
 
 def render(report: Report) -> str:
-    """把 :class:`Report` 渲染成整块 stdout 文本（不带尾随换行）。"""
+    """把 :class:`Report` 渲染成整块 stdout 文本（不带尾随换行）。
+
+    结论行按「无 PR → 有 UNOWNED → 有 WARN（降级）→ 全通过」的顺序选一条；两条附加
+    说明只挂在结论行尾，**不加行**（报告行数仍恒为 ``1 + 判定数 + 1``）：
+
+    - 围栏不配对 → 追加 :data:`FENCE_NOTE`（豁免可能没生效，不许无声）；
+    - 降级但日志没写成 → 用 :data:`VERDICT_DEGRADED_UNLOGGED`，不说「（日志已写）」。
+    """
     lines = [f"卡 {report.card} [{report.status}]"]
     lines.extend(_render_verdict(v) for v in report.verdicts)
     total = len(report.verdicts)
     unowned = report.unowned
     warns = report.warns
     if total == 0:
-        lines.append(VERDICT_NO_PR)
+        conclusion = VERDICT_NO_PR
     elif unowned:
-        lines.append(
-            VERDICT_UNOWNED.format(
-                n=total,
-                k=total - len(unowned),
-                m=len(unowned),
-                pr=unowned[0].pr,  # verdicts 升序 → 第一项即最小无归属号
-            )
+        conclusion = VERDICT_UNOWNED.format(
+            n=total,
+            k=total - len(unowned),
+            m=len(unowned),
+            pr=unowned[0].pr,  # verdicts 升序 → 第一项即最小无归属号
         )
     elif warns:
-        lines.append(VERDICT_DEGRADED.format(detail=warns[0].detail))
+        template = VERDICT_DEGRADED if report.log_written else VERDICT_DEGRADED_UNLOGGED
+        conclusion = template.format(detail=warns[0].detail)
     else:
-        lines.append(VERDICT_ALL_OK.format(n=total))
+        conclusion = VERDICT_ALL_OK.format(n=total)
+    if report.fence_unbalanced:
+        conclusion += FENCE_NOTE
+    lines.append(conclusion)
     return "\n".join(lines)
 
 

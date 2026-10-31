@@ -85,11 +85,14 @@
   空串 / 非 ASCII 数字，``--db`` 不存在、不是合法 SQLite、打不开、读 ``tasks``
   失败、stdout 编码表示不了中文）
 
-``merge-owner-audit`` 子命令（只读 + 逐个 PR 一次 ``gh pr view``；R8「卡上有 PR 号就有主」的机器闸门）：
+``merge-owner-audit`` 子命令（只读 + 逐个**非豁免** PR 一次 ``gh pr view``；R8「卡上有 PR 号就有主」的机器闸门）：
 - 0：卡上 PR 全部有归属（``MERGED`` / ``CLOSED`` / 另一张未结卡顶格 ``PR-CLAIM`` /
-  正文或评论顶格 ``PR-MERGE-EXEMPT``）或压根没有 PR 号；gh 取不到状态时**降级放行**
-  （stderr 一行 ``warn: …``，日志 ``<log-dir>/merge-owner-audit-<卡号>.log``）
-- 1：有任一 ``UNOWNED``（即使同时有 ``WARN`` —— 降级不许盖掉真问题）
+  本卡**正文围栏外**顶格 ``PR-MERGE-EXEMPT``）或压根没有 PR 号；gh 取不到状态时
+  **降级放行**（stderr 一行 ``warn: …``，日志 ``<log-dir>/merge-owner-audit-<卡号>.log``）
+- 1：有任一 ``UNOWNED``（即使同时有 ``WARN`` —— 降级不许盖掉真问题）；``UNOWNED`` 行
+  注明来源（正文 / 评论），评论来源另提示「需在本卡正文写 ``PR-MERGE-EXEMPT: #n``」
+- 例外两条（不改 rc）：正文围栏不配对（行首 ``` 奇数）时结论行点名「围栏不配对，
+  豁免未生效」；降级日志写不进去时只 stderr 一行 ``warn: …``，且不许说「（日志已写）」
 - 2：参数或环境错误（``mergeowner.MergeOwnerError`` / ``db.BoardError`` /
   ``OSError`` / ``sqlite3.Error`` → stderr 恰一行 ``错误: …``、stdout 空、不冒
   traceback；含卡号形态非法、``--repo`` 不是 ``OWNER/REPO``、``--timeout`` 不是
@@ -139,6 +142,7 @@ argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=valu
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -147,6 +151,7 @@ import sqlite3
 import subprocess  # nosec B404 - gate 子命令要跑外部检查器，这是本工具的用途
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -1714,12 +1719,14 @@ def _gh_pr_state(pr: int, repo: str, timeout: int) -> tuple[str | None, str]:
     """跑一次 ``gh pr view <pr> --repo <repo> --json state,mergedAt``。
 
     返回 ``(state, reason)``：成功是 ``(压好的状态, "")``，失败是 ``(None, 一句话原因)``。
-    ``reason`` 只有四个定值 —— ``gh 超时 <n>s`` / ``gh 不在 PATH`` / ``gh rc=<n>`` /
+    ``reason`` 只有这几组定值 —— ``gh 超时 <n>s`` / ``gh 不在 PATH`` /
+    ``gh 不可执行（EACCES|ENOEXEC|…）`` / ``gh 启动失败（<n>）`` / ``gh rc=<n>`` /
     ``gh 输出非 JSON``：gh 自己的 stderr 原文**不许**流进 reason（一条 4KB 的
     GraphQL 报错会把报告、降级日志与 output-audit 全顶碎，契约 v2 增量 3）。
 
-    ``OSError`` 里除 ``FileNotFoundError`` 之外（权限、ENOEXEC）同样是「gh 起不来」，
-    四个定值里只有「gh 不在 PATH」表达这个意思，归一到这里。
+    ``OSError`` 按 errno 分开：``FileNotFoundError``（ENOENT）=「不在 PATH」；
+    **其余一律不是「不在 PATH」** —— ``gh`` 明明存在但不可执行（EACCES / ENOEXEC）
+    报成「不在 PATH」会把人引去改 PATH，改到天亮也修不好（P3，2026-10-31）。
     判定方向（取数失败 = ``WARN`` = 降级）不在这里，全在 :mod:`team_board.mergeowner`。
     """
 
@@ -1734,8 +1741,8 @@ def _gh_pr_state(pr: int, repo: str, timeout: int) -> tuple[str | None, str]:
         return None, f"gh 超时 {timeout}s"
     except FileNotFoundError:
         return None, "gh 不在 PATH"
-    except OSError:
-        return None, "gh 不在 PATH"
+    except OSError as exc:
+        return None, _startup_reason(exc)
     except (UnicodeDecodeError, ValueError):
         return None, "gh 输出非 JSON"
 
@@ -1751,26 +1758,38 @@ def _gh_pr_state(pr: int, repo: str, timeout: int) -> tuple[str | None, str]:
     return state, ""
 
 
-def _body_outside_fences(body: str | None) -> str:
-    """去掉正文里 ``` 围栏包住的整段，只留围栏外的行。
+def _startup_reason(exc: OSError) -> str:
+    """把「gh 起不来」的 ``OSError`` 折成一句定值文案（不含异常原文，见上）。"""
+    name = errno.errorcode.get(exc.errno) if exc.errno is not None else None
+    if not name:
+        return "gh 启动失败"
+    return f"gh 不可执行（{name}）"
+
+
+def _fence_split(body: str | None) -> tuple[str, bool]:
+    """拆成 ``(围栏外的行, 围栏是否配对)``。
 
     豁免面是「本卡**正文**的顶格一行」：评论里的示例不算（P2-a），正文里贴进
-    代码围栏的示例也不算 —— 围栏是引用写法，不是本卡声明。围栏不配对时按「从
-    第一个 ``` 起到文末都在围栏内」处理（宁严不宽）。剥完只用于
-    :func:`mergeowner.exempt_prs`；PR 号提取（``extract_prs``）仍吃全文。
+    代码围栏的示例也不算 —— 围栏是引用写法，不是本卡声明。围栏不配对（行首 ```
+    奇数）时按「从第一个 ``` 起到文末都在围栏内」处理（宁严不宽），同时把
+    ``False`` 交给 :func:`mergeowner.judge` 渲染进结论行 —— 否则豁免行被围栏吞掉
+    只会留一个无声的 rc1。剥完只用于 :func:`mergeowner.exempt_prs`；PR 号提取
+    （``mergeowner.extract_prs_sources``）仍吃全文。
     """
 
     if not body:
-        return ""
+        return "", True
     kept: list[str] = []
     in_fence = False
+    fences = 0
     for line in body.splitlines():
         if line.lstrip().startswith("```"):
+            fences += 1
             in_fence = not in_fence
             continue
         if not in_fence:
             kept.append(line)
-    return "\n".join(kept)
+    return "\n".join(kept), fences % 2 == 0
 
 
 def _append_degrade_log(
@@ -1780,8 +1799,9 @@ def _append_degrade_log(
 
     行格式固定 ``<UTC ISO8601（秒精度）> warn pr=<n> <reason>``。
     ``log-dir`` 不存在就建（``parents=True``）。成功返回 ``None``；写不进去返回
-    一行失败原因（调用点折成 stderr 那一行 ``错误: …`` + rc2）—— **不许**在日志
-    根本没写成时还让 stdout 说「（日志已写）」（P2-c）。
+    一行失败原因（调用点折成 stderr 那一行 ``warn: …``，**rc 不变**）—— 日志写不进去
+    是环境问题，不是判据问题（P2，2026-10-31）；但**不许**在日志根本没写成时还让
+    stdout 说「（日志已写）」。
     """
 
     path = Path(log_dir) / f"{MERGE_OWNER_LOG_PREFIX}{card}.log"
@@ -1800,10 +1820,11 @@ def _run_merge_owner_audit(args: argparse.Namespace) -> int:
     """``merge-owner-audit`` 子命令：有 ``UNOWNED`` → rc1，参数/库错 → rc2，否则 rc0。
 
     顺序固定：先校验三个参数（rc2 时 gh 一次都不发、stdout 一个字节都不写）→ 读库
-    （正文 + 全部评论 + 认领行）→ 逐个 PR 跑一次 gh → 判定 → 降级日志 → stderr
-    ``warn:`` → 渲染。判定与文案全部来自 :mod:`team_board.mergeowner`，本函数只做
-    接线（取数、gh、降级留痕），不复制第二份判定。降级**只针对 gh**：``--db``
-    打不开 / 卡不存在仍是 rc2。
+    （正文 + 全部评论 + 认领行）→ 剥围栏取豁免 → 逐个**非豁免** PR 跑一次 gh → 判定
+    → 降级日志 → stdout → stderr ``warn:``。判定与文案全部来自
+    :mod:`team_board.mergeowner`，本函数只做接线（取数、gh、降级留痕），不复制第二份
+    判定。降级**只针对 gh**：``--db`` 打不开 / 卡不存在仍是 rc2；**日志写不进去也不是
+    rc2**（P2，2026-10-31：环境问题不改判据结果，只 stderr 一行 ``warn: …``）。
     """
 
     try:
@@ -1826,38 +1847,56 @@ def _run_merge_owner_audit(args: argparse.Namespace) -> int:
         if conn is not None:
             conn.close()
 
-    prs = mergeowner.extract_prs(body, *comments)
-    # 豁免面是「**本卡正文**的顶格一行」：评论里的示例不算（契约 v3 增量），
-    # 正文里代码围栏内的示例也不算（围栏只是引用写法，不是声明）
-    exempt = mergeowner.exempt_prs(_body_outside_fences(body))
+    # 豁免面是「**本卡正文**、围栏外」的顶格一行：评论里的示例不算，正文里代码围栏内的
+    # 示例也不算（围栏只是引用写法，不是声明）。围栏奇数时豁免未生效 → 结论行点名。
+    body_out, fence_ok = _fence_split(body)
+    exempt = mergeowner.exempt_prs(body_out)
+    # 抽取仍吃全文（正文 + 全部评论），但记住每个号从哪儿来：评论来源的 UNOWNED 要
+    # 告诉卡主「往正文补一行豁免」才能自解（P2，2026-10-31）。
+    sources = mergeowner.extract_prs_sources(body, comments)
+    prs = tuple(sources)
     gh: dict[int, mergeowner.GhResult] = {}
     for pr in prs:
+        if pr in exempt:
+            # 已判 EXEMPT 的不发 gh：判定优先级 1 已经定了，问一次纯属浪费（P3）
+            continue
         state, reason = _gh_pr_state(pr, repo, timeout)
         gh[pr] = mergeowner.GhResult(status=state or "", error=reason)
 
-    report = mergeowner.judge(card, status, prs, exempt=exempt, gh=gh, others=others)
+    report = mergeowner.judge(
+        card,
+        status,
+        prs,
+        exempt=exempt,
+        gh=gh,
+        others=others,
+        sources=sources,
+        fence_unbalanced=not fence_ok,
+    )
 
     # 三条动作的顺序是契约的一部分（P2-b / P2-c）：
-    # ① 先落降级日志 —— 写不成就 rc2（stderr 恰一行 ``错误: …``、stdout 0 字节），
-    #    绝不让 stdout 说一句「（日志已写）」的假话；
+    # ① 先落降级日志 —— 写不成只记下原因，**不改 rc**，也不许让 stdout 说「（日志已写）」；
     # ② 再写 stdout —— 编码写不出去仍是 rc2，**此时一句 warn 都不许提前打**，
     #    否则 rc2 的 stderr 会变成两行；
-    # ③ 最后才打 stderr 的降级 warn。
+    # ③ 最后才打 stderr 的降级 warn（日志写失败与降级本身合成**一行**）。
+    log_error = None
     if report.warns:
         log_error = _append_degrade_log(args.log_dir, card, report.warns)
         if log_error is not None:
-            _write_stderr_error(log_error)
-            return 2
+            report = replace(report, log_written=False)
 
     if not _write_stdout(mergeowner.render(report) + "\n"):
         return 2
 
-    if report.warns and not report.unowned:
+    code = mergeowner.exit_code(report)
+    if log_error is not None:
+        _write_stderr_line(f"warn: {log_error}，降级照旧，rc 仍 {code}；晨报须列")
+    elif report.warns and not report.unowned:
         # 有 UNOWNED 时不是「降级放行」（rc 已是 1），只留日志，不打这句误导性的 warn
         _write_stderr_line(
             f"warn: gh 不可用（{report.warns[0].detail}）→ 降级放行，晨报须列"
         )
-    return mergeowner.exit_code(report)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
