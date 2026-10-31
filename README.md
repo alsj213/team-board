@@ -582,15 +582,27 @@ python3 -m team_board.merge_guard \
   `headRefName` 必须与 `--branch` **逐字相等**，`headRefOid` 必须是 40 位（SHA-1）或
   64 位（SHA-256）十六进制提交 SHA —— 缺字段或格式不对一律 rc2，说清实际值。预检通过
   后把提交钉进证据：`head sha | PASS | <sha>`。
-- **合并前的两道证据闸门（预检之后、rebase 之前，顺序固定）**，两道都**只读**、拒绝时
-  stdout 0 字节、**一个 gh 写操作都不发**，也都**没有跳过开关**（没有 `--skip-claim` /
-  `--skip-review-head`），且都不在 `--verify-only` 路径上跑：
+- **合并前的三道证据闸门（预检之后、rebase 之前，顺序固定：认领 → 证据状态机 → 双问）**，
+  三道都**只读**、拒绝时 stdout 0 字节、**一个 gh 写操作都不发**，也都**没有跳过开关**
+  （没有 `--skip-claim` / `--skip-evidence` / `--skip-review-head`，也没有 `--allow-stale` /
+  `--force` 这类放宽口径），且都不在 `--verify-only` 路径上跑：
   1. **认领唯一性（R17⑤）**：读 `--db` 指向的看板库（只读 `mode=ro`）的未结卡，判「恰好
      一张卡在正文顶格写了 `PR-CLAIM: #<pr>`」且这张卡的卡号**逐字等于 `--card`**。判定
      逻辑与 `team-board pr-claim-audit` 同源（`prclaim.audit` / `Report.sole_claim_id`），
      本工具不复制正则。三种拒绝文案一眼可分：`无未结卡认领该 PR` / `重复认领`（附卡号
      清单） / `认领卡 <id> ≠ --card <card>`。这一步一次 gh 都不调。
-  2. **双问绑定内容指纹（R18④）**：`ensure_pr_refs` 一次 `git fetch` 把远端 base 与
+  2. **证据状态机（四槽绑当前 head，`t_1429d01c`）**：实现卡号从 `--branch` 取（必须整串
+     `wt/t_<8 位小写十六进制>`，否则「无法定位实现卡」rc2），读 `--db` 的 evidence 事件
+     （`evidence.collect`，与 `team-board evidence audit` 同一份实现），要求 `tier` /
+     `qa_pass` / `review:defect` / `review:regression` 四槽各取 id 最大的一条、全部绑预检
+     读到的 `headRefOid`。`tier` 槽的档位必须是 `A`/`B`/`C` 之一（**缺键 / 非法一律
+     「缺证据」**，不许因为 head 对得上就算齐）；`tier=C` 还必须有同 `--pr` 的
+     `boss_approve`。事件 payload 有解析失败（`parse_failures > 0`）时**直接 rc2 并点名
+     条数** —— 解析不了的最新事件不能被读成「没有更新」。verdict 只用 evidence 的七个
+     字面量；库读不到 → rc2 点名 `--db` 与路径（「读不到」不许读成「没证据」）。这一步
+     一次 gh 都不调。
+
+  3. **双问绑定内容指纹（R18④）**：`ensure_pr_refs` 一次 `git fetch` 把远端 base 与
      `--branch` 抓进私有 ref `refs/merge-guard/<pr>/{base,head}`（与后面的 rebase 闸门共用这
      一份，判定顺序不变），随后 `git rev-parse refs/merge-guard/<pr>/head` 必须仍等于预检读到
      的 `headRefOid` —— 对不上就是「预检之后分支被推送」→ rc2、一个 gh 调用都不发。然后算
@@ -716,7 +728,7 @@ stdout 失败」，`141` 是 SIGPIPE）。
 预检 | PASS | gh pr view 20 -R alsj213/team-board --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
 head sha | PASS | 2e130b963160aca12e3548f2a1341b3ca23fb87c
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
-证据状态机 | PASS | evidence.audit(card=t_deadbeef, head=2e130b963160aca12e3548f2a1341b3ca23fb87c) | rc=0 | tier=B, qa_pass=*** review=defect+regression
+证据状态机 | PASS | PYTHONPATH=src python3 -m team_board.cli evidence audit --card t_deadbeef --head 2e130b963160aca12e3548f2a1341b3ca23fb87c --pr 20 --db <board> | rc=0 | tier=B, qa_pass=*** review=defect+regression
 双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 2e130b963160 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
 rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 70ce884 是 head 2e130b9 的祖先（已 rebase 到 main）
 合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 2e130b963160aca12e3548f2a1341b3ca23fb87c --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
@@ -753,7 +765,7 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
 
 `git rebase origin/main` 之后同一条命令 rc0，stdout 依次为（真跑原文，路径已换成 `<repo>`；
 **这段是 2026-10-29 只有 rebase 闸门时的历史原文**，认领 / 双问两道闸门是 PR #45 才接上的，
-现行 8 行样例见上一节的端到端样例）：
+证据状态机是 `t_1429d01c`（PR #70）才接上的，现行 9 行样例见上一节的端到端样例）：
 
 ```
 分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | f483f2d8c4ae812086c19c7003406eb270774c56	refs/heads/wt/t_deadbeef

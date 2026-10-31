@@ -124,12 +124,14 @@ def review_line(stub: Stub) -> str:
 def evidence_line(stub: Stub) -> str:
     """证据状态机闸门通过时的那一行证据（默认 fixture：四槽齐、全绑 ``HEAD_OID``）。
 
-    判据是本地只读库 + ``evidence.collect`` / ``judge`` 纯函数，没有外部命令；命令格写
-    数据来源与实现卡，最后一格是四槽摘要（``qa_pass`` 按契约示例打码成 ``***``）。
+    命令格是**能直接复跑**的真 CLI 命令：实现卡号 / head / PR 号 / 库路径全给实值，
+    粘回终端就能重放同一条判据（P3 返工项）。最后一格是四槽摘要
+    （``qa_pass`` 按契约示例打码成 ``***``）。
     """
 
     return (
-        f"证据状态机 | PASS | evidence.audit(card={MERGE_CARD}, head={HEAD_OID}) | rc=0 | "
+        "证据状态机 | PASS | PYTHONPATH=src python3 -m team_board.cli evidence audit "
+        f"--card {MERGE_CARD} --head {HEAD_OID} --pr 9 --db {stub.board_db} | rc=0 | "
         "tier=B, qa_pass=*** review=defect+regression"
     )
 
@@ -2870,9 +2872,9 @@ def test_verify_only_never_emits_rebase_step(
 
 
 # ============================================================================
-# 16. 合并前的两道证据闸门（R17⑤ 认领唯一性 / R18④ 双问绑定 head sha）
+# 16. 合并前的三道证据闸门（R17⑤ 认领唯一性 / t_1429d01c 证据状态机 / R18④ 双问绑定 head sha）
 #
-# 顺序固定：预检（拿到 headRefOid）→ ① 认领 → ② 双问 → ③ rebase → gh pr merge。
+# 顺序固定：预检（拿到 headRefOid）→ ① 认领 → ② 证据状态机 → ③ 双问 → ④ rebase → gh pr merge。
 # 五种拒绝态都要求：rc2、stdout **0 字节**、stderr 恰一行、**零 gh 写操作**；
 # 文案必须一眼分清「无认领 / 重复认领 / 认领卡≠--card / 双问缺证 / 双问陈旧 / 双问缺类」。
 # ============================================================================
@@ -3166,7 +3168,7 @@ def test_gates_run_before_rebase_gate(stub: Stub, capsys: pytest.CaptureFixture[
     assert not [c for c in stub.git_calls() if " fetch " in c or " merge-base " in c]
 
 
-# ---------------------------- 16d. rc0 正路：两道闸门放行后 argv 逐字不变
+# ---------------------------- 16d. rc0 正路：三道闸门放行后 argv 逐字不变
 def test_gates_pass_keeps_merge_argv_verbatim(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -3195,7 +3197,7 @@ def test_gates_pass_keeps_merge_argv_verbatim(
 
 
 def test_verify_only_never_runs_gates(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
-    """``--verify-only`` 不跑这两道闸门：不读库（没有认领也照样 rc0）、不发 gh api。"""
+    """``--verify-only`` 不跑这三道闸门：不读库（没有认领也照样 rc0）、不发 gh api。"""
 
     stub.set_claims([])  # 未结卡里没有一张认领 #9
     stub.set_review_bodies([], [])
@@ -3411,7 +3413,7 @@ def sample_block_labels(text: str, marker: str) -> list[str]:
 def test_evidence_step_order_matches_constants(
     stub: Stub, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """走通的合并路径打 8 行步骤证据，顺序 = 常量顺序（实跑，不是照抄文档）。"""
+    """走通的合并路径打 9 行步骤证据，顺序 = 常量顺序（实跑，不是照抄文档）。"""
 
     stub.setenv("FAKE_LS_REMOTE_RC", "2")
 

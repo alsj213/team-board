@@ -312,7 +312,10 @@ def test_pass_line_sits_between_claim_and_review(
     evidence = next(i for i, line in enumerate(lines) if line.startswith("证据状态机 | PASS |"))
     review = next(i for i, line in enumerate(lines) if line.startswith("双问绑定 | PASS |"))
     assert claim < evidence < review
-    assert f"evidence.audit(card={IMPL_CARD}, head={HEAD_OID})" in lines[evidence]
+    assert (
+        f"PYTHONPATH=src python3 -m team_board.cli evidence audit "
+        f"--card {IMPL_CARD} --head {HEAD_OID} --pr {PR} --db {tmp_path / 'kanban.db'}"
+    ) in lines[evidence]
     assert "tier=B" in lines[evidence]
     assert "qa_pass=***" in lines[evidence]
     assert "review=defect+regression" in lines[evidence]
@@ -504,6 +507,77 @@ def test_verify_only_never_runs_evidence_gate(
     assert rc == 0
     assert "证据状态机" not in captured.out
     assert captured.err == ""
+
+
+# --------------------- 返工 t_e7dc8082：三条 fail-open 钉子（零事件 / 缺 tier 键 / 坏 payload）
+
+def test_zero_evidence_events_rc2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """库能读、``task_events`` 一张卡一条 evidence 事件都没有 → rc2「缺证据」，绝不 PASS。
+
+    「零事件」是最容易 fail-open 的形态：取数成功（``parse_failures == 0``）+ 没有任何槽位
+    可判，任何「查不到就当齐」的写法都会在这里放行一条没有任何验收证据的 PR。
+    """
+
+    fake = FakeRunner()
+    rc, out, err = run_main(tmp_path, monkeypatch, capsys, events=[], runner=fake)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert err.startswith("错误: ")
+    assert "缺证据" in err
+    for slot in ("tier", "qa_pass", "review:defect", "review:regression"):
+        assert slot in err
+    assert fake.write_calls() == []
+
+
+def test_tier_event_without_tier_key_never_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """id 最大的 tier 事件缺 ``tier`` 键 → 该槽「缺证据」、整条闸门 rc2，**不得 PASS**。
+
+    P2-1 的原样复现（pm 在 PR #70 评论里跑出来的）：四槽本来齐全，再追加一条只带
+    ``pr`` / ``head_sha`` 的 tier 事件（id 更大 → ``_latest`` 取到它），旧实现在 tier 槽
+    只比 head，于是把「缺档位」读成「齐」，C 档缺老板点头也能翻成 PASS。
+    """
+
+    fake = FakeRunner()
+    events = [*four_slots(), e_row("tier", {"pr": PR, "head_sha": HEAD_OID}, 1)]
+    rc, out, err = run_main(tmp_path, monkeypatch, capsys, events=events, runner=fake)
+
+    assert rc == 2
+    assert out == ""  # 一行 PASS 都不许打
+    assert "缺证据" in err
+    assert "tier" in err
+    assert fake.write_calls() == []
+
+
+def test_truncated_event_payload_rc2_names_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """最新一条 review 事件的 payload 被截断 → ``parse_failures=1`` → rc2 且点名 1 条。
+
+    P2-2 的原样复现：坏 payload 被 ``collect`` 丢掉后，剩下的旧 review 事件仍然「齐」，
+    旧闸门于是 PASS；判据是「解析失败 > 0 = 无法确认最新证据」，不是「剩下的够不够」。
+    """
+
+    fake = FakeRunner()
+    truncated = (
+        "review",
+        '{"kind":"defect","head_sha":"' + HEAD_OID + '","verdict":"blo',
+        1,
+    )
+    rc, out, err = run_main(
+        tmp_path, monkeypatch, capsys, events=[*four_slots(), truncated], runner=fake
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "解析失败" in err
+    assert "1 条" in err
+    assert fake.write_calls() == []
 
 
 def test_summary_reads_tier_and_review_slots() -> None:

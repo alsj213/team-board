@@ -332,6 +332,18 @@ def _short(value: object) -> str:
     return repr(value)
 
 
+def _tier_is_legal(value: object) -> bool:
+    """tier 槽的档位取值域：``payload['tier']`` 必须**是** ``A`` / ``B`` / ``C`` 之一。
+
+    缺键（``None``）、非字符串、取值域外一律 ``False`` —— 槽位记 ``missing``、verdict 落
+    「缺证据」。与 :func:`validate_payload` 共用同一个 :data:`TIERS`，但**不**在这里跑整份
+    ``validate_payload``：那会把 head / 角色问题也折成「缺证据」，打乱
+    :data:`VERDICT_PRIORITY` 已定的先后（角色不符 > 缺证据 > 证据对新 head 无效）。
+    """
+
+    return isinstance(value, str) and value in TIERS
+
+
 def judge(
     events: Iterable[Event],
     head: str,
@@ -348,6 +360,10 @@ def judge(
 
     ``pr`` 为 ``None``（``--pr`` 没给）时跳过依赖 PR 相等的两条判定；
     ``tier_required`` 给了值就要求 tier 槽位证据的档位**恰好等于**它。
+
+    tier 槽在 head 之外还要求 ``payload['tier']`` 落在 :data:`TIERS`（``A``/``B``/``C``）
+    里 —— 缺键 / 非字符串 / 取值域外一律记 ``missing``（verdict 落「缺证据」），
+    不许「head 对得上就算齐」。
     """
     ordered = tuple(events)
     slots: list[Slot] = []
@@ -374,6 +390,16 @@ def judge(
                 state = SLOT_HEAD_MISMATCH
                 problems[VERDICT_HEAD_MISMATCH].append(
                     f"{name}：{_short(event.payload.get('head_sha'))} != {_short(head)}"
+                )
+            elif name == "tier" and not _tier_is_legal(event.payload.get("tier")):
+                # tier 槽的档位是「本 PR 走哪一档」的唯一依据：缺键 / 非字符串 /
+                # 取值域外的值一律按「缺证据」处理，绝不因为「head 对得上」就 PASS
+                # （P2-1 fail-open：追加一条只带 head_sha 的 tier 事件曾能翻成 PASS）。
+                state = SLOT_MISSING
+                missing.append(name)
+                problems[VERDICT_MISSING].append(
+                    f"tier：档位证据的 tier 缺键或不在 {'/'.join(sorted(TIERS))} 之一"
+                    f"（实际 {event.payload.get('tier')!r}）"
                 )
             elif name == "tier" and tier_required is not None and (
                 event.payload.get("tier") != tier_required

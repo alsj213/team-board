@@ -1557,6 +1557,9 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
     - ``--branch`` 不是 ``wt/t_xxxxxxxx`` → 「无法定位实现卡」；
     - 库不可用 / 读事件失败 → 文案点名 ``--db`` 与该路径（与 :func:`claim_gate` 同口径，
       「读不到库」不许被读成「没有证据」）；
+    - 有事件的 payload 解析失败（``Collection.parse_failures > 0``）→ rc2、点名条数：
+      坏 payload 的事件已被 ``collect`` 丢掉，某槽 id 最大的那条恰好坏掉时，
+      「最新证据」根本不是最新的，不许拿剩下的旧事件判 PASS（P2-2 fail-open）；
     - 判定不过 → ``证据闸门拦下 PR #<n>（实现卡 <卡>）：<verdict>；<detail>``，verdict 是
       :mod:`team_board.evidence` 的七个字面量之一（``缺证据`` / ``证据对新 head 无效`` /
       ``双问阻塞`` / ``缺老板点头`` / ``证据串卡`` / ``角色不符``），本模块不造新词。
@@ -1579,8 +1582,10 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
             f"（实现卡 {impl_card}）：{exc}；拒绝合并"
             f"（证据闸门只读 --db 指向的库，缺省 {DEFAULT_DB}）"
         ) from exc
+    parse_failures = 0
     try:
         events = evidence.collect(conn, impl_card)
+        parse_failures = events.parse_failures
         judgment = evidence.judge(events, head, opts.pr)
     except evidence.EvidenceReadError as exc:
         raise MergeGuardError(
@@ -1589,6 +1594,14 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         ) from exc
     finally:
         conn.close()
+    if parse_failures:
+        # 解析不了的事件已被 ``collect`` 丢掉；「丢掉」不等于「不存在」——某槽 id 最大的
+        # 那条恰好是坏 payload 时，判出来的「最新证据」根本不是最新的（P2-2 fail-open）。
+        raise MergeGuardError(
+            f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：有 {parse_failures} 条 "
+            f"evidence 事件的 payload 解析失败（--db {opts.db_path}）；无法确认槽位的最新"
+            f"证据，拒绝合并（证据必须绑当前 head，R 状态机化）"
+        )
     if not judgment.ok:
         raise MergeGuardError(
             f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：{judgment.verdict}；"
@@ -1597,8 +1610,12 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
     return format_step(
         STEP_EVIDENCE,
         ok=True,
-        # 这一步同样没有外部命令：判据是本地只读库 + evidence 的纯函数判定
-        command=f"evidence.audit(card={impl_card}, head={head})",
+        # 命令格要能**直接复跑**：与 ``evidence audit`` 子命令同一入口，参数给实值
+        # （卡号 / head / PR / 库路径），不留 ``<card>`` 这种占位符（P3）。
+        command=(
+            f"PYTHONPATH=src python3 -m team_board.cli evidence audit "
+            f"--card {impl_card} --head {head} --pr {opts.pr} --db {opts.db_path}"
+        ),
         rc=0,
         key=evidence_slots_summary(judgment),
     )

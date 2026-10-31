@@ -1428,9 +1428,10 @@ def _check_branch_for_command(branch: str) -> None:
     含空白 / 带 ``refs/`` 前缀三种输入各自的错误文案都在那里）。这里只把它的
     ``MergeGuardError`` 折成本子命令既有的 ``MergeAuditError`` 口径（stderr
     ``错误: …`` + rc2）。惰性 import：只在真要拼命令时才加载 ``merge_guard`` —— 它现在
-    连带依赖 ``db`` / ``prclaim`` / ``reviewhead``（认领与双问两道闸门），而 ``team-board``
-    的其余子命令（含 ``merge-record`` 的生成路径）都不需要这些。无循环导入：
-    ``merge_guard`` 只 import ``team_board.{db,prclaim,reviewhead,merges,model}``。
+    连带依赖 ``db`` / ``evidence`` / ``prclaim`` / ``reviewhead``（认领 → 证据状态机 → 双问
+    三道闸门），而 ``team-board`` 的其余子命令（含 ``merge-record`` 的生成路径）都不需要
+    这些。无循环导入：``merge_guard`` 只 import ``team_board.{db,evidence,prclaim,reviewhead,
+    merges,model}``。
     """
 
     from . import merge_guard

@@ -74,7 +74,9 @@ grep / 文档 / 测试逐字断言）：
   认账字段的同步合并提交。
 
 判据本身不看「你用什么方式补上 main」，但**别的闸门会**：rebase 的方式与人选由 `commit-identity`
-管，合并提交的形状由 `merge-accountability` 管。本闸门只回答祖先关系，不替那两道闸门背书。
+管，合并提交的形状由 `merge-accountability` 管。本闸门只回答祖先关系，不替这两道 CI 闸门
+（`commit-identity` / `merge-accountability`）背书 —— 它们与合并前的三道证据闸门
+（认领唯一性 → 证据状态机 → 双问绑定）也互不背书。
 
 通过时的证据行（下游 grep 这一行）：
 
@@ -98,7 +100,7 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/bas
 预检 | PASS | gh pr view 20 -R alsj213/team-board --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
 head sha | PASS | 2e130b963160aca12e3548f2a1341b3ca23fb87c
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
-证据状态机 | PASS | evidence.audit(card=t_deadbeef, head=2e130b963160aca12e3548f2a1341b3ca23fb87c) | rc=0 | tier=B, qa_pass=*** review=defect+regression
+证据状态机 | PASS | PYTHONPATH=src python3 -m team_board.cli evidence audit --card t_deadbeef --head 2e130b963160aca12e3548f2a1341b3ca23fb87c --pr 20 --db <board> | rc=0 | tier=B, qa_pass=*** review=defect+regression
 双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 2e130b963160 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
 rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 70ce884 是 head 2e130b9 的祖先（已 rebase 到 main）
 合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 2e130b963160aca12e3548f2a1341b3ca23fb87c --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
