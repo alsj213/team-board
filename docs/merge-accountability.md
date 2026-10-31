@@ -142,7 +142,7 @@ team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
 卡面认账块由 `merge-record` 生成、合并后由
 `merge-audit --card <卡号> --require` 回读合并提交 sha 补一行：
 
-1. 合并前：`team-board merge-record --card t_xxx --by pm/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt`
+1. 合并前：`team-board merge-record --card t_xxx --by repo/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt`
    打印 body 段（三行 trailer）+ 卡面认账块说明 + 一行 `merge_guard` 合并命令（R12 ① 的
    唯一入口，带齐 `--delete-branch` 与认账四参数；**只打印，不执行**）；`--check-file PATH`
    是另一模式：合并前预检一份 body 文件是否三字段齐
@@ -171,7 +171,7 @@ team-board merge-audit --repo . --card t_xxxxxxx --require; echo "rc=$?"
 ```bash
 # 1. 生成认账 body + 一行可直接照抄的 merge_guard 合并命令（只打印，不执行 git/gh）
 PYTHONPATH=src python -m team_board.cli merge-record \
-  --card t_xxx --by pm/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt
+  --card t_xxx --by repo/runNNN --pr NN --branch wt/t_xxx --body-out /tmp/t_xxx-merge-body.txt
 
 # 2. R6 三条前置（不改门槛）
 PYTHONPATH=src python -m team_board.cli merge-record --check-file /tmp/t_xxx-merge-body.txt
@@ -181,7 +181,7 @@ gh pr view NN -R alsj213/team-board --json headRefName        # 必须是 wt/t_x
 
 # 3. 合并（唯一入口 merge_guard：--body-file 带进合并提交 message，认账三字段随命令走）
 python -m team_board.merge_guard --pr NN --branch wt/t_xxx --method merge --delete-branch \
-  --card t_xxx --by pm/runNNN --subject "<subject>" \
+  --card t_xxx --by repo/runNNN --subject "<subject>" \
   --body-file /tmp/t_xxx-merge-body.txt; echo "rc=$?"
 # --subject / --body-file 缺任一项即 rc2、零 gh 调用：不带它们时 gh 用默认文案生成合并
 # 提交，message 里没有任何 trailer，第 5 步的 merge-audit --require 必红。

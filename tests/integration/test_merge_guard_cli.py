@@ -28,7 +28,7 @@ from team_board import merge_guard as mg
 CARD_BRANCH = "wt/t_bbeab29f"
 #: 认账四参数的默认取值（合并模式必填；body 文件由 fixture 写在临时目录里）
 MERGE_CARD = "t_bbeab29f"
-MERGE_BY = "pm/run200"
+MERGE_BY = "repo/run200"
 MERGE_SUBJECT = "Merge PR #9（t_bbeab29f）"
 #: 合法 body：恰好三行 trailer（与 ``team-board merge-record --body-out`` 的输出同形）
 BODY_TEXT = (
@@ -1547,6 +1547,10 @@ def _fill_documented(argv: list[str], stub: Stub) -> list[str]:
         .replace("<卡号>", MERGE_CARD)
         .replace("<NNN>", "200")
         .replace("<body-file>", str(stub.body_file))
+        # R15：执行者只能是 repo。docs/merge-policy.md 的样例行仍写旧 profile
+        # （改它归 G1-b），这里按 repo 填，否则占位值自己就把命令挡在预检之前 ——
+        # 那不再是「文档命令能不能跑」的判据。G1-b 改完文档后这两条 replace 变成空操作。
+        .replace("pm/run", "repo/run")
         for arg in argv
     ]
 
@@ -1681,7 +1685,9 @@ def _fill_readme(argv: list[str], stub: Stub) -> list[str]:
 
     mapping = {
         "<卡号>": MERGE_CARD,
-        "<profile>": "pm",
+        # R15：合并权归 repo bot，``--by`` 的 profile 只能是 repo（``<profile>`` 占位符
+        # 现在只有一个合法展开值）
+        "<profile>": "repo",
         "<NNN>": "200",
         "<subject>": MERGE_SUBJECT,
         "<body文件>": str(stub.body_file),
@@ -2251,7 +2257,7 @@ def test_merge_guard_commit_passes_merge_audit_require(
         encoding="utf-8",
     )
     # 判据①（merged-by 的 profile == 该卡 tasks.assignee）要读看板库：造一份最小库，
-    # 探针卡 assignee=pm，与 merged-by: pm/run200 的 profile 严格一致。
+    # 探针卡 assignee=repo，与 merged-by: repo/run200 的 profile 严格一致。
     # 同一份库也给 merge_guard 的认领闸门用：探针卡正文认领 PR #PROBE_PR。
     board = tmp_path / "board.db"
     with sqlite3.connect(board) as conn:
@@ -2260,7 +2266,7 @@ def test_merge_guard_commit_passes_merge_audit_require(
         )
         conn.execute(
             "INSERT INTO tasks (id, assignee, status, body) VALUES (?, ?, ?, ?)",
-            (PROBE_CARD, "pm", "running", f"PR-CLAIM: #{PROBE_PR}\n"),
+            (PROBE_CARD, "repo", "running", f"PR-CLAIM: #{PROBE_PR}\n"),
         )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_REAL_GIT", REAL_GIT)
@@ -2309,7 +2315,7 @@ def test_merge_guard_commit_passes_merge_audit_require(
 
     # 真 git 看到的合并提交：2 个父提交 + 三行 trailer
     message = _git("log", "-1", "--format=%B", cwd=work).stdout
-    assert "merged-by: pm/run200" in message
+    assert f"merged-by: {MERGE_BY}" in message
     assert f"merge-card: {PROBE_CARD}" in message
     assert f"merge-pr: #{PROBE_PR}" in message
 

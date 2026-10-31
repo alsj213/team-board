@@ -19,7 +19,7 @@ HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
 
 #: 认账四参数的默认取值（合并模式必填）
 MERGE_CARD = "t_bbeab29f"
-MERGE_BY = "pm/run200"
+MERGE_BY = "repo/run200"
 MERGE_SUBJECT = "Merge PR #9（t_bbeab29f）"
 #: 仓库核对 / ``-R`` 钉死用的 ``owner/name``（= ``reviewhead.REPO`` 的小写形态）
 REPO_SLUG = "alsj213/team-board"
