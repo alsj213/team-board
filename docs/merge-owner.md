@@ -87,7 +87,7 @@ $ PYTHONPATH=src python3 -m team_board.cli merge-owner-audit t_cd645098 --timeou
 证据 PR、明确决定不合并的 PR，在本卡正文**顶格**写一行：
 
 ```
-PR-MERGE-EXEMPT: #57
+PR-MERGE-EXEMPT: #123
 ```
 
 - 顶格、整行、无尾随字符；缩进一格、行尾多一个空格、`#0`、`#034` 都不算（CRLF 的 `\r` 认）。
@@ -103,7 +103,7 @@ PR-MERGE-EXEMPT: #57
 
 - stderr 一行 `warn: gh 不可用（<原因>）→ 降级放行，晨报须列`；
 - 每条 `WARN` 追加一行到 `<log-dir>/merge-owner-audit-<卡号>.log`，行格式
-  `<UTC ISO8601 秒精度> warn pr=<n> <原因>`（实测三行 `2026-10-31T03:50:11Z warn pr=46 gh rc=1`）。
+  `<UTC ISO8601 秒精度> warn pr=<n> <原因>`（实测三行 `2026-10-31T03:57:25Z warn pr=46 gh rc=1`）。
 - 日志目录不可写只在 stderr 补一行 `warn: 日志写入失败: …`，**rc 不变**（日志是留痕，不是判定）。
 
 实测（`gh` 换成固定 `exit 1` 的假命令）：
@@ -121,7 +121,8 @@ $ PATH=<假 gh 目录>:$PATH PYTHONPATH=src python3 -m team_board.cli merge-owne
 
 - **本命令 = 源头拦截**（关闭前）：卡要关，先证明它交付的每个 PR 都有合并归属。没过就关不了。
 - **`pr_orphan_autoclose.py` = 漏网修复**（事后）：PR 开着却没有任何未结卡认领 → 自动建一张
-  收口卡（首行 `PR-CLAIM: #<n>`）交给 pm。当前由 ops 的 crontab 每 30 分钟跑一次
+  收口卡（首行 `PR-CLAIM: #<n>`；按 R15 合并权归 repo，`assignee` 必须是 `repo`）交给 repo bot。
+  当前由 ops 的 crontab 每 30 分钟跑一次
   （`*/30 * * * * … pr_orphan_autoclose.py --apply`），脚本默认 dry-run、`--apply` 才建卡，
   跳过 head 前缀 `evidence/` 与标题含「证据 PR / 不合并」的 PR，同一 PR 12 小时内只自动建一次、
   每轮最多 2 张。
