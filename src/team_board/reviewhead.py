@@ -30,6 +30,7 @@ rc2 一律在取数阶段抛出 :class:`ReviewHeadError`，所以 stdout 一个�
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess  # nosec B404
 from collections.abc import Iterable, Sequence
@@ -291,6 +292,27 @@ NUMSTAT_ROW_RE = re.compile(r"(?:[0-9]+|-)\t(?:[0-9]+|-)\t.*", re.ASCII)
 #: 混排输出里 patch 段的起始行前缀（``--numstat`` 之后紧跟的整份 patch）。
 PATCH_SECTION_PREFIXES = ("diff --git ", "diff --cc ", "diff --combined ")
 
+#: git 子进程环境里**必须摘掉**的键（「指向别处」类）：
+#: 留着就会让「在 B 仓算指纹」被静默搬到 A 仓上去算 —— 结果看着正常，算的是另一个仓。
+GIT_ENV_STRIP_EXACT = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_CONFIG_COUNT",
+    }
+)
+
+#: 同上，按前缀摘：``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 成对注入 git 配置
+GIT_ENV_STRIP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+#: 「按提交 sha 算指纹」时 sha 的形态：40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径）
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+
 
 class PatchIdError(Exception):
     """git 侧失败（缺 git / 超时 / 非 UTF-8 / 非 0 退出）：CLI 层映射 rc2。"""
@@ -315,6 +337,47 @@ class Fingerprint:
     paths: tuple[str, ...]
 
 
+def _git_env() -> dict[str, str]:
+    """git 子进程的环境：复制 ``os.environ``，只摘「指向别处」的那些开关。
+
+    摘掉的键见 :data:`GIT_ENV_STRIP_EXACT` / :data:`GIT_ENV_STRIP_PREFIXES`；其余原样
+    保留 —— SSH（``GIT_SSH*`` / ``SSH_AUTH_SOCK`` / ``GIT_ASKPASS``）与代理
+    （``HTTPS_PROXY`` / ``https_proxy`` 等）凭据变量必须留着，否则 ``fetch`` 会被误判成
+    环境故障。摘 ``GIT_CONFIG_COUNT`` 那组是因为它们能把 ``color.ui=always`` 之类配置
+    注进子进程，破坏「同一份内容 ⇒ 同一指纹」。
+    """
+
+    env = dict(os.environ)
+    for key in list(env):
+        if key in GIT_ENV_STRIP_EXACT or key.startswith(GIT_ENV_STRIP_PREFIXES):
+            del env[key]
+    return env
+
+
+def _check_rev(value: object, what: str) -> str:
+    """rev 形态：非空字符串、且不以 ``-`` 开头。
+
+    ``-`` 开头的 rev 会被 git 当成选项（``--help`` / ``-n1`` / ``--output=…``），
+    等于把调用面交给调用方 —— 这里一律 :class:`PatchIdError`，不往下传。
+    """
+
+    if not isinstance(value, str):
+        raise PatchIdError(f"{what} 非法：{value!r}（应为字符串形态的 rev）")
+    if not value:
+        raise PatchIdError(f"{what} 非法：空字符串（应为非空 rev）")
+    if value.startswith("-"):
+        raise PatchIdError(f"{what} 非法：{value!r}（以 '-' 开头，会被 git 当成选项）")
+    return value
+
+
+def _check_commit_sha(value: object) -> str:
+    """提交 sha 形态：40 位小写十六进制，否则 :class:`PatchIdError`。"""
+
+    if not isinstance(value, str) or COMMIT_SHA_RE.fullmatch(value) is None:
+        raise PatchIdError(f"提交 sha 非法：{value!r}（应为 40 位小写十六进制）")
+    return value
+
+
 def _run_git(
     repo: str | Path,
     argv: Sequence[str],
@@ -326,6 +389,7 @@ def _run_git(
 
     只在**执行不成立**时抛 :class:`PatchIdError`（缺 git / 超时 / 其它 OSError）；
     rc 由调用方判 —— 有的调用（``merge-base`` / ``cat-file``）本来就允许非 0。
+    环境走 :func:`_git_env`（摘掉 ``GIT_DIR`` 一类「指向别处」的开关）。
     """
 
     label = what or " ".join(argv)
@@ -339,6 +403,7 @@ def _run_git(
             capture_output=True,
             check=False,
             shell=False,
+            env=_git_env(),
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
@@ -418,26 +483,39 @@ def _numstat_rows(raw: str, label: str) -> list[str]:
 def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
     """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（``FINGERPRINT_ALGO``）。
 
-    1. ``merge-base`` 取分叉点，rc≠0（不是共同祖先 / 未知 rev）→ :class:`PatchIdError`；
-    2. ``diff --numstat -U0 mb head``：空输出 → ``kind="empty"``；任一行以
+    1. ``merge-base --all`` 取分叉点：候选**恰好 1 个**才算数 —— rc≠0（不是共同祖先 /
+       未知 rev）或候选 ≠1（criss-cross，没有唯一分叉点）→ :class:`PatchIdError`；
+    2. ``diff --numstat --no-color -U0 mb head``：空输出 → ``kind="empty"``；任一行以
        ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
     3. 否则 ``diff -U0 --no-color mb head | patch-id --stable`` 的第一列 40 hex →
        ``kind="patch"``。
+
+    两次 diff 都带 ``--no-color``（numstat 也带），``color.ui=always`` 不许改变指纹。
+    ``base_ref`` / ``head_rev`` 以 ``-`` 开头一律 :class:`PatchIdError`（会被当选项吃）。
     """
 
-    mb_proc = _run_git(
-        repo,
-        ("merge-base", base_ref, head_rev),
-        what=f"git merge-base {base_ref} {head_rev}",
-    )
-    _expect_ok(mb_proc, f"git merge-base {base_ref} {head_rev}")
-    merge_base = _stdout_text(mb_proc, "git merge-base").strip()
-    if not merge_base:
-        raise PatchIdError(f"git merge-base {base_ref} {head_rev} 无输出（空 merge base）")
+    base = _check_rev(base_ref, "base_ref")
+    head = _check_rev(head_rev, "head_rev")
+    mb_label = f"git merge-base --all {base} {head}"
+    mb_proc = _run_git(repo, ("merge-base", "--all", base, head), what=mb_label)
+    _expect_ok(mb_proc, mb_label)
+    candidates = [
+        line.strip()
+        for line in _stdout_text(mb_proc, mb_label).splitlines()
+        if line.strip()
+    ]
+    if len(candidates) != 1:
+        raise PatchIdError(
+            f"{mb_label} 得到 {len(candidates)} 个候选 merge base（应为 1 个；"
+            "多基 = criss-cross 历史没有唯一分叉点，按取不到处理，不猜）"
+        )
+    merge_base = candidates[0]
 
-    numstat_label = "git diff --numstat -U0"
+    numstat_label = "git diff --numstat --no-color -U0"
     numstat_raw = _stdout_text(
-        _expect_and_get(repo, ("diff", "--numstat", "-U0", merge_base, head_rev), numstat_label),
+        _expect_and_get(
+            repo, ("diff", "--numstat", "--no-color", "-U0", merge_base, head), numstat_label
+        ),
         numstat_label,
     )
     if not numstat_raw.strip():
@@ -452,7 +530,7 @@ def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
 
     diff_label = "git diff -U0 --no-color"
     diff_proc = _expect_and_get(
-        repo, ("diff", "-U0", "--no-color", merge_base, head_rev), diff_label
+        repo, ("diff", "-U0", "--no-color", merge_base, head), diff_label
     )
     pid_label = "git patch-id --stable"
     pid_proc = _run_git(
@@ -487,9 +565,15 @@ def fingerprint_of_commit(
 
     取不到对象不是异常（调用方按「不可验证」处理）：fetch 失败（含超时 / rc≠0 /
     没有这个 remote）→ 返回 ``None``。真·环境故障（缺 git、diff 失败、非 UTF-8）
-    仍然是 :class:`PatchIdError`。
+    仍然是 :class:`PatchIdError` —— 所以 ``except GitMissingError: raise`` 必须排在
+    ``except PatchIdError: return None`` 之前，否则「PATH 里没有 git」会被静默吞成
+    「这个 sha 取不到」。
+
+    ``sha`` 必须是 40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
+    :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验。
     """
 
+    sha = _check_commit_sha(sha)
     if not _has_commit(repo, sha):
         fetch_label = f"git fetch --no-tags --quiet {remote} {sha}"
         try:
@@ -498,6 +582,9 @@ def fingerprint_of_commit(
                 ("fetch", "--no-tags", "--quiet", remote, sha),
                 what=fetch_label,
             )
+        except GitMissingError:
+            # 缺 git 是环境故障，不许被下面那条当成「对象取不到」
+            raise
         except PatchIdError:
             # 缺 git 之外的失败（网络 / 超时 / 没这个 remote / rc≠0）都归「对象取不到」
             return None
