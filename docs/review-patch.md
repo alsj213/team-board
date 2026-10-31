@@ -39,7 +39,7 @@ REVIEW-KIND: defect|regression         这一条是哪一类双问
   # 1) 审计报告：看到的是哪一份内容
   $ PYTHONPATH=src python3 -m team_board.cli pr-review-head-audit \
       --pr <PR 号> --head <40 位 head sha> --repo <checkout 路径>
-  algo=diff-sha256-U0-v1 current=<前 12 位> base=<base 的 40 位> mb=<merge-base 前 12 位>
+  algo=diff-sha256-U0-v1 current=<前 12 位> base=<--base 原样> mb=<merge-base 前 12 位>
 
   # 2) 完整 40 位（与指纹层同一算法：只丢 @@ 头与 index 行，其余逐字节进 sha256）
   $ mb=$(git -C <checkout> merge-base <base> <head>)
@@ -52,7 +52,9 @@ REVIEW-KIND: defect|regression         这一条是哪一类双问
   `64c73bcd6d673735bcab6116d9db34e7e9131515` —— 前 12 位一致，就是同一份指纹。
   （「报告只打印前 12 位」这个不便已单独立卡跟进，见本文末。）
   `--repo` 默认 `.`、`--base` 默认 `origin/main`（解析不到回退 `main`）、`--remote` 默认
-  `origin`；`--head` 是**预检读到的 head 提交**，不是分支名。
+  `origin`；`--head` 是**预检读到的 head 提交**，不是分支名。首行 `base=` **只是回显
+  `--base` 原样**（ref 名或 40 位 sha 都照原样打印，没传时打印实际用上的 `origin/main`），
+  CLI 不替你解析成 sha —— 所以 `--base main` 的样例行输出就是 `base=main`。
 - 报告其余部分：第二行 `扫描正文 N 条；带标记行 M 条`，随后每条标记一行
   `<状态> <标记指向的内容前 12 位> <kind>`（状态见第五节），最后一行 `结论: …`。
 - 退出码：`0` 绑定成立 / `1` 该内容上双问不齐（缺类、缺证、标记指向别的内容、取不到对象）/
@@ -91,7 +93,8 @@ REVIEW-KIND: defect|regression         这一条是哪一类双问
 ## 三、纯 rebase 不变：实测表
 
 真 git 造提交（`git init` 一个临时仓库，`feat` 分支 `git rebase` 到动过的 `main` 上），
-`base` / `head` 显示前 12 位，指纹是完整 40 位：
+`base` / `head` 显示前 12 位，指纹是完整 40 位（临时仓库每次探针运行都重建 → 短 sha 会变，
+指纹、`base=` 回显与结论行的形态不变）：
 
 | 场景 | base | head | 内容指纹 | kind | 对照 `patch-id --stable` |
 | --- | --- | --- | --- | --- | --- |
@@ -117,7 +120,7 @@ REVIEW-KIND: defect|regression         这一条是哪一类双问
 ```
 $ PYTHONPATH=src python3 -m team_board.cli pr-review-head-audit --pr 4 --head <rebase 后的 head> --repo <临时仓库> --base main
 exit 0
-algo=diff-sha256-U0-v1 current=64c73bcd6d67 base=b4664460d4f6e550c01636654b8808bdc92f67f7 mb=b097e682766b
+algo=diff-sha256-U0-v1 current=64c73bcd6d67 base=main mb=b097e682766b
 结论: 内容指纹 64c73bcd6d67 的 defect + regression 各 >=1 条 → 绑定成立
 ```
 
@@ -141,7 +144,7 @@ exit 1
 
 $ ... pr-review-head-audit --pr 9 --head <与 base 相同的提交> --repo <临时仓库> --base main
 exit 1
-结论: 分支相对 b4664460d4f6e550c01636654b8808bdc92f67f7 无差异 → 无可绑定内容（不许当 PASS）
+结论: 分支相对 main 无差异 → 无可绑定内容（不许当 PASS）
 ```
 
 合并侧（`merge_guard` 双问绑定闸门）对这两种范围的拒绝文案是**同一条**
@@ -179,7 +182,7 @@ REVIEW-KIND: defect|regression
 ```
 $ PYTHONPATH=src python3 -m team_board.cli pr-review-head-audit --pr 5 --head <rebase 后的 head> --repo <临时仓库> --base main
 exit 0
-algo=diff-sha256-U0-v1 current=64c73bcd6d67 base=b4664460d4f6e550c01636654b8808bdc92f67f7 mb=b4664460d4f6
+algo=diff-sha256-U0-v1 current=64c73bcd6d67 base=main mb=b4664460d4f6
 扫描正文 2 条；带标记行 2 条
   LEGACY-OK 99af27724ade defect
   LEGACY-OK 99af27724ade regression
