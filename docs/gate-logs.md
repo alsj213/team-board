@@ -21,9 +21,16 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 | `--gate <名>` | 是 | 闸门名，日志文件名前缀。字母数字开头，其后字母数字与 `._-` |
 | `--card t_xxxxxxxx` | 是 | 卡号，日志文件名后缀。`t_` + 8 位小写十六进制 |
 | `--log-dir DIR` | 否 | 日志目录，默认 `evidence` |
-| `--` 之后 | 是 | 要执行的命令与参数，按列表 exec、**不经 shell** |
+| `--` 之后 | 否（**一律带上**） | 要执行的命令与参数，按列表 exec、**不经 shell** |
 
 `--` 之后为空 → rc2（`错误: 缺少要执行的命令（-- 之后至少一个）`）。
+
+`--` 严格说可省，但**一律带上**：首个 token 不像选项时 parser 直接把它当位置参数 —— 实测
+`gate --gate nosep --card t_facc5c45 --log-dir /tmp/gl472 /bin/echo hi` → 摘要齐全、rc0；
+首个 token **像选项**（`-q`、`--foo`）时会被**顶层** parser 吞掉，落的是顶层文案而不是
+`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行** 253 字节，
+首行 `usage: team-board [-h]`、末行 `team-board: error: unrecognized arguments: -q`、
+stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: error:`」的例外里）。
 
 ### 前置：`gate` 只在含 PR #50 的树里；解释器写绝对路径；cwd 是本卡 worktree
 
@@ -76,7 +83,11 @@ counts: passed=49 failed=0 error=0 skipped=0
 log: /home/liu/project/tb-wt/t_facc5c45/evidence/pytest-t_facc5c45.log
 ```
 
-通过的 `ruff`（没有 pytest 风格计数行 → `counts: 未解析`，其余照常）：
+通过的 `ruff`（没有 pytest 风格计数行 → `counts: 未解析`，其余照常）。**「未解析」只对通过的情形成立**：
+失败时 ruff 的 `Found 2 errors.` 正好命中 `_COUNTS_RE`，被解析成
+`counts: passed=0 failed=0 error=2 skipped=0`（`failed` 恒 0，数字看着像「没失败」）——
+**判定看 `exit:` 不看 `counts:`**（2026-10-31 实测：同一 worktree、两处 F401 的文件 → `exit: 1`、
+`counts: … error=2 …`、`末尾行（20/27，≤20）` 里带着 `Found 2 errors.`）：
 
 ```
 $ $PY -m team_board.cli gate --gate ruff --card t_facc5c45 -- /usr/bin/env PYTHONPATH=src $PY -m ruff check src tests
@@ -126,6 +137,9 @@ log: /home/liu/project/tb-wt/t_facc5c45/evidence/body-audit-t_facc5c45.log
 注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算（当日 `合计：270 张；超限：142 张`）；
 **不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：当日 19 张、超限 0 张）时 rc=0 ——
 两者都是 rc 原样透传。上面与这里的数字是 **2026-10-31 CST 当日快照**，真板卡数会漂移，复跑以当场输出为准。
+**别整行贴「超限清单」**：它是**单行**、随卡数线性增长（实测 142 张 = 1591 字节 ≈ 11.2 字节/卡），
+卡再多几百张就顶到 8192 的单条上限（§4 第 5 条）。卡上只贴到「末尾行」节，或把该行截成
+`超限清单（142 张）：t_f43fa954 …` 再给 `log:` 路径。
 
 ### 树里没有 `gate` 时：兜底等价写法
 
@@ -135,8 +149,16 @@ PR #50 之前的树，或还没把 `21d40b9` rebase 进来的 worktree，`gate` 
 
 ```
 $ cd /home/liu/project/tb-wt/t_xxxxxxxx          # 本卡 worktree
-$ <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
+$ env PYTHONPATH=src <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
 ```
+
+`env PYTHONPATH=src` 这个前缀不是装饰：`.venv` 里 `team-board` 是**已安装**的、指主 checkout，
+而前置第 1 条又让你 `export PYTHONPATH=<含 gate 的树>/src`。少了前缀，pytest 跑的是主 checkout
+的代码 —— 本卡 diff 一行没验，rc 照样是 0，就是前置第 3 条说的假证据。同 cwd 实测
+`team_board.__file__`：沿用外层 `PYTHONPATH` → `/home/liu/project/team-board/src/team_board/__init__.py`；
+加 `env PYTHONPATH=src` → `/home/liu/project/tb-wt/t_facc5c45/src/team_board/__init__.py`。
+**别用 `unset PYTHONPATH` 代替**：实测 unset 之后 import 到的仍是
+`/home/liu/project/team-board/src/…`（editable 装的就是那棵树），一样验错树。
 
 `$?` 是被包装命令自己的 rc（2026-10-31 实测 `/bin/sh -c 'exit 1'` → `rc=1`，日志里有它的输出）。
 代价是**没有摘要**：`counts:` / 失败行 / 末尾行 一律没有，卡上能贴的只剩 `rc=` 和日志绝对路径。
@@ -153,12 +175,19 @@ $ <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
 - **落盘内容**：子命令的 stdout 与 stderr **合流**（`stderr=subprocess.STDOUT`），先按**解释器的文本
   编码**解码（`subprocess.run(..., text=True, errors="replace")`），再以 UTF-8 写文件
   （`gatelog.write_log` 里 `encoding="utf-8"`）。三条边界：
-  - **默认就是 UTF-8**（Python 3.7+ 的 UTF-8 mode，`PYTHONUTF8` 未显式关掉时），检查器输出按原字节
-    还原，不经过任何替换；
-  - **显式 `PYTHONUTF8=0` + 非 UTF-8 locale**（例 `LC_ALL=C`）时解码用 `ascii`，非 ASCII 字节全变
-    `U+FFFD` —— 实测 `printf '中文ok\n'` 落成 `ef bf bd`×6 + `ok`；此时 gate 自己的 stdout 也编不出
-    中文摘要，**多以 rc2 退出**（`错误: 当前 stdout 编码 'ascii' 无法表示输出里的中文…`），而日志
-    在退出**之前**已写好 —— 读到 U+FFFD 先看卡上 rc 是不是 2，别当检查器的输出坏了；
+  - **默认就是 UTF-8**，但来源有两个，**都不是**「Python 3.7+ 的 UTF-8 mode 默认开」：① locale 本身
+    是 UTF-8（本机 `LANG=C.UTF-8`，`sys.flags.utf8_mode == 0`）；② locale 是 `C`/POSIX 时 **PEP 538**
+    把 C locale 协同成 `C.UTF-8`，并借 **PEP 540** 打开 UTF-8 mode —— 实测 `LC_ALL=C` 下
+    `sys.stdout.encoding == 'utf-8'`、`sys.flags.utf8_mode == 1`。UTF-8 mode **默认开**要到
+    **PEP 686 / Python 3.15**（PEP 原文 `Python will enable UTF-8 mode by default from Python 3.15`）；
+    本机解释器是 3.14.7，仍靠上面两条。两条任一成立时，检查器输出按原字节还原，不经过任何替换；
+  - **显式 `PYTHONUTF8=0` / `-X utf8=0` 且 locale 非 UTF-8**（例 `LC_ALL=C`，实测 `-X utf8=0` 下
+    `sys.stdout.encoding == 'ascii'`）时解码用 `ascii`，非 ASCII 字节全变 `U+FFFD` —— 实测
+    `printf '中文ok\n'` 落成 `ef bf bd`×6 + `ok`；此时 gate 自己的 stdout 也编不出中文摘要，
+    **必然 rc2**（摘要恒含中文，不是「多以」）—— `PYTHONIOENCODING=ascii` 与 `PYTHONUTF8=0 LC_ALL=C`
+    两次实测都是 rc2、stderr 恰一行 `错误: 当前 stdout 编码 'ascii' 无法表示输出里的中文…`，而日志
+    在退出**之前**已写好（两次都留下 3 字节 `hi\n`）—— 读到 U+FFFD 先看卡上 rc 是不是 2，别当
+    检查器的输出坏了；
   - 检查器输出里的**非 UTF-8 字节**同样替换为 `U+FFFD`，不截断。
   跨流的严格时序**不保证** —— 合流只保证同一个 fd 上的先后，子进程自己的
   stdout 缓冲会让两流相对顺序与程序逻辑顺序不同。
@@ -179,6 +208,9 @@ stdout 有完整摘要、stderr 为空。
 上面那句有一个例外：**argparse 参数解析失败**（缺必填参数、未知子命令、未知选项）发生在
 `_run_gate` 之前，落的是 argparse 自己的文案，不是 `错误:` 那一行 —— stderr 是 `usage: …` 加
 `team-board gate: error: …` **两行**（无 `错误:` 前缀），stdout 仍为 0 字节，rc 仍为 2，不写日志。
+（若连 `--` 也省了、首个 token 又像选项，报错来自**顶层** parser：`usage: team-board [-h]` 开头、
+`team-board: error: unrecognized arguments: …` 结尾的 **3 行**，见 §1 对 `--` 的说明。）
+
 2026-10-31 实测（缺 `--gate`）：
 
 ```
@@ -245,10 +277,27 @@ log: <日志文件的绝对路径>
    **但摘要 ≠ R3 全套证据**：R3 要的是「rc0 / rc1 / rc2 各一条复跑命令」加声明过的取值域边界
    （0 / 负数 / 13 位毫秒 / 天文数字 / 空串各一条），gate 摘要只覆盖**它包装的那一条命令**。
    拿一条 `pytest` 的 `exit: 0` 当全套证据，照样会被打回 —— 缺的那几条得自己再跑、再贴；
-4. 单条评论 / `tasks.result` 的 UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
+4. **摘要按行截断，不按字节**：失败行 / 末尾行各 ≤20 **行**，单行长度不设上限 —— 单行巨长
+   （JSON dump、长 lint 行、`body-audit --all` 的超限清单单行）时摘要**自己**就超 8192，
+   照第 1 条贴照样违规。实测一条 200000 字符的单行：日志 200004 字节、摘要 **200166 字节**
+   （摘要总共才 8 行）。先量再贴：摘要 `| wc -c`，超 8192 就只贴 `log:` 路径 +
+   `sed -n '<a>,<b>p' <日志>` 取段；
+5. 同一条边界也管**评论 / `tasks.result` 本身**：UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
    全文贴法一超就违规。这一条由 `output-audit` 子命令**机器判定**（已合入 `main`，实现在
-   `src/team_board/outputaudit.py`；`-m team_board.cli output-audit --help` rc=0）：
-   rc0 = 无超限 / rc1 = 有超限 / rc2 = 参数或环境错误；默认只算未结卡，`--all` 连 `done` 卡一起算。
+   `src/team_board/outputaudit.py`）：rc0 = 无超限 / rc1 = 有超限 / rc2 = 参数或环境错误；
+   默认只算未结卡，`--all` 连 `done` 卡一起算。
+
+   自检命令写死「**在本卡 worktree** + `env PYTHONPATH=src`」：
+
+   ```
+   $ cd <本卡 worktree> && env PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python \
+       -m team_board.cli output-audit --help
+   ```
+
+   rc0 才算树对了。**主 checkout 若还没 fetch 到 `ff679a7`**（output-audit 进 `main` 的那个提交），
+   同一条命令 rc2 `team-board: error: argument command: invalid choice: 'output-audit'` ——
+   那是**树的问题，不是有超限**（2026-10-31 实测：本卡 worktree rc0；主 checkout @ `21d40b9` rc2，
+   而 `git merge-base --is-ancestor ff679a7 origin/main` rc0）。
 
 ## 5. 边界
 
