@@ -23,7 +23,9 @@ $ sqlite3 -header -column ~/.hermes/kanban/boards/devteam/kanban.db \
 ```
 
 等价读法：取 `task_events` 里 `kind='changes_requested'` 的行，`payload.reason` 首行的
-`REWORK-CAUSE:` 值即归因；无此行的记 `UNTAGGED`。
+`REWORK-CAUSE:` 值即归因；无此行的记 `UNTAGGED`。本机没有 `sqlite3` CLI 时
+（`command -v sqlite3` rc=1，开发机实测如此），改用 Python 标准库 `sqlite3` 以只读方式
+（`file:<db>?mode=ro`）打开同一个 `kanban.db`，按这句等价读法取数，结果与上面命令同一份。
 
 结论：问题不在验收轮次太少，而在**验收标准出场太晚**——派卡时只有一句「完成目标」，跑完
 才第一次把判据说清，返工必然跑在实现者头上。修法是把验收标准前置：**派卡前写清判据，
