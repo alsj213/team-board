@@ -234,7 +234,11 @@ def _echo(value: object, limit: int = ECHO_LIMIT) -> str:
     head 会把终端刷屏、把日志撑爆。截断**只影响回显**，校验本身仍按完整输入做。
     """
 
-    text = repr(value)
+    try:
+        text = repr(value)
+    except ValueError:  # pragma: no cover - 只在 int 位数超 sys.int_info 上限（3.11+）时
+        # 超长 int 的 ``repr`` 自己会抛 ValueError；回显路径不许把格式化错误漏出去。
+        text = f"<{type(value).__name__}，位数过多无法回显>"
     if len(text) <= limit:
         return text
     note = f"…（共 {len(text)} 字符，已截断）"
@@ -255,13 +259,13 @@ def _as_pr(value: object, where: str) -> int:
     """PR 号必须是 1..999999999 的整数；字符串形态 ``"53"``、``bool``、越界全拒。"""
 
     if isinstance(value, bool):
-        raise _err(where, f"pr 必须是整数，不接受布尔值：{value!r}")
+        raise _err(where, f"pr 必须是整数，不接受布尔值：{_echo(value)}")
     if not isinstance(value, int):
         raise _err(
-            where, f"pr 必须是整数（不接受 {type(value).__name__} 形态）：{value!r}"
+            where, f"pr 必须是整数（不接受 {type(value).__name__} 形态）：{_echo(value)}"
         )
     if value < 1 or value > MAX_PR:
-        raise _err(where, f"pr 必须在 1..{MAX_PR} 之间：{value}")
+        raise _err(where, f"pr 必须在 1..{MAX_PR} 之间：{_echo(value)}")
     return value
 
 

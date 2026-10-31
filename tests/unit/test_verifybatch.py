@@ -345,6 +345,39 @@ class TestGitCallHardening:
             vb.resolve_head(tmp_path, "HEAD")
         assert "超时" in str(excinfo.value)
 
+    @pytest.mark.parametrize(
+        "bad_pr",
+        [
+            pytest.param("8" * 300, id="pr=300位字符串"),
+            pytest.param(int("9" * 300), id="pr=300位整数"),
+        ],
+    )
+    def test_long_pr_message_is_truncated(self, tmp_path: Path, bad_pr: object) -> None:
+        """``pr`` 的三条回显分支（布尔 / 非 int / 越界）也必须走 ``_echo``。
+
+        之前这里直接写 ``{value!r}`` / ``{value}``，300 位的 pr 会把一行错误消息撑到 300+
+        字符；qa 复审残留就出在这条路径上（同长度输入在 head/base/card 上已截断）。
+        """
+
+        path = write_plan(tmp_path, plan_with(units=[one_unit(pr=bad_pr)]))
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.load_plan(path)
+        message = str(excinfo.value)
+        assert "units[0].pr" in message
+        assert len(message) <= vb.ECHO_LIMIT + 100, len(message)
+        assert "已截断" in message
+
+    def test_echo_survives_int_str_digit_limit(self) -> None:
+        """位数超 ``int_max_str_digits``（4300）的 int 连 ``repr`` 都抛 ValueError。
+
+        这种值进不了 JSON plan，但 ``_as_pr`` 是公开可调的校验层；回显路径不许把
+        格式化异常漏成非 ``VerifyBatchError``。
+        """
+
+        text = vb._echo(10**5000)
+        assert "位数过多" in text
+        assert len(text) <= vb.ECHO_LIMIT
+
 
 class TestDataclasses:
     def test_fields_match_contract(self) -> None:
