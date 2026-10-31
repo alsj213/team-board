@@ -40,6 +40,8 @@ __all__ = [
     "CARD_RE",
     "DEFAULT_BASE",
     "DEFAULT_GROUP_CHECKS",
+    "ECHO_LIMIT",
+    "GIT_TIMEOUT_S",
     "KIND_HEAD",
     "KIND_PATCH",
     "KIND_SOLO",
@@ -60,6 +62,12 @@ CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
 
 #: PR 号上限（与 ``prclaim.MAX_PR`` 同一个数字：1..999999999）
 MAX_PR = 999999999
+
+#: 单条 git 调用的超时秒数（超时 → ``VerifyBatchError``，不挂死整条命令）
+GIT_TIMEOUT_S = 120.0
+
+#: 错误消息里回显用户输入的字符上限：超长输入（如 10 万字符的假 head）不许原样喷进 stderr
+ECHO_LIMIT = 200
 
 #: ``base`` 缺省值（§1）
 DEFAULT_BASE = "origin/main"
@@ -167,7 +175,12 @@ def _git(repo: str | os.PathLike[str], *args: str) -> subprocess.CompletedProces
             errors="strict",
             check=False,
             env=_git_env(),
+            timeout=GIT_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise VerifyBatchError(
+            f"git 调用超时（>{GIT_TIMEOUT_S:g}s）：git {' '.join(args)}"
+        ) from exc
     except FileNotFoundError as exc:
         raise VerifyBatchError("找不到 git 可执行文件（PATH 里没有 git），无法分组") from exc
     except UnicodeDecodeError as exc:
@@ -195,7 +208,12 @@ def _git_raw(
             check=False,
             env=_git_env(),
             input=stdin_bytes,
+            timeout=GIT_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise VerifyBatchError(
+            f"git 调用超时（>{GIT_TIMEOUT_S:g}s）：git {' '.join(args)}"
+        ) from exc
     except FileNotFoundError as exc:
         raise VerifyBatchError("找不到 git 可执行文件（PATH 里没有 git），无法算 patch-id") from exc
     except OSError as exc:
@@ -209,13 +227,27 @@ def _err(where: str, detail: str) -> VerifyBatchError:
     return VerifyBatchError(f"{where}: {detail}")
 
 
+def _echo(value: object, limit: int = ECHO_LIMIT) -> str:
+    """把用户输入渲染进错误消息：``repr`` 形态，超过 ``limit`` 字符就截断并标出总长。
+
+    为什么要有：错误消息会原样进 stderr（CLI 一行 ``错误: …``），一个 10 万字符的假
+    head 会把终端刷屏、把日志撑爆。截断**只影响回显**，校验本身仍按完整输入做。
+    """
+
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    note = f"…（共 {len(text)} 字符，已截断）"
+    return f"{text[: max(0, limit - len(note))]}{note}"
+
+
 def _as_card(value: object, where: str) -> str:
     """卡号必须逐字 ``t_[0-9a-f]{8}``（大小写敏感、不许带空白）。"""
 
     if not isinstance(value, str):
         raise _err(where, f"card 必须是字符串，实际是 {type(value).__name__}")
     if not CARD_RE.match(value):
-        raise _err(where, f'card 形态非法（须为 t_[0-9a-f]{{8}}）："{value}"')
+        raise _err(where, f"card 形态非法（须为 t_[0-9a-f]{{8}}）：{_echo(value)}")
     return value
 
 
@@ -243,15 +275,38 @@ def _as_head(value: object, where: str) -> str:
     if "\x00" in value:
         raise _err(where, "head 不许含 NUL")
     if any(ch.isspace() for ch in value):
-        raise _err(where, f'head 不许含空白（不是单个 git rev）："{value}"')
+        raise _err(where, f"head 不许含空白（不是单个 git rev）：{_echo(value)}")
     return value
+
+
+def _as_base(value: object, where: str) -> str:
+    """``base`` 是 git rev（缺省 ``origin/main``），与 :func:`_as_head` 同级校验。
+
+    额外一条：**不许以 ``-`` 开头**。``git merge-base <base> <head>`` 不隔离选项，
+    ``base="--help"`` 会被当选项解析（打印帮助、rc0、无祖先输出），``patch_id`` 于是
+    返回 ``None``、所有 unit 静默降级成 ``solo``/``head`` 组 —— 配置写错却 rc0 放行。
+    这类输入必须在 plan 校验层就报错，不许走到 git 里当「比不出来」。
+    """
+
+    if not isinstance(value, str):
+        raise _err(where, f"必须是字符串，实际是 {type(value).__name__}")
+    if not value.strip():
+        raise _err(where, "不许为空串")
+    if "\x00" in value:
+        raise _err(where, "不许含 NUL")
+    if any(ch.isspace() for ch in value):
+        raise _err(where, f"不许含空白（不是单个 git rev）：{_echo(value)}")
+    if value.startswith("-"):
+        raise _err(where, f"不许以 '-' 开头（会被 git 当选项解析）：{_echo(value)}")
+    return value
+
 
 
 def _as_argv(value: object, where: str) -> tuple[str, ...]:
     """一条命令 = 非空字符串数组（不经 shell，所以**不支持**字符串形态）。"""
 
     if isinstance(value, str):
-        raise _err(where, f'不接受字符串形态的命令（须为 argv 数组）："{value}"')
+        raise _err(where, f"不接受字符串形态的命令（须为 argv 数组）：{_echo(value)}")
     if not isinstance(value, list):
         raise _err(where, f"命令必须是 argv 数组，实际是 {type(value).__name__}")
     if not value:
@@ -297,10 +352,7 @@ def _parse_plan(raw: object) -> Plan:
         raise _err("plan", f"顶层必须是 JSON 对象，实际是 {type(raw).__name__}")
 
     base_raw = raw.get("base", DEFAULT_BASE)
-    if not isinstance(base_raw, str):
-        raise _err("base", f"必须是字符串，实际是 {type(base_raw).__name__}")
-    if not base_raw.strip():
-        raise _err("base", "不许为空串")
+    base = _as_base(base_raw, "base")
 
     checks_raw = raw.get("group_checks", [list(argv) for argv in DEFAULT_GROUP_CHECKS])
     group_checks = _as_argv_list(checks_raw, "group_checks")
@@ -314,7 +366,7 @@ def _parse_plan(raw: object) -> Plan:
         raise _err("units", "不许为空数组（没有待验证单元）")
 
     units = tuple(_parse_unit(item, index) for index, item in enumerate(units_raw))
-    return Plan(base=base_raw, group_checks=group_checks, units=units)
+    return Plan(base=base, group_checks=group_checks, units=units)
 
 
 def load_plan(path: str | os.PathLike[str]) -> Plan:
@@ -325,7 +377,7 @@ def load_plan(path: str | os.PathLike[str]) -> Plan:
     except (OSError, UnicodeError) as exc:
         # UnicodeDecodeError 不是 OSError（它是 UnicodeError/ValueError 子类），
         # 漏掉它会让非 UTF-8 的 plan 变成 traceback + rc1，打穿「不合法一律 rc2」契约。
-        raise VerifyBatchError(f"读不到 plan 文件 {os.fspath(path)}: {exc}") from exc
+        raise VerifyBatchError(f"读不到 plan 文件 {_echo(os.fspath(path))}: {exc}") from exc
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -351,7 +403,7 @@ def resolve_head(repo: str | os.PathLike[str], rev: str) -> str:
     if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         tail = detail[-1] if detail else f"退出码 {proc.returncode}"
-        raise VerifyBatchError(f'head "{rev}" 解析失败（不是本仓库里的提交）: {tail}')
+        raise VerifyBatchError(f"head {_echo(rev)} 解析失败（不是本仓库里的提交）: {tail}")
     return sha
 
 
@@ -369,7 +421,9 @@ def patch_id(repo: str | os.PathLike[str], base: str, head_sha: str) -> str | No
     if not ancestor:
         return None
 
-    diff = _git_raw(repo, "diff", "--binary", ancestor, head_sha)
+    diff = _git_raw(
+        repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", ancestor, head_sha
+    )
     if diff.returncode != 0 or not diff.stdout.strip():
         return None
 
@@ -410,6 +464,9 @@ def build_groups(repo: str | os.PathLike[str], plan: Plan) -> tuple[Group, ...]:
     """
 
     resolved: list[tuple[Unit, str, str | None]] = []
+    # base 在这里再校验一次：``Plan`` 是公开 dataclass，调用方可以绕开 ``load_plan``
+    # 手搓一个（pm 的复审探针就是这么构造的）。不校验就会把 ``--help`` / NUL 送进 git。
+    _as_base(plan.base, "base")
     for unit in plan.units:
         head_sha = resolve_head(repo, unit.head)
         resolved.append((unit, head_sha, patch_id(repo, plan.base, head_sha)))

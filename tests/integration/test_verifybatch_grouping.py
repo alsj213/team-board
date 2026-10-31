@@ -185,6 +185,24 @@ class TestPatchId:
     def test_unknown_base_is_none(self, repo: Repo) -> None:
         assert vb.patch_id(repo.path, "no-such-rev", repo.first) is None
 
+    def test_external_diff_env_does_not_hijack(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``GIT_EXTERNAL_DIFF`` 置位时 patch-id 仍按内容算，且两次一致。
+
+        不加 ``--no-ext-diff`` 时宿主环境的一个变量就能把 ``git diff`` 换成任意脚本，
+        ``patch_id`` 于是变 ``None``（或变成脚本输出算出来的垃圾值）—— 分组静默降级。
+        """
+
+        expected = vb.patch_id(repo.path, repo.base, repo.first)
+        assert expected is not None
+        shadow = tmp_path / "fakediff.sh"
+        shadow.write_text("#!/bin/sh\necho fake-diff-content\n", encoding="utf-8")
+        shadow.chmod(0o755)
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", str(shadow))
+        assert vb.patch_id(repo.path, repo.base, repo.first) == expected
+        assert vb.patch_id(repo.path, repo.base, repo.first) == expected
+
 
 class TestSamePatchDifferentHead:
     """验收第 1 条：``worktree add --detach`` + ``cherry-pick`` 造双胞胎 → 1 组 2 unit。"""

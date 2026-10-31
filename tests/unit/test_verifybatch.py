@@ -203,11 +203,32 @@ class TestLoadPlanRejects:
 
     @pytest.mark.parametrize(
         "bad_base",
-        [pytest.param("", id="空串"), pytest.param(53, id="整数"), pytest.param(None, id="null")],
+        [
+            pytest.param("", id="空串"),
+            pytest.param(53, id="整数"),
+            pytest.param(None, id="null"),
+            # 以下四条来自 PR #64 复审（base 与 head 同级校验 + 不许以 '-' 开头）
+            pytest.param("origin/main\x00--all", id="含NUL"),
+            pytest.param("--help", id="以-开头"),
+            pytest.param("-h", id="单破折号选项"),
+            pytest.param("a b", id="含空白"),
+            pytest.param("   ", id="全空白"),
+        ],
     )
     def test_bad_base(self, tmp_path: Path, bad_base: object) -> None:
         with pytest.raises(VerifyBatchError) as excinfo:
             vb.load_plan(write_plan(tmp_path, plan_with(base=bad_base)))
+        assert "base" in str(excinfo.value)
+
+    @pytest.mark.parametrize("bad_base", ["origin/main\x00--all", "--help", "a b"])
+    def test_bad_base_fails_in_build_groups_too(self, bad_base: str) -> None:
+        """手搓 ``Plan`` 绕开 ``load_plan`` 也要拦：``build_groups`` 自己再验一次 base。
+
+        pm 的复审探针就是直接构造 ``Plan`` 的 —— 只在校验层拦会把缺陷留给下游。
+        """
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.build_groups(".", Plan(base=bad_base, group_checks=(), units=()))
         assert "base" in str(excinfo.value)
 
     @pytest.mark.parametrize(
@@ -293,6 +314,36 @@ class TestBatchId:
         shas = ["034ae4c" + "0" * 33, "af45471" + "0" * 33]
         expected = "b-" + hashlib.sha256("\n".join(sorted(shas)).encode()).hexdigest()[:8]
         assert vb.batch_id_for(shas) == expected
+
+
+class TestGitCallHardening:
+    """PR #64 复审的两条加固：超长输入的回显截断、git 调用超时 → ``VerifyBatchError``。"""
+
+    def test_long_rev_message_is_truncated(self, tmp_path: Path) -> None:
+        """``resolve_head(repo, "a" * 100000)`` 的错误消息不许原样回显 10 万字符。"""
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.resolve_head(tmp_path, "a" * 100000)
+        message = str(excinfo.value)
+        assert len(message) <= vb.ECHO_LIMIT + 100, len(message)
+        assert "已截断" in message
+
+    def test_short_rev_message_kept_verbatim(self, tmp_path: Path) -> None:
+        """短输入照旧逐字回显（截断不许误伤正常输入的可读性）。"""
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.resolve_head(tmp_path, "deadbeef")
+        assert "'deadbeef'" in str(excinfo.value)
+
+    def test_git_timeout_becomes_verify_batch_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``subprocess.run(timeout=...)`` 触发时必须是 ``VerifyBatchError``，不许是 TimeoutExpired。"""
+
+        monkeypatch.setattr(vb, "GIT_TIMEOUT_S", 0.000001)
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.resolve_head(tmp_path, "HEAD")
+        assert "超时" in str(excinfo.value)
 
 
 class TestDataclasses:
