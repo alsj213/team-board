@@ -212,8 +212,20 @@ def test_binary_diff_is_binary_not_patch(tmp_path: Path) -> None:
     assert v2.kind == "binary" and v3.kind == "binary"
     assert v2.value is None and v3.value is None
     assert v2.paths == ("b.bin",) and v3.paths == ("b.bin",)
-    # 对照：patch-id 对这两个不同的二进制 blob 给同一个 id —— 上层不能靠它判「没变」
-    assert patch_id(repo, "main", "v2") == patch_id(repo, "main", "v3")
+    # 对照：diff 正文对两个不同 blob 一模一样（只有 "Binary files … differ" 这一行），
+    # 所以 patch-id 看不到内容差异 —— 上层不能靠它判「没变」，只能 fail-closed。
+    # （不断言两者的 patch-id 相等：该行为随 git 版本变化，git 2.34.1 相等、CI 的
+    #   runner 上新 git 不相等；判据落在「本模块一律返回 binary」上，版本无关。）
+    for rev in ("v2", "v3"):
+        diff = subprocess.run(
+            ["git", "-C", str(repo), "diff", "-U0", "--no-color", "main", rev],
+            capture_output=True,
+            env=_GIT_ENV,
+            check=True,
+        ).stdout
+        # 正文里没有 NUL、只有 "Binary files … differ" 一行 —— 内容差异对 patch-id 不可见
+        assert b"Binary files" in diff
+        assert b"\x00" not in diff
 
 
 def test_empty_diff_is_empty_and_unusable_revs_are_handled(tmp_path: Path) -> None:
