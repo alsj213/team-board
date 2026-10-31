@@ -561,16 +561,24 @@ def build_parser() -> argparse.ArgumentParser:
         "pr-claim-audit",
         help=(
             "稽核 PR 认领唯一性（0 恰好一张卡认领 / 1 无未结卡认领或重复认领 / "
-            "2 参数或环境错误）"
+            "2 参数或环境错误）；--gaps 模式列标题命中合并语义却没有首行 PR-CLAIM 的未结卡"
         ),
     )
-    claim_cmd.add_argument(
+    claim_scope = claim_cmd.add_mutually_exclusive_group(required=True)
+    claim_scope.add_argument(
         "--pr",
-        required=True,
         metavar="N",
         help=(
             f"PR 号（1-{prclaim.MAX_PR} 的 ASCII 十进制正整数；"
             "0 / 负数 / 13 位毫秒 / 空串 → rc2）"
+        ),
+    )
+    claim_scope.add_argument(
+        "--gaps",
+        action="store_true",
+        help=(
+            "缺口模式：列标题命中合并语义（合并卡/收口卡/合并 PR #N/收口：）"
+            "而正文首行不是 PR-CLAIM: #<n> 的未结卡（与 --pr 互斥）"
         ),
     )
     claim_cmd.add_argument(
@@ -1423,12 +1431,29 @@ def _run_pr_review_head_audit(args: argparse.Namespace) -> int:
 def _run_pr_claim_audit(args: argparse.Namespace) -> int:
     """``pr-claim-audit`` 子命令：读失败/参数错一律 stderr 一行 ``错误: …`` + rc2。
 
-    三个码的分工：0 恰好一张卡认领 / 1 无人认领或重复认领 / 2 参数或环境错误。
+    ``--pr`` 模式三个码的分工：0 恰好一张卡认领 / 1 无人认领或重复认领 /
+    2 参数或环境错误。``--gaps`` 模式：0 无缺口 / 1 有缺口 / 2 参数或环境错误。
     ``--pr`` 先校验再看库：库不可用时 stdout **一个字节都不写**（报告整块在库读
     成功之后才拼），所以 rc2 与 rc1 不会混。
     """
 
     conn = None
+    if bool(getattr(args, "gaps", False)):
+        try:
+            conn = db.connect(args.db)
+            cards = db.iter_pending_cards(conn)
+        except (db.BoardError, OSError, sqlite3.Error) as exc:
+            _write_stderr_error(str(exc))
+            return 2
+        finally:
+            if conn is not None:
+                conn.close()
+
+        gap_report = prclaim.audit_gaps(cards)
+        if not _write_stdout(prclaim.render_gaps(gap_report) + "\n"):
+            return 2
+        return prclaim.exit_code_gaps(gap_report)
+
     try:
         pr = prclaim.parse_pr(args.pr)
         conn = db.connect(args.db)
