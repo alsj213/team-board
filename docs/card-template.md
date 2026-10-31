@@ -3,12 +3,19 @@
 **版本 `v3`**（2026-10-31 定）。本文件是模板的**唯一源**：六块固定段落只在文末锚点块里存
 一份，卡正文**读它、不抄它**；卡正文只写与本卡不同的部分。
 
+> **依赖与合并顺序（未合入，先读这段）**：下文引用的两项实现都不在 `main` 上 ——
+> ① **PR #63**（`wt/t_7c17f775`）：`src/team_board/cardtemplate.py`（`TARGET_BYTES` / `WARN_BYTES` /
+>    `FIXED_HEADING_RE` / `scan` / 切点 `FIXED_SECTION_EPOCH`）；
+> ② **PR #65**（`wt/t_eb47566b`）：`scripts/install-card-template.sh`。
+> **合并顺序固定：`#63 → #65 → #62`。** 三者合一前 `main` 上没有这两个可执行物，下文凡引用
+> 它们都按「合入后生效」读；今天照做是 `No such file`（rc=127）。
+
 ## 一、引用行（新卡正文第一行）
 
 - 新卡正文**首行**（顶格、整行）：`TEMPLATE: card-template.md#v3`
 - **合并类卡**：首行仍是 `PR-CLAIM: #<n>`（整行首行，见 [`docs/pr-claim-gate.md`](pr-claim-gate.md)），
   `TEMPLATE: card-template.md#v3` 放**第二行**。
-- 缺这一行 → `cardtemplate.scan` 记一条 warn；内核注入侧按它贴固定段落（`t_c0f2c33e`），
+- 缺这一行 → `cardtemplate.scan`（PR #63，未合）记一条 warn；内核注入侧按它贴固定段落（`t_c0f2c33e`），
   钉版本是为了「模板改了、老卡不被静默换口径」。
 
 ## 二、五段骨架（标题逐字，顺序不许换）
@@ -26,11 +33,11 @@
 ## 三、固定段落（唯一一份，只读不抄）
 
 下面锚点块里的六段是**默认口径**，新卡正文**不许抄**：这六个标题已被建卡闸门拦
-（`FIXED_HEADING_RE`，`src/team_board/cardtemplate.py` + 内核镜像），卡正文里出现
+（`FIXED_HEADING_RE`，`src/team_board/cardtemplate.py`（PR #63，未合）+ 内核镜像），卡正文里出现
 `## 完成契约` 这类标题 → **建卡 rc2、卡不落库**。要表达时写「见模板 · 完成契约」。
 
 锚点是两行整行 HTML 注释（顶格、不缩进）：`FIXED:v3:` 前缀 + `BEGIN` / `END`。内核按版本取
-这一段贴进 `worker_context`（`t_c0f2c33e`），`bash scripts/install-card-template.sh --check`
+这一段贴进 `worker_context`（`t_c0f2c33e`），`bash scripts/install-card-template.sh --check`（PR #65，未合）
 按它判漂移（`t_eb47566b`）。
 
 含 PR 号的卡，关闭前还必须跑 `merge-owner-audit <卡号>`：`rc=0` 才许关；`UNOWNED` 先建收口卡（首行 `PR-CLAIM: #<n>`）或把 PR 合掉；`rc=2` 按错误修、不算通过。口径与降级日志见 [`docs/merge-owner.md`](merge-owner.md)。
@@ -80,12 +87,12 @@
 | 档 | 字节（UTF-8） | 判定 |
 | --- | --- | --- |
 | 目标 | ≤ 800 | 合规，鼓励按此写 |
-| warn | > 1200 | `cardtemplate.scan` 记 warn，建议压回 800 |
+| warn | > 1200 | `cardtemplate.scan`（PR #63，未合）记 warn，建议压回 800 |
 | 硬上限 | 2048 | 建卡即拒：rc=2、stderr 恰一行、卡不落库（不截断、无开关） |
 
 - 数字各有唯一源，本文件不复写第三份字面量：`TARGET_BYTES = 800` / `WARN_BYTES = 1200`
-  （`src/team_board/cardtemplate.py`）、`BODY_LIMIT_BYTES = 2048`（`src/team_board/bodylimit.py`）。
-- **存量不追溯**：切点 `1793462400`（`2026-11-01 00:00:00 CST`，实测 `date -d @1793462400`）。
+  （`src/team_board/cardtemplate.py`，PR #63 未合）、`BODY_LIMIT_BYTES = 2048`（`src/team_board/bodylimit.py`）。
+- **存量不追溯**：切点 `1793462400`（PR #63 `FIXED_SECTION_EPOCH`，未合；`2026-11-01 00:00:00 CST`，实测 `date -d @1793462400`）。
   `created_at < 切点` 的卡按存量豁免 —— 不判红、不改写正文，只由 `body-audit` 记录与列出。
 - 按**字节**不按字符：700 个汉字 = 700 字符 / 2100 字节，超限。细则见 [`docs/card-limit.md`](card-limit.md)。
 
@@ -124,6 +131,13 @@ $ wc -c < /tmp/sample-v3.md
 
 ## 六、安装与指针
 
-- 装到内核读的模板目录 + 漂移检查：`bash scripts/install-card-template.sh [--check]`
-  （目标 `${HERMES_KANBAN_HOME:-$HOME/.hermes/kanban}/templates/card-template.md`；`--check` rc1 = 漂移或缺目标，见 `t_eb47566b`）。
+- 装到内核读的模板目录 + 漂移检查：`bash scripts/install-card-template.sh [--check]`（**PR #65，未合**）
+  （`main` 上没有该文件，今天执行是 `No such file`，rc=127；`--check` rc1 = 漂移或缺目标，见 `t_eb47566b`）。
+  落点以 `--dest` 为准，**默认必须等于内核 `kanban_home()/templates/card-template.md`** ——
+  即 `${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`
+  （`kanban_home()` = `HERMES_KANBAN_HOME` else `~/.hermes`，**不是** `~/.hermes/kanban`；
+  内核 `_card_template_path()` 另有 `${HERMES_CARD_TEMPLATE}` 绝对路径覆盖）。
+  #65 脚本默认 dest 目前写成 `$HOME/.hermes/kanban/templates/…`（差一层 `kanban`），偏差归该卡返工
+  `t_7e847105`；在它修正前显式传 `--dest "${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md"`。
+- 合并顺序：**#63 → #65 → #62**（本文件引用的两张未合 PR 合入后，上面这条才可执行）。
 - 2048 上限的条文、实测与边界：[`docs/card-limit.md`](card-limit.md)；建卡闸门与 `body-audit`：README「卡正文上限」节。

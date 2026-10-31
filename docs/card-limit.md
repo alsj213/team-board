@@ -7,7 +7,7 @@
 >
 > 两条腿的实现卡：建卡拦截 `t_1564c165`、全板扫描 `t_d3625ec7`（`body-audit` 子命令）；
 > 渲染本文件的卡是 `t_2f0b87d2`。模板见 [`docs/card-template.md`](card-template.md)。
-> 模板 v3（五段骨架 + 固定段落锚点 + 目标 ≤800B）：[`docs/card-template.md`](card-template.md)；装到内核模板目录与漂移检查 `bash scripts/install-card-template.sh --check`（rc1 = 漂移或缺目标）。
+> 模板 v3（五段骨架 + 固定段落锚点 + 目标 ≤800B）：[`docs/card-template.md`](card-template.md)；装到内核模板目录与漂移检查 `bash scripts/install-card-template.sh --check`（rc1 = 漂移或缺目标）——**依赖 PR #65（未合，`main` 上无此脚本，rc=127）**；默认落点须等于内核 `_card_template_path()` = `${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`（**不是** `~/.hermes/kanban/…`）；#63 已合，合并顺序 **#65 → #62**。
 > 固定段落红 / 1200B warn / 存量切点由 `t_7c17f775`（`cardtemplate.py`）与 `t_339b3d36`（`body-audit` 扩容）落地。
 
 ## 一、口径

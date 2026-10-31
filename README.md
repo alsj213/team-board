@@ -1014,7 +1014,11 @@ $ echo $?
 
 条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（v3 五段模板 +
 实测 650 字节样例）见 [`docs/card-template.md`](docs/card-template.md)。
-装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（rc1 = 漂移或缺目标）。
+装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（rc1 = 漂移或缺目标；**依赖 PR #65，未合**）——
+`main` 上没有该脚本，今天执行是 `No such file`（rc=127）；
+落点以 `--dest` 为准，默认必须等于内核 `_card_template_path()` =
+`${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`（**不是** `~/.hermes/kanban/…`）。
+合并顺序 **#63 → #65 → #62**。
 
 实现卡的 `## 验收标准` 段与 `QA-SPEC: qa` 签署闸门见 [`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
 
