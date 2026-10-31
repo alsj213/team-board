@@ -238,6 +238,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import stat
 import subprocess  # nosec B404
@@ -1557,7 +1558,8 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
     - ``--branch`` 不是 ``wt/t_xxxxxxxx`` → 「无法定位实现卡」；
     - 库不可用 / 读事件失败 → 文案点名 ``--db`` 与该路径（与 :func:`claim_gate` 同口径，
       「读不到库」不许被读成「没有证据」）；
-    - 有事件的 payload 解析失败（``Collection.parse_failures > 0``）→ rc2、点名条数：
+    - 有事件的 payload 解析失败（``Collection.parse_failures > 0``）→ rc2、点名条数与坏事件
+      id（与 ``evidence audit`` 的首行同口径）：
       坏 payload 的事件已被 ``collect`` 丢掉，某槽 id 最大的那条恰好坏掉时，
       「最新证据」根本不是最新的，不许拿剩下的旧事件判 PASS（P2-2 fail-open）；
     - 判定不过 → ``证据闸门拦下 PR #<n>（实现卡 <卡>）：<verdict>；<detail>``，verdict 是
@@ -1583,9 +1585,11 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
             f"（证据闸门只读 --db 指向的库，缺省 {DEFAULT_DB}）"
         ) from exc
     parse_failures = 0
+    failure_ids: tuple[int, ...] = ()
     try:
         events = evidence.collect(conn, impl_card)
         parse_failures = events.parse_failures
+        failure_ids = events.parse_failure_ids
         judgment = evidence.judge(events, head, opts.pr)
     except evidence.EvidenceReadError as exc:
         raise MergeGuardError(
@@ -1597,10 +1601,13 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
     if parse_failures:
         # 解析不了的事件已被 ``collect`` 丢掉；「丢掉」不等于「不存在」——某槽 id 最大的
         # 那条恰好是坏 payload 时，判出来的「最新证据」根本不是最新的（P2-2 fail-open）。
+        # 文案与 ``evidence audit`` 的结论行同一口径（返工 t_39c86400）：点名坏事件 id，
+        # 两边文案能逐字对上，排障时不用猜是哪一条。
+        bad = ",".join(str(event_id) for event_id in failure_ids) or "-"
         raise MergeGuardError(
             f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：有 {parse_failures} 条 "
-            f"evidence 事件的 payload 解析失败（--db {opts.db_path}）；无法确认槽位的最新"
-            f"证据，拒绝合并（证据必须绑当前 head，R 状态机化）"
+            f"evidence 事件的 payload 解析失败（坏事件 id: {bad}；--db {opts.db_path}）；"
+            f"无法确认槽位的最新证据，拒绝合并（证据必须绑当前 head，R 状态机化）"
         )
     if not judgment.ok:
         raise MergeGuardError(
@@ -1612,9 +1619,12 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         ok=True,
         # 命令格要能**直接复跑**：与 ``evidence audit`` 子命令同一入口，参数给实值
         # （卡号 / head / PR / 库路径），不留 ``<card>`` 这种占位符（P3）。
+        # ``--db`` 的路径含空格时原样拼会断成两个参数（返工 t_39c86400 P3），
+        # 用 ``shlex.quote`` 转义 —— 无空格时输出与原来逐字相同。
         command=(
             f"PYTHONPATH=src python3 -m team_board.cli evidence audit "
-            f"--card {impl_card} --head {head} --pr {opts.pr} --db {opts.db_path}"
+            f"--card {impl_card} --head {head} --pr {opts.pr} "
+            f"--db {shlex.quote(opts.db_path)}"
         ),
         rc=0,
         key=evidence_slots_summary(judgment),

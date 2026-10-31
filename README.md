@@ -595,10 +595,15 @@ python3 -m team_board.merge_guard \
      `wt/t_<8 位小写十六进制>`，否则「无法定位实现卡」rc2），读 `--db` 的 evidence 事件
      （`evidence.collect`，与 `team-board evidence audit` 同一份实现），要求 `tier` /
      `qa_pass` / `review:defect` / `review:regression` 四槽各取 id 最大的一条、全部绑预检
-     读到的 `headRefOid`。`tier` 槽的档位必须是 `A`/`B`/`C` 之一（**缺键 / 非法一律
-     「缺证据」**，不许因为 head 对得上就算齐）；`tier=C` 还必须有同 `--pr` 的
-     `boss_approve`。事件 payload 有解析失败（`parse_failures > 0`）时**直接 rc2 并点名
-     条数** —— 解析不了的最新事件不能被读成「没有更新」。verdict 只用 evidence 的七个
+     读到的 `headRefOid`。`tier` 槽按 `REQUIRED_KEYS["tier"]` 三键齐才算齐（`tier` /
+     `reason` / `head_sha`，**缺任一键一律「缺证据」**，不许因为 head 对得上就算齐），
+     且档位必须是 `A`/`B`/`C` 之一；`tier=C` 还必须有同 `--pr` 的 `boss_approve`。
+     `review:defect` / `review:regression` 两槽的 `verdict` 只认 `pass` / `block` 两个
+     逐字字面量：缺 `verdict` 键、写 `BLOCK`、写 `Block` 等**域外取值一律「缺证据」**
+     （只有 `block` 才算「双问阻塞」）。事件 payload 有解析失败（`parse_failures > 0`）
+     时**直接 rc2 并点名坏事件 id** —— 解析不了的最新事件不能被读成「没有更新」；
+     `team-board evidence audit` 对同一份库同口径（rc1 + 首行点名坏事件 id，见该子命令
+     一节）。verdict 只用 evidence 的七个
      字面量；库读不到 → rc2 点名 `--db` 与路径（「读不到」不许读成「没证据」）。这一步
      一次 gh 都不调。
 
@@ -1242,7 +1247,7 @@ PR #50 MERGED
 ## evidence 事件（evidence emit / audit）
 
 `evidence` 有两个动词：`emit` 写入一条事件、`audit` 只读判「四槽齐不齐、是否绑当前
-head」（`audit` 见上一节 `evidence audit`）。两者共用父解析器，`evidence --help` 里是
+head」（`audit` 见下一节「证据状态机稽核」）。两者共用父解析器，`evidence --help` 里是
 `{emit,audit}`。
 
 ```
@@ -1296,6 +1301,40 @@ evidence emit: kind=qa_pass card=t_deadbeef run=7 profile=qa event=1 payload={"h
 ```
 
 一次成功只追加一行 `task_events`，`kind` 就是 `--kind`，`run_id` 就是那个 running run。
+
+## 证据状态机稽核（evidence audit）
+
+```
+team-board evidence audit --card t_xxxxxxxx --head <40/64 位小写 hex> [--pr N] [--db PATH]
+```
+
+四槽（`tier` / `qa_pass` / `review:defect` / `review:regression`）各取 id 最大的一条，
+按 `角色 → 缺证据 → head → 双问` 的顺序判定；判定逻辑与 `merge_guard` 的证据闸门
+同源（`evidence.judge`），两处给同一份库必须给同一结论。
+
+- `tier` 槽按 `REQUIRED_KEYS["tier"]` **三键齐**（`tier` / `reason` / `head_sha`），
+  缺任一键记「缺证据」；档位取值域是 `A`/`B`/`C`。
+- `review:defect` / `review:regression` 两槽的 `verdict` 只认 `pass` / `block` 两个**逐字**
+  字面量；缺键、`BLOCK`、`Block`、非字符串一律「缺证据」，`block` 才是「双问阻塞」。
+- 事件 payload 解析失败（坏 JSON / 非 JSON 对象）时，**首行**是
+  `解析失败 N 条（坏事件 id: …）；无法确认槽位的最新证据`，退出码 **1** ——
+  「解析不了」不等于「没有证据」，剩下的槽位再齐也不许 rc0。
+- `review` 事件的 `payload.kind` 域外（不是 `defect`/`regression`）会被静默丢掉，报告里
+  出一行 `review kind 域外: 事件 id=… kind=…（…，已丢弃）` 点名，不把「写错 kind」读成
+  「没写 review」。
+
+退出码：`0` 四槽齐且全绑 `--head` **且没有解析失败的事件**；`1` 判定不通过（缺证据 /
+证据对新 head 无效 / 双问阻塞 / 缺老板点头 / 证据串卡 / 角色不符）**或有解析失败的事件**；
+`2` 参数或环境错误（`--card` / `--head` / `--pr` 形态非法、库不存在或不是合法 SQLite、
+缺 `task_events` / `task_runs` 表），stderr 恰一行 `错误: …`、stdout 为空。
+
+**合并闸门要求实现卡分支整串等于 `wt/t_<8 位小写十六进制>`**（`card_from_branch`，
+否则「无法定位实现卡」rc2），且**不提供 `--impl-card` 让调用方自己指卡**。所以
+**setup / 杂活 PR 同样先建卡、再开分支**：
+
+> 先建卡 → 分支叫 `wt/t_<卡号>` → 再开 PR。
+> 不许用 `wt/setup-xxx` / `chore/xxx` / 裸 `wt/t_x` 这类无卡号分支开 PR —— 这样的 PR
+> 过不了证据闸门（合并卡与证据卡是两张卡也没关系，合并卡号走 `--card`）。
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /

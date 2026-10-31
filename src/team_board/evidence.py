@@ -332,6 +332,38 @@ def _short(value: object) -> str:
     return repr(value)
 
 
+def _absent_keys(kind: str, payload: Mapping[str, object]) -> list[str]:
+    """该 kind 的 payload 少了哪些必填键（顺序即 :data:`REQUIRED_KEYS` 的顺序）。
+
+    与 :func:`validate_payload` 共用同一张 :data:`REQUIRED_KEYS` 表：槽位判定里要判
+    「证据够不够格」的地方都调这里，不许另抄一份键名。
+    """
+
+    return [key for key in REQUIRED_KEYS[kind] if key not in payload]
+
+
+def _review_kind_is_legal(value: object) -> bool:
+    """review 事件的 ``payload['kind']``：必须**是** ``defect`` / ``regression`` 之一。
+
+    报告里用它点名「kind 域外、被 ``_latest`` 静默丢掉」的事件（返工 t_39c86400 P3）。
+    与 :func:`validate_payload` 共用同一个 :data:`REVIEW_KINDS`。
+    """
+
+    return isinstance(value, str) and value in REVIEW_KINDS
+
+
+def _verdict_is_legal(value: object) -> bool:
+    """review 槽的 ``payload['verdict']``：必须**是** ``pass`` / ``block`` 之一。
+
+    缺键（``None``）、非字符串、大小写走样（``BLOCK`` / ``Block``）一律 ``False`` ——
+    槽位记 ``missing``、verdict 落「缺证据」。旧实现只比 ``== "block"``，于是
+    「缺 verdict 键」「写大写 BLOCK」全被读成通过（P1 fail-open，返工 t_39c86400）。
+    与 :func:`validate_payload` 共用同一个 :data:`REVIEW_VERDICTS`。
+    """
+
+    return isinstance(value, str) and value in REVIEW_VERDICTS
+
+
 def _tier_is_legal(value: object) -> bool:
     """tier 槽的档位取值域：``payload['tier']`` 必须**是** ``A`` / ``B`` / ``C`` 之一。
 
@@ -386,6 +418,18 @@ def judge(
                     f"{name}：run_id={event.run_id} profile={event.profile!r} "
                     f"不在 {src_kind} 的允许集合 {sorted(allowed)}"
                 )
+            elif name == "tier" and (absent := _absent_keys("tier", event.payload)):
+                # 返工 t_39c86400（P2）：tier 槽原先只查 ``payload['tier']`` 的值，
+                # ``{"tier":"B","head_sha":…}`` 缺 reason 的事件照样 PASS。档位证据按
+                # :data:`REQUIRED_KEYS` 的三键（tier/reason/head_sha）齐才算齐 ——
+                # 缺键 = 缺证据，不因为「head 对得上」放过。判在 head 之前：缺键比
+                # 「绑错 head」更接近「没有这条证据」（与 VERDICT_PRIORITY 顺序一致）。
+                state = SLOT_MISSING
+                missing.append(name)
+                problems[VERDICT_MISSING].append(
+                    f"tier：档位证据缺键 {'/'.join(absent)}"
+                    f"（三键必须齐：{'/'.join(REQUIRED_KEYS['tier'])}）"
+                )
             elif event.payload.get("head_sha") != head:
                 state = SLOT_HEAD_MISMATCH
                 problems[VERDICT_HEAD_MISMATCH].append(
@@ -408,6 +452,19 @@ def judge(
                 missing.append(name)
                 problems[VERDICT_MISSING].append(
                     f"tier：要求 {tier_required}，证据是 {event.payload.get('tier')!r}"
+                )
+            elif src_kind == "review" and not _verdict_is_legal(
+                event.payload.get("verdict")
+            ):
+                # 返工 t_39c86400（P1）：review 槽原先只比 ``== "block"``，于是缺
+                # ``verdict`` 键、写 ``BLOCK``、写 ``Block`` 全被读成通过。取值域外
+                # 一律按「缺证据」处理，只有 ``pass`` 才算通过、``block`` 才算阻塞。
+                state = SLOT_MISSING
+                missing.append(name)
+                problems[VERDICT_MISSING].append(
+                    f"{name}：verdict 缺键或不在 "
+                    f"{'/'.join(sorted(REVIEW_VERDICTS))} 之一"
+                    f"（实际 {event.payload.get('verdict')!r}）"
                 )
             elif src_kind == "review" and event.payload.get("verdict") == "block":
                 state = SLOT_BLOCKED
@@ -506,12 +563,18 @@ class Collection(tuple):
     """
 
     parse_failures: int
+    #: 解析失败的事件 id（与 :attr:`parse_failures` 同序；报告要逐条点名）
+    parse_failure_ids: tuple[int, ...]
 
     def __new__(
-        cls, events: Sequence[Event] = (), parse_failures: int = 0
+        cls,
+        events: Sequence[Event] = (),
+        parse_failures: int = 0,
+        parse_failure_ids: Sequence[int] = (),
     ) -> Collection:
         self = super().__new__(cls, tuple(events))
         self.parse_failures = parse_failures
+        self.parse_failure_ids = tuple(parse_failure_ids)
         return self
 
 
@@ -552,15 +615,20 @@ def collect(conn: Any, card: str) -> Collection:
 
     events: list[Event] = []
     failures = 0
+    failure_ids: list[int] = []
     for row in rows:
         try:
             event = _event_from_row(row)
         except (TypeError, ValueError, IndexError):
             failures += 1
+            try:
+                failure_ids.append(int(row[0]))
+            except (TypeError, ValueError, IndexError):
+                failure_ids.append(-1)  # 连 id 都读不出来：报告里点 `-1`
             continue
         if event is not None:
             events.append(event)
-    return Collection(events, failures)
+    return Collection(events, failures, failure_ids)
 
 
 def _slot_line(name: str, state: str, event: Event | None) -> str:
@@ -615,18 +683,25 @@ def render(
     *,
     parse_failures: int = 0,
     events: Sequence[Event] = (),
+    parse_failure_ids: Sequence[int] = (),
 ) -> list[str]:
     """把一次判定渲染成 ``evidence audit`` 的整块报告（纯函数，不 print）。
 
-    行序：非 PASS 时先出结论行 → 表头 ``evidence audit card=<卡> head=<sha>
+    行序：``解析失败`` 结论行（仅当 >0，逐条点名坏事件 id）→ 非 PASS 时出结论行 →
+    表头 ``evidence audit card=<卡> head=<sha>
     verdict=<判定>`` → 四个必需槽位各一行 → 非必需槽位（有才出）各一行 →
-    ``解析失败`` 计数（仅当 >0）→ 末行 ``missing: <逗号分隔槽位名>`` / ``missing: -``。
+    ``review kind 域外`` 点名行（有才出）→ 末行 ``missing: <逗号分隔槽位名>`` / ``missing: -``。
 
-    ``parse_failures`` / ``events`` 是**可选**扩展位（默认值即契约里的三参数形态）：
-    前者只为把 :func:`collect` 的计数带进报告，后者只为渲出非必需槽位的行 ——
-    ``judge`` 不动（E1 段一行未改）。
+    ``parse_failures`` / ``events`` / ``parse_failure_ids`` 是**可选**扩展位（默认值即
+    契约里的三参数形态）：前者只为把 :func:`collect` 的计数与坏事件 id 带进报告，
+    后者只为渲出非必需槽位的行 —— ``judge`` 不动（E1 段一行未改）。
     """
     lines: list[str] = []
+    if parse_failures:
+        ids = ",".join(str(event_id) for event_id in parse_failure_ids) or "-"
+        lines.append(
+            f"解析失败 {parse_failures} 条（坏事件 id: {ids}）；无法确认槽位的最新证据"
+        )
     if not judgment.ok:
         lines.extend(_problem_lines(judgment))
     lines.append(f"evidence audit card={card} head={head} verdict={judgment.verdict}")
@@ -637,8 +712,15 @@ def render(
         event = _latest(ordered, name, None)
         if event is not None:
             lines.append(_slot_line(name, _extra_state(event, head), event))
-    if parse_failures:
-        lines.append(f"解析失败: {parse_failures}")
+    for event in ordered:
+        # 返工 t_39c86400（P3）：``kind`` 不在 REVIEW_KINDS 的 review 事件被 ``_latest``
+        # 静默滤掉（槽位成了「无 review 事件」）。报告必须点名这条事件的 id，否则
+        # 「kind 写错」与「根本没写」在报告上一模一样。
+        if event.kind == "review" and not _review_kind_is_legal(event.payload.get("kind")):
+            lines.append(
+                f"review kind 域外: 事件 id={event.id} kind={event.payload.get('kind')!r}"
+                f"（不在 {'/'.join(sorted(REVIEW_KINDS))} 之一，已丢弃）"
+            )
     lines.append(
         "missing: " + (",".join(judgment.missing) if judgment.missing else "-")
     )

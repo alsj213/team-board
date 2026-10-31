@@ -554,6 +554,62 @@ def test_tier_event_without_tier_key_never_passes(
     assert fake.write_calls() == []
 
 
+def test_tier_event_without_reason_key_rc2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """id 最大的 tier 事件缺 ``reason`` 键 → 该槽「缺证据」、rc2（返工 t_39c86400 P2）。
+
+    P2 的原样复现（pm 实测）：``{"tier":"B","head_sha":…}`` 只缺 reason，旧实现只查
+    ``payload['tier']``，于是 tier 槽算「齐」、整条闸门 PASS。
+    """
+
+    fake = FakeRunner()
+    events = [*four_slots(), e_row("tier", {"tier": "B", "head_sha": HEAD_OID}, 1)]
+    rc, out, err = run_main(tmp_path, monkeypatch, capsys, events=events, runner=fake)
+
+    assert rc == 2
+    assert out == ""
+    assert "缺证据" in err
+    assert "reason" in err
+    assert fake.write_calls() == []
+
+
+def test_review_verdict_out_of_domain_rc2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """id 最大的 review 事件 ``verdict`` 写成 ``BLOCK`` → 「缺证据」rc2（返工 t_39c86400 P1）。
+
+    旧实现只比 ``== "block"``，大写 BLOCK / 缺 verdict 键都被读成通过 —— 这是 fail-open。
+    """
+
+    fake = FakeRunner()
+    bad = e_row("review", {"kind": "defect", "head_sha": HEAD_OID, "verdict": "BLOCK"}, 2)
+    rc, out, err = run_main(
+        tmp_path, monkeypatch, capsys, events=[*four_slots(), bad], runner=fake
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "缺证据" in err
+    assert "verdict" in err
+    assert fake.write_calls() == []
+
+
+def test_db_path_with_spaces_is_quoted_in_command_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """命令格的 ``--db`` 要能直接复跑：路径含空格时用 shell 引号包住（返工 t_39c86400 P3）。"""
+
+    spaced = tmp_path / "with space"
+    spaced.mkdir()
+    db = board_db(spaced, events=four_slots())
+    rc, out, err = run_main(tmp_path, monkeypatch, capsys, db=db)
+
+    assert (rc, err) == (0, "")
+    line = next(line for line in out.splitlines() if line.startswith("证据状态机 | PASS |"))
+    assert f"--db '{db}'" in line
+
+
 def test_truncated_event_payload_rc2_names_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
