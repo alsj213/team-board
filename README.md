@@ -1212,25 +1212,33 @@ PR #50 MERGED
   不是合法 SQLite / 打不开 / 读失败、卡不存在、stdout 编码表示不了中文）：stderr 恰
   一行 `错误: …`、stdout 为空、不冒 traceback。日志目录不可写**不是** `2`。
 
-## evidence 事件（evidence emit）
+## evidence 事件（evidence emit / audit）
 
-`evidence` 有两个动词：`audit`（只读稽核，见上文）与 `emit`（写入，本节）。
+`evidence` 有两个动词：`emit` 写入一条事件、`audit` 只读判「四槽齐不齐、是否绑当前
+head」（`audit` 见上一节 `evidence audit`）。两者共用父解析器，`evidence --help` 里是
+`{emit,audit}`。
 
 ```
-team-board evidence emit --kind KIND --payload '<json>' [--card t_xxxxxxxx] [--db PATH]
-team-board evidence emit --kind KIND [--head SHA] [--disc defect|regression] \
-    [--verdict pass|block] [--tier A|B|C --reason TEXT] [--pr N] [--run-id RUN] \
-    [--card t_xxxxxxxx] [--db PATH]
+team-board evidence emit --kind KIND (--payload '<json>' | --head SHA ...) [--card t_xxxxxxxx] [--db PATH]
 ```
 
 - `--kind` —— 可 emit 的是六个：`spec_sign` / `impl_done` / `tier` / `qa_pass` /
   `review` / `boss_approve`。`merged` 是保留字（由 `merge_audit` trailer 承载），
   连同任何未知 kind 一律 **rc1**、库里一行都不多。
-- `--payload` —— payload 的权威入口（JSON 对象字符串）。也可用便捷参数拼：`--head` /
-  `--disc` / `--verdict` / `--tier` / `--reason` / `--pr` / `--run-id`（与 `--payload`
-  互斥，同时给 → rc2）。落库前过 `team_board.evidence.validate_payload`（缺键 / 多键 /
-  类型 / 取值域一律拒绝），库里存的是 `evidence.normalize` 的结果（键序固定、紧凑
-  分隔符）。不是合法 JSON → **rc2**；是 JSON 但违反契约（含不是对象）→ **rc1**。
+- `--payload` —— payload 的**权威**入口（JSON 对象字符串）。
+  落库前过 `team_board.evidence.validate_payload`（缺键 / 多键 / 类型 / 取值域一律
+  拒绝），库里存的是 `evidence.normalize` 的结果（键序固定、紧凑分隔符）。不是合法
+  JSON → **rc2**；是 JSON 但违反契约（含不是对象）→ **rc1**。
+- 便捷参数（给了就**不许**再给 `--payload`，同给 → **rc2**）—— 把 payload 按键拆开
+  写，拼不出来时按契约层同一套规则判 rc1/rc2：`--head SHA`（`head_sha`）、
+  `--disc defect|regression`（`review` 的 `kind`）、`--verdict pass|block`
+  （`review` 的 `verdict`）、`--tier A|B|C` 与 `--reason TEXT`（`tier`）、
+  `--pr N`（`impl_done` / `boss_approve`）、`--run-id RUN`（`qa_pass` 的 `run_id`，
+  同时对账「是不是本卡当前 running run」）。某个便捷参数对当前 `kind` 不适用
+  （例：`--pr` 给 `review`）→ **rc2**，不静默丢弃。
+- `--run-id RUN` 的另一半作用：它**不**参与身份解析（身份只从库里取），但与
+  `tasks.current_run_id` 解析出的 run 不等 → **rc1**
+  （`run 不属于本卡：--run-id=9，卡 t_deadbeef 当前 running run 是 7`）。
 - `--card` —— 缺省取 `HERMES_KANBAN_TASK`，其次 `HERMES_KANBAN_WORKSPACE` 的
   basename（必须形如 `t_[0-9a-f]{8}`）。显式给的值与 env 兜底值不相等 → **rc1**
   （防止拿 A 卡的身份给 B 卡写证据）。
