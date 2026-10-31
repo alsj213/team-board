@@ -357,7 +357,7 @@ def test_blank_kanban_home_falls_back_to_home(tmp_path: Path) -> None:
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert (home / ".hermes" / "kanban" / "templates" / "card-template.md").is_file()
+    assert (home / ".hermes" / "templates" / "card-template.md").is_file()
     assert list(work.iterdir()) == [], f"不该在 cwd 里建任何东西: {list(work.iterdir())}"
 
 
