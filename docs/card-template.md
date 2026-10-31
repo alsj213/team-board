@@ -8,7 +8,7 @@ warn 清单（红即 rc1，warn 只报不改 rc）。细则见 [`docs/card-limit
 **用法一句话**：模板是基线，**卡正文只写与本卡不同的部分**。长背景、日志、证据一律写进
 卡评论（`kanban_comment`）或附件（`kanban_attach`），正文只留一句指针。下面六块一段不缺、
 也不多加；`assignee=engineer` 的实现卡另有第 7 块「验收标准（qa 签署）」—— 那一段必填，
-口径见 [`docs/qa-spec-gate.md`](qa-spec-gate.md)。
+口径见 [`docs/qa-spec-gate.md`](qa-spec-gate.md)。 含 PR 号的卡关闭前还必须走第 8 块「关闭前必跑（merge-owner-audit）」。
 
 ## 1. 目标
 
@@ -67,6 +67,23 @@ warn 清单（红即 rc1，warn 只报不改 rc）。细则见 [`docs/card-limit
   不因缺这一段回头把旧卡判不通过。
 - 两条闸门的完整口径（为什么、rc、文案、出路、边界）见
   [`docs/qa-spec-gate.md`](qa-spec-gate.md)。
+
+## 8. 关闭前必跑（merge-owner-audit）
+
+- 写什么：**卡正文或评论里出现 PR 号的卡，关闭前必跑**
+  `PYTHONPATH=src python3 -m team_board.cli merge-owner-audit <卡号>`。
+  - `rc=0` —— 才许 `kanban_complete`（没有 PR / 全部有归属 / 降级放行）；
+  - `rc=1` —— 有 `UNOWNED`，**不许关**：先建收口卡（正文首行 `PR-CLAIM: #<n>`），或把该 PR 合掉；
+  - `rc=2` —— 参数或环境错误，先按错误修，**不算通过**。
+- 完成契约的默认口径写成这条命令的 `rc`：**默认 = `merge-owner-audit <卡号>` 的 `rc=0`**。
+  卡上**不许**写「`completion_contract` 字段已设为该命令」—— 内核字段只接受 `local-only`、
+  `OWNER/REPO` 或精确的 GitHub PR URL（`hermes_cli/kanban_pr_acceptance.py:23-28`；写命令值实测
+  抛 `ValueError`），做不到的事别写进卡里。
+- `rc=0` 之后在 summary 里留一行固定格式：`<条目> | PASS | $ <命令原文> | exit 0 | <末 1-3 行>`。
+- `warn:` 降级（`gh` 不可用）→ `rc` 仍是 0，但**必须进晨报**（哪天 / 哪张卡 / 什么原因），
+  不许静默放行。
+- 证据 PR / 明确不合并的 PR：正文顶格一行 `PR-MERGE-EXEMPT: #<n>`；**不许拿它绕真交付 PR**。
+- 三档真跑样例、五类判定与降级日志格式见 [`docs/merge-owner.md`](merge-owner.md)。
 
 ## 样例
 
