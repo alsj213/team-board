@@ -1,30 +1,50 @@
-"""双问结论「是否绑定某条 head sha」的判定：纯函数 + 唯一取数入口。
+"""双问结论「是否绑定某份内容」的判定：纯函数 + 唯一取数入口。
 
-R18 的机器判据本体（只读）。判的是**证据结构**，不判结论对错：
+R18 的机器判据本体（只读）。判的是**证据结构**，不判结论对错。结论绑的是
+**内容指纹**（``patch-id -U0``，见 :data:`FINGERPRINT_ALGO`），不是 head sha：纯
+rebase 不改内容 → 结论继续可用；内容任何改动 → 立即失效。
 
 - 取数：``gh api repos/alsj213/team-board/pulls/<N>/reviews`` 与
   ``issues/<N>/comments``（``--paginate``），**只看 body**，其它字段一概不读；
-- 标记：同一条正文里**顶格**两行都出现才算一条标记 ——
+- 标记：同一条正文里**顶格**出现 ``REVIEW-KIND`` 与「``REVIEW-PATCH`` 或
+  ``REVIEW-HEAD``」才算一条标记 ——
 
-      REVIEW-HEAD: <40 或 64 位小写十六进制>
+      REVIEW-PATCH: <40 位小写十六进制>      内容指纹（新写法，两种都在时优先）
+      REVIEW-HEAD: <40 或 64 位小写十六进制>  历史 head sha（只读兼容，不追溯）
       REVIEW-KIND: defect|regression
 
-  两条正则 ``HEAD_RE`` / ``KIND_RE`` 是唯一来源（``re.MULTILINE``，行首行尾都锚死：
-  缩进、行尾多空格、``REVIEW-HEAD:`` 前后带别的字都不算）。同一条正文只取每条
-  正则的第一个匹配；已有两行才记一条 :class:`Mark`。
+  三条正则 :data:`PATCH_RE` / :data:`HEAD_RE` / :data:`KIND_RE` 是唯一来源
+  （``re.MULTILINE``，行首行尾都锚死：缩进、行尾多空格、``REVIEW-…:`` 前后带别的字
+  都不算）。同一条正文只取每条正则的第一个匹配；只有 ``REVIEW-KIND`` 不算一条标记。
+
+四态（判定见 :func:`judge`；``resolve(sha) -> 指纹 | None`` 可注入，单测不碰 git）
+------------------------------------------------------------------------------
+- ``REVIEW-PATCH`` == current → ``OK``（计入 kinds）；
+- ``REVIEW-PATCH`` != current → ``STALE``（不计入）；
+- 只有 ``REVIEW-HEAD``，对象 / 指纹取不到 → ``UNVERIFIABLE``（不计入）；
+- 只有 ``REVIEW-HEAD``，其内容指纹 == current → ``LEGACY-OK``（计入）；
+- 只有 ``REVIEW-HEAD``，其内容指纹 != current（或算不出 == kind！=patch）→ ``STALE``。
+
+一条标记 = 对「某份内容」的结论：值就是内容指纹，旧标记用它的 sha 现算指纹；内容
+等价即结论可用，内容任何变化即失效。历史评论只读 —— 不改写、不补标记。
 
 判定口径
 --------
-1. ``--head`` 上 ``defect`` 与 ``regression`` 各 ≥1 → rc0（绑定成立）；
-2. 缺一类 / 两类都缺 / 只有别的 sha 的标记（= head 变了但双问没重跑）→ rc1；
-3. ``--head`` 不是 40 或 64 位小写十六进制、``--pr`` 不是正整数、``gh`` 调用失败
-   （非 0 / 超时 / PATH 里没有 / 输出不是 UTF-8 或不是 JSON）→ rc2。
+1. 内容指纹上 ``defect`` 与 ``regression`` 各 ≥1 → rc0（绑定成立）；
+2. 缺一类 / 两类都缺 / 标记都指向别的内容（= 内容变了但双问没重跑）→ rc1；
+3. 参数形态坏（``--head`` 不是 40/64 位小写十六进制、``--pr`` 不是正整数）、``gh``
+   调用失败、git 侧失败（非 0 / 超时 / PATH 里没有 / 输出不是 UTF-8）→ rc2。
 
-rc2 一律在取数阶段抛出 :class:`ReviewHeadError`，所以 stdout 一个字节都不会写
-（报告整块在取数与判定都成功之后才拼）。
+rc2 一律在取数与判定阶段抛出（:class:`ReviewHeadError` / :class:`PatchIdError`），所以
+stdout 一个字节都不会写（报告整块在取数与判定都成功之后才拼）。
 
-**不判结论对错**：正文里写「阻塞 / 非阻塞」是二层的事，本模块只认上面两行标记；
+**不判结论对错**：正文里写「阻塞 / 非阻塞」是二层的事，本模块只认上面几行标记；
 也**没有** ``--skip`` 之类开关，缺证据就是 rc1。
+
+兼容形态（临时）：``analyze`` / ``render`` 收到的是 head sha 字符串而非
+:class:`Fingerprint` 时，走「按 sha 判」的旧口径与旧渲染 —— 只为让 ``cli.py`` /
+``merge_guard.py`` 的既有调用点（E3 / E4 接线前的状态）不炸；接线完成后这两条分支
+应删除，本模块从此只有指纹口径。
 """
 
 from __future__ import annotations
@@ -33,8 +53,8 @@ import json
 import os
 import re
 import subprocess  # nosec B404
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 #: 唯一仓库（``gh api`` 的路径前缀）
@@ -43,11 +63,23 @@ REPO = "alsj213/team-board"
 #: 两类双问（顺序即结论行里 ``缺`` 的枚举顺序）
 KINDS = ("defect", "regression")
 
+#: ``REVIEW-PATCH:`` 行：内容指纹（MULTILINE、顶格、行尾锚死；只认 40 位小写十六进制）
+PATCH_RE = re.compile(r"^REVIEW-PATCH: ([0-9a-f]{40})$", re.M)
+
 #: ``REVIEW-HEAD:`` 行（MULTILINE、顶格、行尾锚死）
 HEAD_RE = re.compile(r"^REVIEW-HEAD: ([0-9a-f]{40}|[0-9a-f]{64})$", re.M)
 
 #: ``REVIEW-KIND:`` 行（同上）
 KIND_RE = re.compile(r"^REVIEW-KIND: (defect|regression)$", re.M)
+
+#: 四态（:func:`judge` 的唯一取值域；排序即报告里的展示顺序无关，逐条按标记原序）
+STATE_OK = "OK"
+STATE_LEGACY_OK = "LEGACY-OK"
+STATE_STALE = "STALE"
+STATE_UNVERIFIABLE = "UNVERIFIABLE"
+
+#: 计入 ``kinds_on_patch`` 的两种状态（内容等价：直接命中或历史标记按内容复用）
+STATES_COUNTED = frozenset({STATE_OK, STATE_LEGACY_OK})
 
 #: ``--head`` 的形态：40 或 64 位小写十六进制（41-63 位也在这一档被拒）
 HEAD_SHAPE_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
@@ -63,10 +95,19 @@ PR_MAX = 999_999_999
 #: 单次 ``gh api`` 的硬超时（秒）：一次卡住的 gh 不许把整张卡拖到 worker 超时
 GH_TIMEOUT_SECONDS = 120
 
-#: 结论行（三种，逐字；渲染与测试共用同一份文案）
-CONCLUSION_OK = "结论: head {short} 的 defect + regression 各 >=1 条 → 绑定成立"
-CONCLUSION_MISSING = "结论: head {short} 缺 {missing} → head 变了要重跑双问"
+#: 结论行（五种，逐字；渲染与测试共用同一份文案）
+CONCLUSION_OK = "结论: 内容指纹 {short} 的 defect + regression 各 >=1 条 → 绑定成立"
+CONCLUSION_MISSING = "结论: 内容指纹 {short} 缺 {missing} → 内容变了要重跑双问"
 CONCLUSION_NO_MARK = "结论: 无结构化标记 → 该 PR 的双问不可机器绑定（按缺证据处理）"
+CONCLUSION_BINARY = (
+    "结论: 分支含二进制文件 {paths} → 内容指纹不覆盖二进制（patch-id 盲），按不可绑定处理"
+)
+CONCLUSION_EMPTY = "结论: 分支相对 {base} 无差异 → 无可绑定内容（不许当 PASS）"
+
+#: 兼容形态（收到 head sha 而不是指纹）专用的旧文案：只给 E3 / E4 接线前的
+#: ``cli.py`` / ``merge_guard.py`` 调用点用，接线后随同兼容分支一起删除。
+LEGACY_CONCLUSION_OK = "结论: head {short} 的 defect + regression 各 >=1 条 → 绑定成立"
+LEGACY_CONCLUSION_MISSING = "结论: head {short} 缺 {missing} → head 变了要重跑双问"
 
 
 class ReviewHeadError(Exception):
@@ -75,30 +116,63 @@ class ReviewHeadError(Exception):
 
 @dataclass(frozen=True)
 class Mark:
-    """一条正文里的结构化标记（sha 已通过形态校验）。"""
+    """一条正文里的结构化标记（值已通过形态校验）。
 
-    sha: str
+    ``patch`` 是 ``REVIEW-PATCH`` 的 40 hex 内容指纹，``head`` 是 ``REVIEW-HEAD`` 的
+    40/64 hex 历史 head sha（两者都在时**以 ``patch`` 为准**，``head`` 只留痕）。``state``
+    ∈ :data:`STATE_OK` / :data:`STATE_LEGACY_OK` / :data:`STATE_STALE` /
+    :data:`STATE_UNVERIFIABLE`，由 :func:`judge` 填；``resolved`` 是旧标记现算出的内容
+    指纹（``LEGACY-OK`` / 旧标记 ``STALE`` 时有值，其余 ``None``）。
+
+    :func:`parse_marks` 只出形态（``state=""``、``resolved=None``）—— 判定归
+    :func:`judge`，两件事分开才好在单测里注入 ``resolve`` 替身。
+    """
+
     kind: str
+    patch: str | None
+    head: str | None
+    state: str = ""
+    resolved: str | None = None
+
+    @property
+    def value(self) -> str | None:
+        """这条标记指向的内容值：``REVIEW-PATCH`` 优先，否则退回历史 head sha。"""
+
+        return self.patch if self.patch is not None else self.head
 
     @property
     def short(self) -> str:
-        """前 12 位（输出行与结论行用它，避免把 64 位 sha 铺满一行）。"""
-        return self.sha[:12]
+        """前 12 位（输出行用它，避免把 40/64 位值铺满一行）。"""
+
+        return (self.value or "")[:12]
 
 
 @dataclass(frozen=True)
 class Report:
-    """一次判定的全部结果：扫描条数、标记、该 head 上已齐的 kind、缺的 kind。"""
+    """一次判定的全部结果：当前内容指纹、扫描条数、标记、已齐的 kind、缺的 kind。"""
 
-    head: str
+    #: 当前内容指纹（:class:`Fingerprint`）；兼容形态（按 sha 判）时为 ``None``
+    current: Fingerprint | None
     bodies_scanned: int
     marks: tuple[Mark, ...]
-    kinds_on_head: frozenset[str]
+    #: 内容指纹上已齐的 kind（只算 ``OK`` / ``LEGACY-OK`` 的标记）
+    kinds_on_patch: frozenset[str]
     missing: tuple[str, ...]
+    #: 兼容形态的 head sha（指纹形态为空串，只为旧调用点渲染用）
+    head: str = ""
+    #: 仅用于空 diff 结论行点名 base
+    base: str = ""
+
+    @property
+    def kinds_on_head(self) -> frozenset[str]:
+        """旧名别名（``cli.py`` / ``merge_guard.py`` 仍在用；E3 / E4 接线后删）。"""
+
+        return self.kinds_on_patch
 
     @property
     def ok(self) -> bool:
-        """两类都在该 head 上 ≥1 条才算绑定成立（= CLI rc0）。"""
+        """两类都在当前内容指纹上 ≥1 条才算绑定成立（= CLI rc0）。"""
+
         return not self.missing
 
 
@@ -128,51 +202,231 @@ def check_pr(value: object) -> int:
 
 
 def parse_marks(bodies: Iterable[str]) -> tuple[Mark, ...]:
-    """逐条正文抽标记；两行都出现才算一条（同一条正文只取每条正则的首个匹配）。"""
+    """逐条正文抽标记：``REVIEW-KIND`` + (``REVIEW-PATCH`` 或 ``REVIEW-HEAD``) 才算一条。
+
+    同一条正文只取每条正则的**首个**匹配；两种值行都在时以 ``REVIEW-PATCH`` 为准
+    （``head`` 照样留痕，判定不看它）。只有 ``REVIEW-KIND``（或只有值行）不算标记。
+    返回的 ``state`` 是空串 —— 判定归 :func:`judge`。
+    """
 
     marks: list[Mark] = []
     for body in bodies:
         text = body or ""
-        head = HEAD_RE.search(text)
         kind = KIND_RE.search(text)
-        if head is not None and kind is not None:
-            marks.append(Mark(sha=head.group(1), kind=kind.group(1)))
+        if kind is None:
+            continue
+        patch = PATCH_RE.search(text)
+        head = HEAD_RE.search(text)
+        if patch is None and head is None:
+            continue
+        marks.append(
+            Mark(
+                kind=kind.group(1),
+                patch=patch.group(1) if patch is not None else None,
+                head=head.group(1) if head is not None else None,
+            )
+        )
     return tuple(marks)
 
 
-def analyze(head: str, bodies: Sequence[str]) -> Report:
-    """判定该 head 上双问是否齐（纯函数；``head`` 已由 :func:`check_head` 规整）。"""
+def judge(
+    marks: Sequence[Mark],
+    current: Fingerprint,
+    *,
+    resolve: Callable[[str], Fingerprint | None] | None,
+) -> tuple[Mark, ...]:
+    """四态判定（表见模块 docstring）。
 
-    marks = parse_marks(bodies)
-    kinds = frozenset(mark.kind for mark in marks if mark.sha == head)
+    ``resolve(sha)`` 把一条历史 head sha 现算成内容指纹：注入替身即可脱离 git（单测
+    不碰网络），:func:`analyze` 注入的是 :func:`fingerprint_of_commit`。同一个 sha 在
+    一轮判定里只算一次（memo）—— 一条 PR 有十几条评论时不必重复跑 git。
+
+    - ``REVIEW-PATCH``：不调用 ``resolve``，与 ``current.value`` 逐字比；
+    - 只有 ``REVIEW-HEAD``：``resolve`` 为 ``None``（没有仓库上下文）或返回 ``None`` /
+      非 ``patch`` 指纹 → ``UNVERIFIABLE``；否则按指纹相等与否给 ``LEGACY-OK`` / ``STALE``。
+    """
+
+    memo: dict[str, Fingerprint | None] = {}
+    judged: list[Mark] = []
+    for mark in marks:
+        if mark.patch is not None:
+            matched = current.value is not None and mark.patch == current.value
+            judged.append(
+                replace(mark, state=STATE_OK if matched else STATE_STALE, resolved=None)
+            )
+            continue
+        sha = mark.head or ""
+        if sha in memo:
+            fp = memo[sha]
+        else:
+            fp = resolve(sha) if resolve is not None else None
+            memo[sha] = fp
+        if fp is None or fp.kind != "patch" or fp.value is None:
+            judged.append(replace(mark, state=STATE_UNVERIFIABLE, resolved=None))
+            continue
+        state = STATE_LEGACY_OK if fp.value == current.value else STATE_STALE
+        judged.append(replace(mark, state=state, resolved=fp.value))
+    return tuple(judged)
+
+
+def _report_from(
+    current: Fingerprint | None,
+    marks: tuple[Mark, ...],
+    bodies_scanned: int,
+    *,
+    head: str = "",
+    base: str = "",
+) -> Report:
+    """按判定后的标记算 ``kinds_on_patch`` / ``missing``（``missing`` 顺序固定）。"""
+
+    kinds = frozenset(mark.kind for mark in marks if mark.state in STATES_COUNTED)
     missing = tuple(kind for kind in KINDS if kind not in kinds)
     return Report(
-        head=head,
-        bodies_scanned=len(bodies),
+        current=current,
+        bodies_scanned=bodies_scanned,
         marks=marks,
-        kinds_on_head=kinds,
+        kinds_on_patch=kinds,
         missing=missing,
+        head=head,
+        base=base,
+    )
+
+
+def _unverifiable_report(
+    current: Fingerprint | None,
+    bodies: Sequence[str],
+    *,
+    head: str = "",
+    base: str = "",
+) -> Report:
+    """内容指纹不可用（二进制 / 空 diff / 当前对象取不到）：两类全缺，标记一律不可验证。"""
+
+    marks = tuple(
+        replace(mark, state=STATE_UNVERIFIABLE, resolved=None)
+        for mark in parse_marks(bodies)
+    )
+    return _report_from(current, marks, len(bodies), head=head, base=base)
+
+
+def _legacy_report(head: str, bodies: Sequence[str]) -> Report:
+    """兼容形态（没有仓库上下文）：按 sha 比，等价于接线前的旧口径。"""
+
+    marks = tuple(
+        replace(
+            mark,
+            state=(
+                STATE_LEGACY_OK
+                if mark.patch is None and mark.head == head
+                else STATE_STALE
+            ),
+            resolved=None,
+        )
+        for mark in parse_marks(bodies)
+    )
+    return _report_from(None, marks, len(bodies), head=head)
+
+
+def analyze(
+    current: Fingerprint | str,
+    bodies: Sequence[str],
+    *,
+    repo: str | Path | None = None,
+    base: str | None = None,
+    remote: str = "origin",
+) -> Report:
+    """判定「某份内容」上双问是否齐。
+
+    ``current`` 是 :class:`Fingerprint`（正常形态，由调用方用 :func:`fingerprint` /
+    :func:`fingerprint_of_commit` 算好）；兼容形态传 head sha 字符串（``repo`` /
+    ``base`` 都没给时按 sha 判、走旧渲染 —— 见模块 docstring 末段）。
+
+    - ``current.kind`` 不是 ``"patch"``（``binary`` / ``empty``）→ 两类全缺：二进制
+      patch-id 盲、空 diff 没有可比内容，都不许当 PASS；标记一律 ``UNVERIFIABLE``；
+    - 其余 → :func:`parse_marks` + :func:`judge`（``resolve`` =
+      :func:`fingerprint_of_commit`；没给 ``repo`` / ``base`` 时旧标记只能 ``UNVERIFIABLE``）。
+    """
+
+    if isinstance(current, str):
+        if repo is None or base is None:
+            return _legacy_report(current, bodies)
+        fp = fingerprint_of_commit(repo, base, current, remote)
+        if fp is None:
+            # 取不到对象 = 算不出当前指纹：旧标记全 UNVERIFIABLE，两类全缺（rc1 语义）
+            return _unverifiable_report(None, bodies, head=current, base=base)
+        head_sha, base_ref = current, base
+    else:
+        fp, head_sha, base_ref = current, "", (base or "")
+
+    if fp.kind != "patch" or fp.value is None:
+        return _unverifiable_report(fp, bodies, head=head_sha, base=base_ref)
+
+    resolver: Callable[[str], Fingerprint | None] | None = None
+    if repo is not None and base is not None:
+        resolve_repo, resolve_base = repo, base
+
+        def _resolve(sha: str) -> Fingerprint | None:
+            return fingerprint_of_commit(resolve_repo, resolve_base, sha, remote)
+
+        resolver = _resolve
+
+    return _report_from(
+        fp, judge(parse_marks(bodies), fp, resolve=resolver), len(bodies),
+        head=head_sha, base=base_ref,
     )
 
 
 def render(report: Report) -> str:
-    """整块报告：扫描条数 / 带标记行数 / 每条 ``OK|STALE <sha12> <kind>`` / 结论。"""
+    """整块报告（指纹形态）。
 
+    首行 ``algo=<FINGERPRINT_ALGO> current=<前12> mb=<前12>``，第二行扫描条数，然后每条
+    ``<state> <pid12|head12> <kind>``，最后一行结论。``report.current`` 为 ``None`` 时是
+    兼容形态（按 sha 判），走旧渲染（旧调用点的输出保持逐字不变）。
+    """
+
+    if report.current is None:
+        return _legacy_render(report)
+
+    current = report.current
+    lines = [
+        f"algo={FINGERPRINT_ALGO} current={current.value[:12] if current.value else '-'}"
+        f" mb={current.merge_base[:12]}",
+        f"扫描正文 {report.bodies_scanned} 条；带标记行 {len(report.marks)} 条",
+    ]
+    for mark in report.marks:
+        lines.append(f"  {mark.state} {mark.short} {mark.kind}")
+    short = (current.value or report.head or "")[:12]
+    if current.kind == "binary":
+        lines.append(CONCLUSION_BINARY.format(paths=",".join(current.paths)))
+    elif current.kind == "empty":
+        lines.append(CONCLUSION_EMPTY.format(base=report.base or "base"))
+    elif not report.marks:
+        lines.append(CONCLUSION_NO_MARK)
+    elif report.missing:
+        lines.append(CONCLUSION_MISSING.format(short=short, missing=",".join(report.missing)))
+    else:
+        lines.append(CONCLUSION_OK.format(short=short))
+    return "\n".join(lines)
+
+
+def _legacy_render(report: Report) -> str:
+    """兼容形态的旧渲染（逐字保持接线前的输出，旧调用点测试不破）。"""
+
+    short = report.head[:12]
     lines = [f"扫描正文 {report.bodies_scanned} 条；带标记行 {len(report.marks)} 条"]
     if not report.marks:
-        lines.append(CONCLUSION_NO_MARK.format(short=report.head[:12]))
+        lines.append(CONCLUSION_NO_MARK)
         return "\n".join(lines)
     for mark in report.marks:
-        flag = "OK" if mark.sha == report.head else "STALE"
-        lines.append(f"  {flag} {mark.short} {mark.kind}")
+        flag = "OK" if mark.state in STATES_COUNTED else "STALE"
+        lines.append(f"  {flag} {(mark.value or '')[:12]} {mark.kind}")
     if report.missing:
         lines.append(
-            CONCLUSION_MISSING.format(
-                short=report.head[:12], missing=",".join(report.missing)
+            LEGACY_CONCLUSION_MISSING.format(
+                short=short, missing=",".join(report.missing)
             )
         )
     else:
-        lines.append(CONCLUSION_OK.format(short=report.head[:12]))
+        lines.append(LEGACY_CONCLUSION_OK.format(short=short))
     return "\n".join(lines)
 
 
