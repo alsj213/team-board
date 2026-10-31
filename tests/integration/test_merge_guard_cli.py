@@ -2679,7 +2679,7 @@ def test_rebase_gate_git_subcommand_order_passing(
     """通过路径的 git 子命令顺序（E4 起双问闸门先跑、共用一次 fetch）：
 
     存在性探针 → remote get-url（仓库核对）→ ①双问闸门的 fetch → rev-parse（交叉核对）
-    → 内容指纹（merge-base / diff --numstat / diff -U0 / patch-id）→ ②rebase 闸门的
+    → 内容指纹（merge-base --all / diff --numstat / diff -U0，sha256 内容行）→ ②rebase 闸门的
     fetch → rev-parse（交叉核对）→ merge-base --is-ancestor → rev-parse(base，只用于证据行）
     → 删除探针。
     """
@@ -2689,23 +2689,36 @@ def test_rebase_gate_git_subcommand_order_passing(
     rc, out, _err = run(args_for(stub), capsys)
 
     assert rc == 0
-    subs = [call.split()[3] for call in stub.git_calls()]
-    assert subs[:12] == [
+    def git_sub(call: str) -> str:
+        """取 git 子命令：跳过全局 ``-c key=value``（指纹那一路会带配置钉死）。"""
+        parts = call.split()
+        i = 3
+        while i < len(parts):
+            if parts[i] == "-c":
+                i += 2
+                continue
+            if parts[i].startswith("-"):
+                i += 1
+                continue
+            return parts[i]
+        return ""
+
+    subs = [git_sub(call) for call in stub.git_calls()]
+    assert subs[:11] == [
         "ls-remote",
         "config",
         "fetch",       # 双问闸门：与 rebase 闸门共用的那一份取数
         "rev-parse",   # 双问闸门：远端 head 必须 == headRefOid
-        "merge-base",  # 内容指纹：merge-base（真 git）
+        "merge-base",  # 内容指纹：merge-base --all（真 git）
         "diff",        # 内容指纹：diff --numstat -U0（真 git）
-        "diff",        # 内容指纹：diff -U0（真 git）
-        "patch-id",    # 内容指纹：patch-id --stable（真 git）
+        "diff",        # 内容指纹：diff -U0（sha256 内容行，无 patch-id 调用）
         "fetch",       # rebase 闸门：同一份取数再跑一次
         "rev-parse",   # rebase 闸门：远端 head 必须 == headRefOid
         "merge-base",  # rebase 闸门：merge-base --is-ancestor
         "rev-parse",   # rebase 闸门：读 base 的前 7 位拼证据行
     ]
-    assert set(subs[12:]) == {"ls-remote"}  # 后面全是删除探针
-    assert " --is-ancestor " in stub.git_calls()[10]  # 第 11 条才是 rebase 判定
+    assert set(subs[11:]) == {"ls-remote"}  # 后面全是删除探针
+    assert " --is-ancestor " in stub.git_calls()[9]  # 第 10 条才是 rebase 判定
     assert " --is-ancestor " not in stub.git_calls()[4]  # 第 5 条是指纹的 merge-base
     assert REMOTE_CALL.format(repo=stub.repo) in stub.git_calls()
     assert rebase_line(stub) in out.splitlines()
