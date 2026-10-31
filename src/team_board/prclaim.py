@@ -10,7 +10,7 @@
 - ``needs_claim`` / ``first_claim_pr`` / ``audit_gaps`` / ``render_gaps``：
   ``pr-claim-audit --gaps`` 的缺口判据（标题命中合并语义、正文首行却不是
   ``PR-CLAIM: #<N>``）。触发谓词与内核建卡闸门逐字相同，**首行判据刻意更严**
-  （不 strip、按 ``\\n`` 切），差异集 4 类（缩进 / 行尾空白 / CRLF / 其它换行符，
+  （不 strip、按 ``\\n`` 切），差异集 4 类（前导空白 / 行尾空白 / CRLF / 其它换行符，
   字符级变体含 NBSP、VT、FF、``\\x1c``、U+2028 等）见 ``docs/pr-claim-gate.md`` 第 2 节。
 
 判定口径（照 R17 原文，一个字都不放宽）：
