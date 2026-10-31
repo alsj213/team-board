@@ -40,7 +40,7 @@ IMPL_CARD = "t_bbeab29f"
 BRANCH = f"wt/{IMPL_CARD}"
 #: 收口（合并）卡：``--card`` 与 ``PR-CLAIM`` 都写它
 MERGE_CARD = "t_0ddc0ffe"
-MERGE_BY = "pm/run200"
+MERGE_BY = "repo/run200"
 PR = 9
 REMOTE_URL = "git@github.com:alsj213/team-board.git"
 
