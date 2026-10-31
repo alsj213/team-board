@@ -140,6 +140,19 @@ def amend_new_content(repo: Repo) -> str:
     return git(repo.path, "rev-parse", "HEAD")
 
 
+def orphan_commit(repo: Repo) -> str:
+    """造一条与本仓库主线**无共同祖先**的提交（``merge-base`` 必然失败）。"""
+
+    git(repo.path, "checkout", "-q", "--orphan", "orphan")
+    git(repo.path, "rm", "-q", "-r", "-f", "--cached", ".")
+    (repo.path / "only.py").write_text("x = 1\n", encoding="utf-8")
+    git(repo.path, "add", "-A")
+    git(repo.path, "commit", "-q", "-m", "orphan root")
+    sha = git(repo.path, "rev-parse", "HEAD")
+    git(repo.path, "checkout", "-q", "feature")
+    return sha
+
+
 @pytest.fixture()
 def repo(tmp_path: Path) -> Repo:
     return make_repo(tmp_path / "repo")
@@ -594,6 +607,21 @@ class TestRc2Params:
 
 
 class TestRc2Environment:
+    def test_legacy_mark_with_unrelated_history_is_rc2(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """旧 ``REVIEW-HEAD`` 指向无共同祖先的提交：解析期 git 失败 → rc2（不是 traceback）。"""
+
+        orphan = orphan_commit(repo)
+        stub.reviews([headed(orphan, "defect")])
+        stub.comments([patched(repo.pid, "regression")])
+        code, out, err = once(capsys, repo)
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+        assert err.startswith("错误: git merge-base")
+        assert "Traceback" not in err
+
     def test_git_missing_from_path(
         self,
         tmp_path: Path,

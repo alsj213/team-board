@@ -1766,16 +1766,18 @@ def _run_pr_review_head_audit(args: argparse.Namespace) -> int:
 
     try:
         bodies = reviewhead.fetch_bodies(pr)
-    except reviewhead.ReviewHeadError as exc:
+        if fingerprint is None:
+            report = reviewhead.unfetchable(head, bodies, base=base)
+        else:
+            # analyze 会把旧 REVIEW-HEAD 标记指向的 sha 现算一遍指纹（要走 git），
+            # 那条路径上的 PatchIdError 同样是环境错误 → 与上面同一个 except 收口，
+            # 不许漏成 traceback（rc2 的判据是「stderr 恰一行、stdout 0 字节」）。
+            report = reviewhead.analyze(
+                fingerprint, bodies, repo=repo, base=base, remote=args.remote
+            )
+    except (reviewhead.ReviewHeadError, reviewhead.PatchIdError) as exc:
         _write_stderr_error(str(exc))
         return 2
-
-    if fingerprint is None:
-        report = reviewhead.unfetchable(head, bodies, base=base)
-    else:
-        report = reviewhead.analyze(
-            fingerprint, bodies, repo=repo, base=base, remote=args.remote
-        )
     if not _write_stdout(reviewhead.render(report) + "\n"):
         return 2
     return 0 if report.ok else 1
