@@ -112,6 +112,63 @@ def iter_body_rows(
     ]
 
 
+#: ``iter_output_rows`` 的两段 SQL：评论（``task_comments.body``）与结果（``tasks.result``）
+_COMMENT_COLUMNS = "c.task_id, c.id, c.body"
+_RESULT_COLUMNS = "id, result"
+
+
+def iter_output_rows(
+    conn: sqlite3.Connection, *, include_done: bool
+) -> list[tuple[str, str, str, int]]:
+    """``(task_id, source, row_id, 字节数)``，按 ``(task_id, source, row_id)`` 升序。
+
+    - ``source``：``"comment"``（``task_comments.body``）或 ``"result"``（``tasks.result``）；
+    - ``row_id``：评论取主键的十进制字符串，result 固定 ``"-"``（一张卡只有一个 result）；
+    - 口径与 :func:`iter_body_rows` 一致：``include_done=False`` → 未结卡
+      （``status NOT IN ('done','archived')``）；``True`` → 未归档卡
+      （``status != 'archived'``）。result 段额外要求 ``result IS NOT NULL``
+      （没有结果 = 没有可稽核的内容，不记 0 字节）；
+    - 字节数在 Python 侧用 :func:`bodylimit.body_bytes` 算（SQLite 的 ``length()``
+      数的是字符，不是 UTF-8 字节），NULL / 空串都记 0；
+    - 评论行按 ``(task_id, source, row_id)`` 元组升序返回，``row_id`` 是十进制字符串，
+      排序因此是字典序 —— 口径写在契约里，不在这里改写。
+    """
+    scope = _BODY_SCOPE_ALL if include_done else _BODY_SCOPE_PENDING
+    # scope 来自模块常量（无外部输入，不是注入面）→ bandit B608 假阳性
+    comment_sql = (
+        f"SELECT {_COMMENT_COLUMNS} FROM task_comments c "  # nosec B608
+        f"JOIN tasks t ON t.id = c.task_id WHERE t.{scope}"
+    )
+    result_sql = (
+        f"SELECT {_RESULT_COLUMNS} FROM tasks "  # nosec B608
+        f"WHERE {scope} AND result IS NOT NULL"
+    )
+
+    rows: list[tuple[str, str, str, int]] = []
+    try:
+        for task_id, comment_id, body in conn.execute(comment_sql).fetchall():
+            rows.append(
+                (
+                    str(task_id),
+                    "comment",
+                    str(comment_id),
+                    bodylimit.body_bytes(None if body is None else str(body)),
+                )
+            )
+        for task_id, result in conn.execute(result_sql).fetchall():
+            rows.append(
+                (
+                    str(task_id),
+                    "result",
+                    "-",
+                    bodylimit.body_bytes(None if result is None else str(result)),
+                )
+            )
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 task_comments 失败: {exc}") from exc
+    return sorted(rows)
+
+
 def iter_claim_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
     """``(id, status, assignee, body)`` 的未结卡，按 id 升序。
 
