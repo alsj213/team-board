@@ -949,8 +949,11 @@ $ echo $?
 2
 ```
 
-条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板 +
-实测 719 字节样例）见 [`docs/card-template.md`](docs/card-template.md)。
+条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板，
+`assignee=engineer` 的实现卡另加第 7 块「验收标准」；字节计数样例 834 字节，**只用于演示
+字节 vs 字符、不能当卡正文抄**）见
+[`docs/card-template.md`](docs/card-template.md)，第 7 块的闸门口径见
+[`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
 
 ## 闸门日志（gate）
 
