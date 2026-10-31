@@ -26,6 +26,7 @@ from team_board.reviewhead import (
     PatchIdError,
     fingerprint,
     fingerprint_of_commit,
+    patch_id_supports_verbatim,
 )
 
 _GIT_ENV = {
@@ -86,9 +87,18 @@ def make_repo(tmp_path: Path, name: str = "repo") -> Path:
 def raw_patch_id(
     repo: Path, base: str, head: str, *diff_args: str, env_extra: dict[str, str] | None = None
 ) -> str:
-    """**不经被测模块**直接算 patch-id（对照组：证明某种注入确实会改变指纹）。"""
+    """**不经被测模块**直接算 patch-id（对照组：证明某种注入确实会改变指纹）。
+
+    档位必须与模块一致（``patch_id_supports_verbatim`` 探针决定，不按版本号猜）：
+    新 git 上模块走 ``--verbatim``，这里再拿 ``--stable`` 去比就是拿两个算法比数字
+    （CI 首轮实测：``baseline.value == rename_off`` 在 runner 的 git 上因此红）。
+    """
 
     env = {**_GIT_ENV, **(env_extra or {})}
+    if patch_id_supports_verbatim(repo):
+        pid_argv = ["-c", "patchid.verbatim=true", "patch-id", "--verbatim"]
+    else:
+        pid_argv = ["-c", "patchid.verbatim=false", "patch-id", "--stable"]
     diff = subprocess.run(
         ["git", "-C", str(repo), "diff", *(diff_args or ("-U0",)), base, head],
         capture_output=True,
@@ -96,7 +106,7 @@ def raw_patch_id(
         check=True,
     ).stdout
     out = subprocess.run(
-        ["git", "-C", str(repo), "patch-id", "--stable"],
+        ["git", "-C", str(repo), *pid_argv],
         input=diff,
         capture_output=True,
         env=env,
