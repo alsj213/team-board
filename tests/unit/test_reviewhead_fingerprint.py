@@ -243,6 +243,41 @@ def test_indent_only_change_changes_fingerprint(tmp_path: Path) -> None:
     assert patch_id(repo, before.merge_base, old_sha) == patch_id(repo, "main", "feat")
 
 
+@pytest.mark.parametrize(
+    "mutated",
+    ("        x = 1\n", "x  =  1\n", "x = 1 \n", "x\t= 1\n"),
+    ids=("indent", "inner-double-space", "trailing-space", "tab-instead-of-space"),
+)
+def test_any_whitespace_byte_change_changes_fingerprint(
+    tmp_path: Path, mutated: str
+) -> None:
+    """**任意一个空白字节的改动**都必须换指纹（行首 / 行中 / 行尾 / 制表符）。
+
+    E3 卡面点名的两个实测样例就是 ``        x = 1`` 与 ``x  =  1``：旧 ``patch-id`` 对它们
+    都返回同一个 id，于是「改空白」能复用旧证据。缩进那条用例只覆盖行首，这里把行中、
+    行尾、制表符一并锁住 —— 判据是「内容行逐字节进哈希」，不是「只有缩进才算内容」。
+    """
+
+    repo = make_repo(tmp_path)
+    git(repo, "checkout", "-q", "-b", "feat")
+    write(repo, "code.txt", "x = 1\n")
+    old_sha = commit(repo, "feat: add code.txt")
+
+    before = fingerprint(repo, "main", "feat")
+    assert before.kind == "patch"
+    assert before.value is not None
+
+    write(repo, "code.txt", mutated)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "--amend", "--no-edit")
+    after = fingerprint(repo, "main", "feat")
+    assert after.kind == "patch"
+    assert after.value is not None
+    assert after.value != before.value, f"空白改动必须换指纹：{mutated!r}"
+    # 对照：旧算法（patch-id）对同一对 diff 给出同一个 id —— 证明这条用例抓的就是那个缺陷
+    assert patch_id(repo, before.merge_base, old_sha) == patch_id(repo, "main", "feat")
+
+
 def test_binary_diff_is_binary_not_patch(tmp_path: Path) -> None:
     """二进制：两个不同 blob 的 patch-id 相同（判不了）→ 必须返回 kind="binary"。"""
 
