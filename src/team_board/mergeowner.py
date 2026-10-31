@@ -1,6 +1,8 @@
 """``merge-owner-audit`` 的纯函数层：抽 PR 号、读豁免、五类判定、渲染与 rc。
 
-口径唯一源是需求卡 ``t_6fca5f99`` 冻结的契约 v1（见本卡评论 #1）。本模块**不读库、
+口径唯一源是需求卡 ``t_6fca5f99`` 冻结的契约 v1（见本卡评论 #1），返工轮按契约 v2
+增量改了两处：``UNOWNED`` 结论行代入真实最小无归属号、``others`` 同时吃三元组与
+``db.iter_claim_rows`` 的四元组。本模块**不读库、
 不调 gh、不写文件、不 print**：取数（db 取正文与评论、gh 判状态、降级写日志）全在
 CLI 层，本模块只吃字符串与 :class:`GhResult`，吐 :class:`Report`。
 
@@ -46,6 +48,7 @@ __all__ = [
     "UNOWNED",
     "URL_RE",
     "WARN",
+    "ClaimRow",
     "GhResult",
     "MergeOwnerError",
     "Report",
@@ -100,7 +103,7 @@ VERDICT_NO_PR = "结论: 抽取到 0 个 PR 号 → 无合并归属需要（直�
 VERDICT_ALL_OK = "结论: {n} 个 PR 全部有归属 → 可关"
 VERDICT_UNOWNED = (
     "结论: {n} 个 PR / 通过 {k} / 无归属 {m} → "
-    "先建收口卡（首行 PR-CLAIM: #<最小无归属号>）再关本卡"
+    "先建收口卡（首行 PR-CLAIM: #{pr}）再关本卡"
 )
 VERDICT_DEGRADED = "结论: gh 不可用（{detail}）→ 降级放行（日志已写），晨报须列"
 
@@ -173,6 +176,12 @@ def exempt_prs(body: str | None) -> frozenset[int]:
     return frozenset(int(n) for n in EXEMPT_RE.findall(body))
 
 
+#: 「另一张卡」的认领行：``(卡号, 状态, 正文)`` 是 E1 里的紧凑形状，
+#: ``(卡号, 状态, 负责人, 正文)`` 是 :func:`team_board.db.iter_claim_rows` 直出的形状
+#: （E2 契约要求复用该函数，故两种都吃；判定只取 ``row[0]`` / ``row[1]`` / ``row[-1]``）
+ClaimRow = tuple[str, str, str | None] | tuple[str, str, str | None, str | None]
+
+
 def judge(
     card: str,
     status: str,
@@ -180,22 +189,24 @@ def judge(
     *,
     exempt: frozenset[int] | None = None,
     gh: Mapping[int, GhResult] | None = None,
-    others: Iterable[tuple[str, str, str | None]] = (),
+    others: Iterable[ClaimRow] = (),
 ) -> Report:
     """把「本卡 + PR 号集合 + gh 结果 + 其它卡的认领」判成 :class:`Report`。
 
     - ``prs``：:func:`extract_prs` 的产物（重复与乱序都容忍，内部按升序去重）；
     - ``exempt``：:func:`exempt_prs` 的产物（本卡正文的豁免行）；
     - ``gh``：PR 号 → :class:`GhResult`；**缺条目按取数失败**（``WARN``）算；
-    - ``others``：``(卡号, 状态, 正文)`` 三元组，可以传全表 —— 「另一张未结卡」的
-      过滤（自己 / 已结）在这里做，判定口径不散到 CLI 层。
+    - ``others``：认领行，两种形状都吃 —— ``(卡号, 状态, 正文)`` 与
+      ``(卡号, 状态, 负责人, 正文)``（:func:`db.iter_claim_rows` 的直出）；判定只认
+      ``row[0]`` / ``row[1]`` / ``row[-1]``，中间列不参与口径。可以传全表 ——
+      「另一张未结卡」的过滤（自己 / 已结）在这里做，判定口径不散到 CLI 层。
     """
     exempt_set = frozenset(exempt or ())
     gh_map: Mapping[int, GhResult] = gh or {}
     pool = tuple(
-        (other_id, body)
-        for other_id, other_status, body in others
-        if other_id != card and other_status not in DONE_STATUSES
+        (row[0], row[-1])
+        for row in others
+        if row[0] != card and row[1] not in DONE_STATUSES
     )
     verdicts = tuple(
         _judge_one(pr, exempt_set, gh_map, pool) for pr in sorted(set(prs))
@@ -239,7 +250,10 @@ def render(report: Report) -> str:
     elif unowned:
         lines.append(
             VERDICT_UNOWNED.format(
-                n=total, k=total - len(unowned), m=len(unowned)
+                n=total,
+                k=total - len(unowned),
+                m=len(unowned),
+                pr=unowned[0].pr,  # verdicts 升序 → 第一项即最小无归属号
             )
         )
     elif warns:

@@ -3,7 +3,7 @@
 这里只测纯函数（不连库、不调 gh、不碰 stdout）；CLI 的 rc 三态与降级日志在
 ``tests/integration/test_cli_merge_owner_audit.py``（子卡 E2）。
 
-12 条用例对应契约 v1（t_6fca5f99 冻结）的清单；每条内部覆盖多个边界值
+15 条用例对应契约 v1 + v2 增量（t_6fca5f99 冻结）的清单；每条内部覆盖多个边界值
 （``0`` / 负数 / 13 位毫秒 / 天文数字 / 空串），不再拆成更多函数。
 """
 
@@ -131,6 +131,44 @@ class TestJudge:
         assert missing.verdicts[0].kind == mo.WARN
         assert missing.verdicts[0].detail
 
+    def test_others_accepts_iter_claim_rows_four_tuples(self) -> None:
+        """``db.iter_claim_rows`` 直出的 4 元组 ``(id, status, assignee, body)`` 也判 CLAIMED。"""
+        rows = [
+            (OTHER_B, "todo", "engineer", "PR-CLAIM: #53"),
+            (OTHER_A, "running", "pm", "PR-CLAIM: #53"),
+        ]
+        report = mo.judge(CARD, "running", [53], gh={53: GhResult(status="OPEN")}, others=rows)
+        assert report.verdicts[0].kind == mo.CLAIMED
+        # detail 只取卡号，升序逗号分隔；负责人列（row[2]）不参与口径
+        assert report.verdicts[0].detail == f"{OTHER_A},{OTHER_B}"
+
+    def test_others_shape_does_not_change_verdicts(self) -> None:
+        """同一批认领的两种行形状 → ``Report`` 完全相等（4 元组只是多一列）。"""
+        triples = [
+            (OTHER_A, "running", "PR-CLAIM: #53"),
+            ("t_11111111", "done", "PR-CLAIM: #53"),
+            (CARD, "running", "PR-CLAIM: #55"),
+        ]
+        quads = [
+            (cid, status, "engineer", body) for cid, status, body in triples
+        ]
+        from_triples = mo.judge(
+            CARD,
+            "running",
+            [53, 55],
+            gh={53: GhResult(status="OPEN"), 55: GhResult(status="OPEN")},
+            others=triples,
+        )
+        from_quads = mo.judge(
+            CARD,
+            "running",
+            [53, 55],
+            gh={53: GhResult(status="OPEN"), 55: GhResult(status="OPEN")},
+            others=quads,
+        )
+        assert from_triples == from_quads
+        assert [v.kind for v in from_triples.verdicts] == [mo.CLAIMED, mo.UNOWNED]
+
 
 class TestRender:
     def test_header_no_pr_and_four_conclusions(self) -> None:
@@ -175,7 +213,7 @@ class TestRender:
                 "PR #53 UNOWNED",
                 "PR #55 WARN gh rc=1",
                 "结论: 3 个 PR / 通过 2 / 无归属 1 → "
-                "先建收口卡（首行 PR-CLAIM: #<最小无归属号>）再关本卡",
+                "先建收口卡（首行 PR-CLAIM: #53）再关本卡",
             ]
         )
 
@@ -197,6 +235,20 @@ class TestRender:
             ]
         )
         assert not mo.render(degraded).endswith("\n")
+
+    def test_unowned_conclusion_uses_smallest_unowned_pr(self) -> None:
+        """两个 UNOWNED（57 与 53）→ 末行取最小号 53，不是 57，也不是字面模板。"""
+        report = mo.judge(
+            CARD,
+            "running",
+            [57, 53],
+            gh={53: GhResult(status="OPEN"), 57: GhResult(status="OPEN")},
+        )
+        rendered = mo.render(report)
+        last = rendered.splitlines()[-1]
+        assert last == "结论: 2 个 PR / 通过 0 / 无归属 2 → 先建收口卡（首行 PR-CLAIM: #53）再关本卡"
+        assert "PR-CLAIM: #57" not in rendered
+        assert "#<最小无归属号>" not in rendered
 
 
 class TestExitCode:
