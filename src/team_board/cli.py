@@ -137,6 +137,24 @@
 ``--subject=<值>`` 形式：``shlex.quote('-h')`` 原样返回，``--subject -h`` 会被
 argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=value`` 形式的
 值不参与选项解析。其余取值仍打 ``--subject <值>``（改动只落在这一行，不换命令形态）。
+
+``evidence`` 子命令（evidence 事件的写入口；``audit`` 归 E3，本命令只有 ``emit``）：
+- ``evidence emit --kind <kind> --payload '<json>' [--card t_xxxxxxxx] [--db PATH]``
+- 0：成功追加**一条** ``task_events``（stdout 恰一行 ``evidence emit: kind=… card=…
+  run=… profile=… event=… payload=…``）
+- 1：判定不通过 —— 角色不符 / 该卡没有进行中的 run / 当前 run 不是 running / 当前
+  run 没有 profile / ``--card`` 与调用者卡号不一致 / payload 违约 / 卡正文缺
+  ``## 验收标准`` 段 / kind 不可 emit（含 ``merged``）；stderr 恰一行、**库里一行都
+  不多**（角色校验失败时没有任何 INSERT）
+- 2：参数或环境错误（``evidence_store.EvidenceStoreError`` → stderr 恰一行
+  ``错误: …``、stdout 空、不冒 traceback；含 ``--payload`` 不是合法 JSON /
+  **不是合法 UTF-8**（非 UTF-8 字节经 argv 进来是孤立代理字符，落库时才炸会变成
+  rc1 + traceback）、``--card`` 形态非法、无法确定调用者卡号、看板库里没有这张卡、
+  ``--db`` 不存在 / 不是合法 SQLite / 缺 ``tasks`` / ``task_runs`` / ``task_events``
+  表、stdout 编码表示不了中文）；**rc2 与落库不并存** —— 摘要在 emit 的事务里先写
+  再 commit，stdout 写不出去就回滚，库里一行都不多
+- 身份只从库取：``tasks.current_run_id`` → ``task_runs.profile``（且 status 必须
+  ``running``）；``HERMES_PROFILE`` 不读，环境变量只用于定位卡号
 """
 
 from __future__ import annotations
@@ -163,6 +181,7 @@ from . import (
     commits,
     db,
     evidence,
+    evidence_store,
     gatelog,
     mergeowner,
     merges,
@@ -694,7 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     evidence_cmd = subparsers.add_parser(
         "evidence",
-        help="evidence 事件（四槽证据）只读稽核：audit 判「四槽齐不齐、是否绑当前 head」",
+        help="evidence 事件（四槽证据）：emit 写入 / audit 只读稽核",
     )
     evidence_sub = evidence_cmd.add_subparsers(dest="evidence_command", required=True)
     evidence_audit = evidence_sub.add_parser(
@@ -731,6 +750,86 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB,
         metavar="PATH",
         help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+
+    emit_cmd = evidence_sub.add_parser(
+        "emit",
+        help="追加一条 evidence 事件（身份取自看板库：tasks.current_run_id → task_runs.profile）",
+    )
+    emit_cmd.add_argument(
+        "--kind",
+        required=True,
+        metavar="KIND",
+        help=(
+            "事件类型（可 emit 的是 evidence.EMITTABLE_KINDS 里的六个；"
+            "merged 由 merge_audit trailer 承载，emit 一律 rc1）"
+        ),
+    )
+    emit_cmd.add_argument(
+        "--payload",
+        default=None,
+        metavar="JSON",
+        help=(
+            "payload 的唯一权威入口（JSON 对象字符串；落库存 evidence.normalize 结果）。"
+            "省略时用下面的便捷参数拼：--head/--disc/--verdict/--tier/--reason/--pr/--run-id"
+        ),
+    )
+    emit_cmd.add_argument(
+        "--disc",
+        default=None,
+        metavar="defect|regression",
+        help="review 事件的判别值（等价于 --payload 里的 kind；review 专用）",
+    )
+    emit_cmd.add_argument(
+        "--head",
+        default=None,
+        metavar="SHA",
+        help="要绑定的 head sha（等价于 --payload 里的 head_sha；40 或 64 位小写十六进制）",
+    )
+    emit_cmd.add_argument(
+        "--pr",
+        default=None,
+        metavar="N",
+        help="PR 号（等价于 --payload 里的 pr；impl_done / boss_approve 用）",
+    )
+    emit_cmd.add_argument(
+        "--run-id",
+        default=None,
+        metavar="RUN",
+        help=(
+            "调用者 run 号（作为 --payload 里 run_id 的缺省值；给了就必须是本卡当前 "
+            "running run，否则 rc1）"
+        ),
+    )
+    emit_cmd.add_argument(
+        "--tier",
+        default=None,
+        metavar="A|B|C",
+        help="tier 事件的档位（等价于 --payload 里的 tier）",
+    )
+    emit_cmd.add_argument(
+        "--reason",
+        default=None,
+        metavar="TEXT",
+        help="tier 事件的理由（等价于 --payload 里的 reason，≤200 字符）",
+    )
+    emit_cmd.add_argument(
+        "--verdict",
+        default=None,
+        metavar="pass|block",
+        help="review 事件的结论（等价于 --payload 里的 verdict）",
+    )
+    emit_cmd.add_argument(
+        "--card",
+        default=None,
+        metavar="t_xxxxxxxx",
+        help="调用者卡号（缺省取 HERMES_KANBAN_TASK，其次 HERMES_KANBAN_WORKSPACE 的 basename）",
+    )
+    emit_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径（默认 {DEFAULT_DB}）",
     )
 
     owner_cmd = subparsers.add_parser(
@@ -1065,6 +1164,18 @@ def _detach_stdout() -> None:
         pass
     finally:
         os.close(devnull)
+
+
+class _StdoutUnwritable(Exception):
+    """stdout 写不出去（编码表示不了 / ``ENOSPC`` 一类）：**库里不许留行**。
+
+    :func:`_run_evidence` 把它当 ``evidence_store.emit`` 的 ``before_commit`` 回调抛
+    出去 —— emit 在事务里收到异常先 ``rollback`` 再上抛，于是 rc2 与「已落库」不再
+    并存（qa run 549 的 ISSUE-2：旧版 rc2 时已经写了 1 行，调用方重试就重复）。
+
+    捕获方**不许再打印第二行** stderr：``_write_stdout`` 失败时自己已经打过
+    ``错误: …``（stderr 恰一行的口径）。
+    """
 
 
 def _parse_merge_pr(value: str) -> int:
@@ -1916,6 +2027,139 @@ def _run_merge_owner_audit(args: argparse.Namespace) -> int:
         )
     return code
 
+def _emit_payload_text(args: argparse.Namespace) -> str:
+    """把 ``--payload`` 或便捷参数拼成 payload JSON 文本（参数错一律抛 StoreError → rc2）。
+
+    口径三条：
+
+    - 给了 ``--payload`` 就以它为准（**唯一权威入口**）；同时再给便捷参数 → rc2
+      （同一字段两个来源，不猜谁赢）；
+    - 没给 ``--payload`` 就用便捷参数拼；一个便捷参数都没给 → rc2；
+    - 每个便捷参数只在**该 kind 的 payload 需要这个键**时才写进 payload
+      （``evidence.REQUIRED_KEYS``）；例外是 ``--run-id`` —— 它对任何 kind 都是
+      「调用方声称的 run 号」，不写进不需要它的 payload，只交给
+      :func:`team_board.evidence_store.check_run_id` 对账。
+    """
+
+    convenience = {
+        flag: getattr(args, flag, None)
+        for flag in ("head", "disc", "verdict", "tier", "reason", "pr", "run_id")
+    }
+    given = sorted(flag for flag, value in convenience.items() if value is not None)
+    if args.payload is not None:
+        if given:
+            raise evidence_store.EvidenceStoreError(
+                "--payload 与便捷参数不能同时给："
+                f"--payload 已给，又多给了 {', '.join('--' + f for f in given)}"
+            )
+        return args.payload
+
+    required = evidence.REQUIRED_KEYS.get(args.kind)
+    built: dict[str, object] = {}
+    for flag, key in (
+        ("head", "head_sha"),
+        ("disc", "kind"),
+        ("verdict", "verdict"),
+        ("tier", "tier"),
+        ("reason", "reason"),
+        ("pr", "pr"),
+        ("run_id", "run_id"),
+    ):
+        value = convenience[flag]
+        if value is None:
+            continue
+        if required is None or key in required:
+            built[key] = (
+                _parse_positive_int("--" + flag.replace("_", "-"), str(value))
+                if key in ("pr", "run_id")
+                else value
+            )
+        elif flag != "run_id":
+            raise evidence_store.EvidenceStoreError(
+                f"--{flag} 不适用于 kind={args.kind}（该 kind 的 payload 键："
+                f"{list(required)}）"
+            )
+    if not built:
+        raise evidence_store.EvidenceStoreError(
+            "缺 --payload（或至少一个便捷参数 --head/--disc/--verdict/--tier/"
+            "--reason/--pr/--run-id）"
+        )
+    return json.dumps(built, ensure_ascii=False)
+
+
+def _parse_positive_int(flag: str, text: str) -> int:
+    """便捷参数的整数形态：非 ASCII 十进制正整数一律 rc2（不猜）。"""
+
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        raise evidence_store.EvidenceStoreError(f"{flag} 非法：{text!r}（应为正整数）")
+    return int(text)
+
+
+def _run_evidence_emit(args: argparse.Namespace) -> int:
+    """``evidence emit``：一次性把写入口径交给 :mod:`team_board.evidence_store`。
+
+    三个码的分工（契约 E2 段）：0 追加成功 / 1 判定不通过 / 2 参数或环境错误。
+
+    - ``EvidenceReject``（``EvidenceStoreError`` 的子类）= rc1，文案**逐字**打到
+      stderr 恰一行（不加 ``错误: `` 前缀：契约 C / F 的引句本身就是完整一句），
+      stdout 空、库里一行都不多；
+    - ``EvidenceStoreError`` = rc2，stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；
+    - 成功时 stdout 恰一行摘要，payload 打的是**落库文本**（``evidence.normalize``
+      的结果），不是 ``--payload`` 原文 —— 两者在键序/空白上可能不同，摘要只认前者。
+
+    摘要行由 :func:`_write_summary_before_commit` 在 emit 的**事务里**写出：stdout
+    写不出去（``PYTHONIOENCODING=ascii`` 表示不了中文、``ENOSPC``）→ 抛
+    :class:`_StdoutUnwritable` → emit 回滚 → rc2 **零落库**。旧版先 commit 再写
+    stdout，于是「说 rc2 没写、实际写了一行」，调用方重试就重复。
+
+    身份解析与写库全在 :mod:`team_board.evidence_store`，这里不重写任何判据。
+    """
+
+    try:
+        payload_text = _emit_payload_text(args)
+        evidence_store.emit(
+            args.kind,
+            payload_text,
+            card=args.card,
+            db_path=args.db,
+            run_id=_parse_positive_int("--run-id", args.run_id) if args.run_id else None,
+            before_commit=_write_summary_before_commit,
+        )
+    except _StdoutUnwritable:
+        # 摘要打不出来：emit 已回滚，stderr 那行由 _write_stdout 自己打的
+        return 2
+    except evidence_store.EvidenceReject as exc:
+        _write_stderr_line(str(exc))
+        return 1
+    except (evidence_store.EvidenceStoreError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    return 0
+
+
+def _run_evidence(args: argparse.Namespace) -> int:
+    """``evidence`` 子命令总入口：按 ``evidence_command`` 分派 ``emit`` / ``audit``。"""
+
+    action = getattr(args, "evidence_command", None)
+    if action == "emit":
+        return _run_evidence_emit(args)
+    if action == "audit":
+        return _run_evidence_audit(args)
+    _write_stderr_error(f"未知的 evidence 动词: {action}")  # pragma: no cover
+    return 2
+
+
+def _write_summary_before_commit(summary: str) -> None:
+    """``evidence_store.emit`` 的 ``before_commit`` 回调：**提交前**把摘要写出去。
+
+    写失败 → :class:`_StdoutUnwritable`（``_write_stdout`` 已经打过 ``错误: …``），
+    emit 收到就回滚。``BrokenPipeError`` 不算失败（下游不要输出了，判定结果仍成立），
+    ``_write_stdout`` 对它返回 ``True``。
+    """
+
+    if not _write_stdout(summary):
+        raise _StdoutUnwritable
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -1949,7 +2193,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pr_claim_audit(args)
 
     if args.command == "evidence":
-        return _run_evidence_audit(args)
+        return _run_evidence(args)
 
     if args.command == "merge-owner-audit":
         return _run_merge_owner_audit(args)

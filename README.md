@@ -29,8 +29,7 @@ team-board export
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节，`merge-owner-audit` 见「PR 合并归属稽核」一节，
 `gate` 见「闸门日志」一节，
-`output-audit` 见「输出上限稽核」一节）。
-
+`output-audit` 见「输出上限稽核」一节，`evidence` 见「evidence 事件」一节）。
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
   review → done）→ 同状态内耗时降序 → id 升序；`archived` 不显示。
@@ -1213,6 +1212,63 @@ PR #50 MERGED
   不是合法 SQLite / 打不开 / 读失败、卡不存在、stdout 编码表示不了中文）：stderr 恰
   一行 `错误: …`、stdout 为空、不冒 traceback。日志目录不可写**不是** `2`。
 
+## evidence 事件（evidence emit / audit）
+
+`evidence` 有两个动词：`emit` 写入一条事件、`audit` 只读判「四槽齐不齐、是否绑当前
+head」（`audit` 见上一节 `evidence audit`）。两者共用父解析器，`evidence --help` 里是
+`{emit,audit}`。
+
+```
+team-board evidence emit --kind KIND (--payload '<json>' | --head SHA ...) [--card t_xxxxxxxx] [--db PATH]
+```
+
+- `--kind` —— 可 emit 的是六个：`spec_sign` / `impl_done` / `tier` / `qa_pass` /
+  `review` / `boss_approve`。`merged` 是保留字（由 `merge_audit` trailer 承载），
+  连同任何未知 kind 一律 **rc1**、库里一行都不多。
+- `--payload` —— payload 的**权威**入口（JSON 对象字符串）。
+  落库前过 `team_board.evidence.validate_payload`（缺键 / 多键 / 类型 / 取值域一律
+  拒绝），库里存的是 `evidence.normalize` 的结果（键序固定、紧凑分隔符）。不是合法
+  JSON → **rc2**；是 JSON 但违反契约（含不是对象）→ **rc1**。
+- 便捷参数（给了就**不许**再给 `--payload`，同给 → **rc2**）—— 把 payload 按键拆开
+  写，拼不出来时按契约层同一套规则判 rc1/rc2：`--head SHA`（`head_sha`）、
+  `--disc defect|regression`（`review` 的 `kind`）、`--verdict pass|block`
+  （`review` 的 `verdict`）、`--tier A|B|C` 与 `--reason TEXT`（`tier`）、
+  `--pr N`（`impl_done` / `boss_approve`）、`--run-id RUN`（`qa_pass` 的 `run_id`，
+  同时对账「是不是本卡当前 running run」）。某个便捷参数对当前 `kind` 不适用
+  （例：`--pr` 给 `review`）→ **rc2**，不静默丢弃。
+- `--run-id RUN` 的另一半作用：它**不**参与身份解析（身份只从库里取），但与
+  `tasks.current_run_id` 解析出的 run 不等 → **rc1**
+  （`run 不属于本卡：--run-id=9，卡 t_deadbeef 当前 running run 是 7`）。
+- `--card` —— 缺省取 `HERMES_KANBAN_TASK`，其次 `HERMES_KANBAN_WORKSPACE` 的
+  basename（必须形如 `t_[0-9a-f]{8}`）。显式给的值与 env 兜底值不相等 → **rc1**
+  （防止拿 A 卡的身份给 B 卡写证据）。
+- `--db PATH` —— 看板库，默认 `/home/liu/.hermes/kanban/boards/devteam/kanban.db`，
+  以 `mode=rw` 打开（只 INSERT，不建表、不 UPDATE / DELETE、不碰 `tasks`）。
+
+调用者身份**只从库里取**：`tasks.current_run_id` → `task_runs(id).profile`，且该 run
+的 `status` 必须是 `running`。`HERMES_PROFILE` 之类「自己报的」profile 不读 —— 环境
+变量只用来定位卡号。角色不匹配（`profile ∉ evidence.ROLE_RULES[kind]`）→ **rc1**，
+stderr 恰一行：
+
+```
+拒绝写入：kind=qa_pass 只允许 qa，调用者 run 7 的 profile 是 pm
+```
+
+其余 rc1：该卡没有进行中的 run（`current_run_id` 为 NULL）/ 当前 run 不是
+`running` / 当前 run 没有 `profile` / 卡正文缺**顶格行首**的 `## 验收标准` 段
+（只对 `spec_sign` 要求）。
+
+rc2：无法确定调用者卡号 / `--card` 形态非法 / 看板库里没有这张卡 / `--db` 不存在 /
+不是合法 SQLite / 缺 `tasks`、`task_runs`、`task_events` 任一张表 / `--payload` 不是
+合法 JSON。rc2 时 stderr 恰一行以 `错误: ` 开头、stdout 为空、不冒 traceback。
+
+rc0 时 stdout 恰一行摘要，`payload=` 打的是**落库文本**：
+
+```
+evidence emit: kind=qa_pass card=t_deadbeef run=7 profile=qa event=1 payload={"head_sha":"…","run_id":7}
+```
+
+一次成功只追加一行 `task_events`，`kind` 就是 `--kind`，`run_id` 就是那个 running run。
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
