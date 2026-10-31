@@ -112,6 +112,45 @@ def iter_body_rows(
     ]
 
 
+_BODY_TEXT_COLUMNS = "id, status, assignee, created_at, body"
+
+
+def iter_body_text_rows(
+    conn: sqlite3.Connection, include_done: bool
+) -> list[tuple[str, str, str, int | None, str | None]]:
+    """``(id, status, assignee, created_at, body|None)``，按 id 升序。
+
+    与 :func:`iter_body_rows` 是**两条独立的消费者口径**，签名互不影响：
+    ``iter_body_rows`` 只给字节数（``body-audit`` 的分桶/超限用），本函数给
+    ``created_at`` 与**正文原文**（固定段落判定无从从字节数推出）。
+
+    - ``include_done=False``：只要未结卡（``status NOT IN ('done','archived')``）；
+    - ``include_done=True``：未归档卡全要（``status != 'archived'``）；
+    - body 为 NULL 的行第 5 列是 ``None``（不是空串）：NULL 与「空正文」要分得开；
+    - ``created_at`` 为 NULL 的行第 4 列是 ``None``（存量切点由调用方定口径）；
+    - ``assignee`` / ``status`` 的 NULL 归成空串（与 :func:`iter_body_rows` 一致）；
+    - 只读：SQL 不带任何写操作，连接本身仍是 ``mode=ro``。
+    """
+    where = _BODY_SCOPE_ALL if include_done else _BODY_SCOPE_PENDING
+    # where / 列名来自模块常量（无外部输入，不是注入面）→ bandit B608 假阳性
+    sql = f"SELECT {_BODY_TEXT_COLUMNS} FROM tasks WHERE {where} ORDER BY id"  # nosec B608
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.body 正文失败: {exc}") from exc
+
+    return [
+        (
+            str(row[0]),
+            "" if row[1] is None else str(row[1]),
+            "" if row[2] is None else str(row[2]),
+            None if row[3] is None else int(row[3]),
+            None if row[4] is None else str(row[4]),
+        )
+        for row in rows
+    ]
+
+
 #: ``iter_output_rows`` 的两段 SQL：评论（``task_comments.body``）与结果（``tasks.result``）
 _COMMENT_COLUMNS = "c.task_id, c.id, c.body"
 _RESULT_COLUMNS = "id, result"
