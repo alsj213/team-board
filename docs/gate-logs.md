@@ -216,7 +216,13 @@ $ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名
     把 C locale 协同成 `C.UTF-8`，并借 **PEP 540** 打开 UTF-8 mode —— 实测 `LC_ALL=C` 下
     `sys.stdout.encoding == 'utf-8'`、`sys.flags.utf8_mode == 1`。UTF-8 mode **默认开**要到
     **PEP 686 / Python 3.15**（PEP 原文 `Python will enable UTF-8 mode by default from Python 3.15`）；
-    本机解释器是 3.14.7，仍靠上面两条。两条任一成立时，检查器输出按原字节还原，不经过任何替换；
+    本机解释器是 3.14.7，仍靠上面两条。两条任一成立时，检查器输出的**非 ASCII 字节**不被替换为
+    `U+FFFD`；**但换行符会被规范化** —— `subprocess.run(..., text=True)` 隐含 universal newlines，
+    CRLF（`0d 0a`）与单独 CR（`0d`）落盘时都变成 LF（`0a`），**日志不是逐字节原件**。实测（本卡
+    worktree）：`gate --gate rep-pm1 --card t_b42125ae -- /bin/sh -c 'printf "a\r\nb\r\n"'` → rc0、
+    摘要 `末尾行（2/2，≤20）:` 下两行 `a` / `b`，日志 `evidence/rep-pm1-t_b42125ae.log` 的
+    `od -An -tx1` 是 `61 0a 62 0a`（4 字节），而子命令真正发出的字节是 `61 0d 0a 62 0d 0a`（6 字节，
+    `od -An -tx1 <(printf 'a\r\nb\r\n')`）—— 差的 2 个 `0d` 就是被规范化掉的 CR；
   - **显式 `PYTHONUTF8=0` / `-X utf8=0` 且 locale 非 UTF-8**（例 `LC_ALL=C`，实测 `-X utf8=0` 下
     `sys.stdout.encoding == 'ascii'`）时解码用 `ascii`，非 ASCII 字节全变 `U+FFFD` —— 实测
     `printf '中文ok\n'` 落成 `ef bf bd`×6 + `ok`；此时 gate 自己的 stdout 也编不出中文摘要，
@@ -332,13 +338,16 @@ log: <日志文件的绝对路径>
    `src/team_board/outputaudit.py`）：rc0 = 无超限 / rc1 = 有超限 / rc2 = 参数或环境错误；
    默认只算未结卡，`--all` 连 `done` 卡一起算。
 
-   自检命令写死「**在本卡 worktree** + `env PYTHONPATH=<本卡 worktree>/src`」（绝对路径，
-   理由见 §1 前置第 4 条）：
+   自检命令用 `<本卡 worktree>` 占位（绝对路径，理由见 §1 前置第 4 条）—— **照抄时把两处占位换成
+   自己那张卡 worktree 的绝对路径**：
 
    ```
-   $ cd /home/liu/project/tb-wt/t_facc5c45 && env PYTHONPATH=/home/liu/project/tb-wt/t_facc5c45/src \
+   $ cd <本卡 worktree> && env PYTHONPATH=<本卡 worktree>/src \
        /home/liu/project/team-board/.venv/bin/python -m team_board.cli output-audit --help
    ```
+
+   别把别人的树原样复制过来：那样 `--card` 是**本卡**卡号、日志却落在**别人**的 worktree 里，
+   两边对不上就是假证据（§1 前置第 3 条）。
 
    rc0 才算树对了。**主 checkout 若还没 fetch 到 `ff679a7`**（output-audit 进 `main` 的那个提交），
    同一条命令 rc2 `team-board: error: argument command: invalid choice: 'output-audit'` ——
@@ -352,7 +361,8 @@ log: <日志文件的绝对路径>
 - **接入旧工具的方式 = 包一层 gate**，不是改造工具本身：工具照旧裸跑可用，要落盘 + 摘要
   就在它前面加 `gate --gate <名> --card <卡号> --`。
 - **gate 不判定通过与否**：`exit:` 是被包装命令的 rc 透传，`counts:` 是从它自己的输出里
-  解析的值；gate 不重算、不解释，输出唯一的改写点是 §2 的 UTF-8 解码替换。
+  解析的值；gate 不重算、不解释，输出有**两处**改写：§2 的 UTF-8 解码替换 + **换行规范化**
+  （`text=True` 的 universal newlines，CRLF / 单独 CR → LF）。
 - 本文只描述契约，改动实现在 `src/team_board/cli.py`（`gate` 子命令）与
   `src/team_board/gatelog.py`（命名 / 落盘 / 摘要的唯一实现）。
 
