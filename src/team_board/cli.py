@@ -113,9 +113,12 @@ argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=valu
   ``## 验收标准`` 段 / kind 不可 emit（含 ``merged``）；stderr 恰一行、**库里一行都
   不多**（角色校验失败时没有任何 INSERT）
 - 2：参数或环境错误（``evidence_store.EvidenceStoreError`` → stderr 恰一行
-  ``错误: …``、stdout 空、不冒 traceback；含 ``--payload`` 不是合法 JSON、``--card``
-  形态非法、无法确定调用者卡号、看板库里没有这张卡、``--db`` 不存在 / 不是合法
-  SQLite / 缺 ``tasks`` / ``task_runs`` / ``task_events`` 表、stdout 编码表示不了中文）
+  ``错误: …``、stdout 空、不冒 traceback；含 ``--payload`` 不是合法 JSON /
+  **不是合法 UTF-8**（非 UTF-8 字节经 argv 进来是孤立代理字符，落库时才炸会变成
+  rc1 + traceback）、``--card`` 形态非法、无法确定调用者卡号、看板库里没有这张卡、
+  ``--db`` 不存在 / 不是合法 SQLite / 缺 ``tasks`` / ``task_runs`` / ``task_events``
+  表、stdout 编码表示不了中文）；**rc2 与落库不并存** —— 摘要在 emit 的事务里先写
+  再 commit，stdout 写不出去就回滚，库里一行都不多
 - 身份只从库取：``tasks.current_run_id`` → ``task_runs.profile``（且 status 必须
   ``running``）；``HERMES_PROFILE`` 不读，环境变量只用于定位卡号
 """
@@ -959,6 +962,18 @@ def _detach_stdout() -> None:
         os.close(devnull)
 
 
+class _StdoutUnwritable(Exception):
+    """stdout 写不出去（编码表示不了 / ``ENOSPC`` 一类）：**库里不许留行**。
+
+    :func:`_run_evidence` 把它当 ``evidence_store.emit`` 的 ``before_commit`` 回调抛
+    出去 —— emit 在事务里收到异常先 ``rollback`` 再上抛，于是 rc2 与「已落库」不再
+    并存（qa run 549 的 ISSUE-2：旧版 rc2 时已经写了 1 行，调用方重试就重复）。
+
+    捕获方**不许再打印第二行** stderr：``_write_stdout`` 失败时自己已经打过
+    ``错误: …``（stderr 恰一行的口径）。
+    """
+
+
 def _parse_merge_pr(value: str) -> int:
     """``merge-record --pr``：ASCII 十进制正整数且不超 ``MAX_MERGE_PR``，否则 rc2。
 
@@ -1542,6 +1557,11 @@ def _run_evidence(args: argparse.Namespace) -> int:
     - 成功时 stdout 恰一行摘要，payload 打的是**落库文本**（``evidence.normalize``
       的结果），不是 ``--payload`` 原文 —— 两者在键序/空白上可能不同，摘要只认前者。
 
+    摘要行由 :func:`_write_summary_before_commit` 在 emit 的**事务里**写出：stdout
+    写不出去（``PYTHONIOENCODING=ascii`` 表示不了中文、``ENOSPC``）→ 抛
+    :class:`_StdoutUnwritable` → emit 回滚 → rc2 **零落库**。旧版先 commit 再写
+    stdout，于是「说 rc2 没写、实际写了一行」，调用方重试就重复。
+
     身份解析与写库全在 :mod:`team_board.evidence_store`，这里不重写任何判据。
     """
 
@@ -1551,22 +1571,35 @@ def _run_evidence(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        result = evidence_store.emit(
+        evidence_store.emit(
             args.kind,
             args.payload,
             card=args.card,
             db_path=args.db,
+            before_commit=_write_summary_before_commit,
         )
+    except _StdoutUnwritable:
+        # 摘要打不出来：emit 已回滚，stderr 那行由 _write_stdout 自己打的
+        return 2
     except evidence_store.EvidenceReject as exc:
         _write_stderr_line(str(exc))
         return 1
     except (evidence_store.EvidenceStoreError, OSError, sqlite3.Error) as exc:
         _write_stderr_error(str(exc))
         return 2
-
-    if not _write_stdout(result.render() + "\n"):
-        return 2
     return 0
+
+
+def _write_summary_before_commit(summary: str) -> None:
+    """``evidence_store.emit`` 的 ``before_commit`` 回调：**提交前**把摘要写出去。
+
+    写失败 → :class:`_StdoutUnwritable`（``_write_stdout`` 已经打过 ``错误: …``），
+    emit 收到就回滚。``BrokenPipeError`` 不算失败（下游不要输出了，判定结果仍成立），
+    ``_write_stdout`` 对它返回 ``True``。
+    """
+
+    if not _write_stdout(summary):
+        raise _StdoutUnwritable
 
 
 def main(argv: list[str] | None = None) -> int:
