@@ -47,7 +47,10 @@ def headed(sha: str, kind: str, *, prefix: str = "") -> str:
 
 
 def fp(value: str | None = PID, *, kind: str = "patch") -> reviewhead.Fingerprint:
-    return reviewhead.Fingerprint(kind=kind, value=value, merge_base=MB, paths=())
+    return reviewhead.Fingerprint(
+        kind=kind, value=value, merge_base=MB, paths=(),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
 
 
 class _Resolver:
@@ -293,7 +296,8 @@ class TestJudge:
         def resolve_without_value(sha: str) -> reviewhead.Fingerprint | None:
             # 二进制 / 空 diff 的 Fingerprint.value 都是 None（patch-id 盲），旧 sha 算不出值
             return reviewhead.Fingerprint(
-                kind="binary", value=None, merge_base=MB, paths=()
+                kind="binary", value=None, merge_base=MB, paths=(),
+                algo=reviewhead.FINGERPRINT_ALGO,
             )
 
         (mark,) = reviewhead.judge(
