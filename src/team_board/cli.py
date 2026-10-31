@@ -249,7 +249,9 @@ def build_parser() -> argparse.ArgumentParser:
       错误），吃 ``--repo`` / ``--main-branch`` / ``--check-install``；不带
       ``--check-install`` 时从 stdin 读 pre-push 的 ref 行；
     - ``pr-claim-audit``：稽核 PR 认领唯一性（0 恰好一张卡认领 / 1 无人认领或重复
-      认领 / 2 参数或环境错误），吃 ``--pr``（必填）/ ``--db``；
+      认领 / 2 参数或环境错误），吃 ``--pr`` / ``--gaps``（二选一必填）/ ``--db``；
+      ``--gaps`` 才读 ``tasks.title``：「老库缺 ``title`` 列」只让 ``--gaps`` rc2，
+      ``--pr`` 照旧 rc0/rc1（它不选该列）；
     - ``pr-review-head-audit``：判双问结论是否绑定该 head sha（0 绑定成立 / 1 缺证据 /
       2 参数或环境错误），只吃 ``--pr`` / ``--head``，**只读**（只发 ``gh api``）；
     - ``evidence``：``evidence audit`` 判一张卡的四槽证据（0 四槽齐且绑该 head /
