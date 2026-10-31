@@ -358,15 +358,24 @@ class TestAnalyze:
 class TestRender:
     def test_full_report_lines(self) -> None:
         report = reviewhead.analyze(
-            fp(), [patched(PID, "defect"), patched(PID, "regression")]
+            fp(), [patched(PID, "defect"), patched(PID, "regression")], base="origin/main"
         )
         assert reviewhead.render(report).splitlines() == [
-            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]} mb={MB[:12]}",
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]}"
+            f" base=origin/main mb={MB[:12]}",
             "扫描正文 2 条；带标记行 2 条",
             f"  OK {PID[:12]} defect",
             f"  OK {PID[:12]} regression",
             f"结论: 内容指纹 {PID[:12]} 的 defect + regression 各 >=1 条 → 绑定成立",
         ]
+
+    def test_first_line_base_is_dash_without_repo_context(self) -> None:
+        """没有 base 上下文时首行仍然定型：``base=-``，不省略字段。"""
+
+        report = reviewhead.analyze(fp(), [patched(PID, "defect")])
+        assert reviewhead.render(report).splitlines()[0] == (
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]} base=- mb={MB[:12]}"
+        )
 
     def test_four_states_in_one_report(self) -> None:
         """四态混排：OK / LEGACY-OK / STALE / UNVERIFIABLE 各一条，只有前两个计入。"""
@@ -390,10 +399,12 @@ class TestRender:
             marks=marks,
             kinds_on_patch=kinds,
             missing=tuple(k for k in reviewhead.KINDS if k not in kinds),
+            base="main",
         )
         lines = reviewhead.render(report).splitlines()
         assert lines[0] == (
-            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]} mb={MB[:12]}"
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]}"
+            f" base=main mb={MB[:12]}"
         )
         assert lines[1] == "扫描正文 4 条；带标记行 4 条"
         assert f"  OK {PID[:12]} defect" in lines

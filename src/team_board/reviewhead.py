@@ -92,6 +92,16 @@ PR_SHAPE_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
 #: 13 位毫秒与天文数字属「填错了字段」）。单测锁住两边相等，防漂移。
 PR_MAX = 999_999_999
 
+#: ``--base`` 的默认值与回退：默认 ``origin/main``，解析不到就试本地 ``main``；
+#: 两者都解析不到 → ``PatchIdError``（rc2），不静默换 base。
+DEFAULT_BASE = "origin/main"
+
+#: 上一条的本地回退（CI 里没有 ``origin`` 远端时的常见形态）
+FALLBACK_BASE = "main"
+
+#: ``--remote`` 的默认值（只用于 ``git fetch --no-tags <remote> <sha>``）
+DEFAULT_REMOTE = "origin"
+
 #: 单次 ``gh api`` 的硬超时（秒）：一次卡住的 gh 不许把整张卡拖到 worker 超时
 GH_TIMEOUT_SECONDS = 120
 
@@ -103,6 +113,11 @@ CONCLUSION_BINARY = (
     "结论: 分支含二进制文件 {paths} → 内容指纹不覆盖二进制（patch-id 盲），按不可绑定处理"
 )
 CONCLUSION_EMPTY = "结论: 分支相对 {base} 无差异 → 无可绑定内容（不许当 PASS）"
+
+#: head 对象取不到（本地没有、按 sha fetch 也失败）：说的不是「重跑双问」而是「先取到对象」
+CONCLUSION_UNFETCHABLE = (
+    "结论: 取不到 {sha}，无法按内容绑定；先 git fetch 或在新 head 上重贴 REVIEW-PATCH"
+)
 
 #: 兼容形态（收到 head sha 而不是指纹）专用的旧文案：只给 E3 / E4 接线前的
 #: ``cli.py`` / ``merge_guard.py`` 调用点用，接线后随同兼容分支一起删除。
@@ -199,6 +214,54 @@ def check_pr(value: object) -> int:
             f"PR 号超出上限 {PR_MAX}：{value!r}（13 位毫秒与天文数字都不合法）"
         )
     return pr
+
+
+def check_repo(repo: object) -> str:
+    """``--repo`` 校验：必须是 git 能识别的目录（``git -C <repo> rev-parse --git-dir``）。
+
+    不是目录 / 不是工作树 → :class:`PatchIdError`（CLI 转 rc2）；PATH 里没有 git →
+    :class:`GitMissingError`（同样的 rc2），不许被当成「对象取不到」吞成 rc1。
+    """
+
+    path = str(repo) if isinstance(repo, (str, Path)) else ""
+    if not path.strip():
+        raise PatchIdError(f"--repo 非法：{repo!r}（应为 git 工作树的路径，默认 .）")
+    if not Path(path).is_dir():
+        raise PatchIdError(f"--repo 不是目录：{path}")
+    label = f"git -C {path} rev-parse --git-dir"
+    proc = _run_git(path, ("rev-parse", "--git-dir"), what=label)
+    if proc.returncode != 0:
+        raise PatchIdError(
+            f"--repo 不是 git 工作树：{path}（{label} 失败 rc={proc.returncode}: "
+            f"{_stderr_first(proc)}）"
+        )
+    return path
+
+
+def resolve_base(repo: str | Path, base: str | None = None) -> str:
+    """解析 base ref：默认 ``origin/main`` → 解析不到回退 ``main``；都解析不到 → rc2。
+
+    显式给了别的 ``--base`` 就**只认这一个**（不回退，免得把「写错了 base」静默成
+    「按 main 判」）；失败抛 :class:`PatchIdError`，消息以 ``找不到 base`` 开头。
+    """
+
+    text = "" if base is None else str(base)
+    candidates: tuple[str, ...] = (
+        (DEFAULT_BASE, FALLBACK_BASE) if text.strip() in ("", DEFAULT_BASE) else (text,)
+    )
+    for candidate in candidates:
+        proc = _run_git(
+            repo,
+            ("rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"),
+            what=f"git rev-parse {candidate}",
+        )
+        if proc.returncode == 0:
+            return candidate
+    raise PatchIdError(
+        "找不到 base："
+        + " / ".join(candidates)
+        + " 在该仓库里都解析不到（先 git fetch，或用 --base 指定已有 ref）"
+    )
 
 
 def parse_marks(bodies: Iterable[str]) -> tuple[Mark, ...]:
@@ -375,12 +438,24 @@ def analyze(
     )
 
 
+def unfetchable(head_sha: str, bodies: Sequence[str], *, base: str = "") -> Report:
+    """head 对象取不到（本地没有、按 sha fetch 也失败）时的报告：rc1 但不算「重跑双问」。
+
+    指纹无从计算 → 两类全缺、标记一律 ``UNVERIFIABLE``（与二进制 / 空 diff 同一档），
+    但结论行点名「取不到 <sha>」—— 这条的修法是先 ``git fetch`` 或在新 head 上重贴
+    ``REVIEW-PATCH``，不是去补双问。
+    """
+
+    fp = Fingerprint(kind="unfetchable", value=None, merge_base="", paths=())
+    return _unverifiable_report(fp, bodies, head=head_sha, base=base)
+
+
 def render(report: Report) -> str:
     """整块报告（指纹形态）。
 
-    首行 ``algo=<FINGERPRINT_ALGO> current=<前12> mb=<前12>``，第二行扫描条数，然后每条
-    ``<state> <pid12|head12> <kind>``，最后一行结论。``report.current`` 为 ``None`` 时是
-    兼容形态（按 sha 判），走旧渲染（旧调用点的输出保持逐字不变）。
+    首行 ``algo=<FINGERPRINT_ALGO> current=<前12> base=<base ref> mb=<前12>``，第二行
+    扫描条数，然后每条 ``<state> <pid12|head12> <kind>``，最后一行结论。``report.current``
+    为 ``None`` 时是兼容形态（按 sha 判），走旧渲染（旧调用点的输出保持逐字不变）。
     """
 
     if report.current is None:
@@ -389,13 +464,16 @@ def render(report: Report) -> str:
     current = report.current
     lines = [
         f"algo={FINGERPRINT_ALGO} current={current.value[:12] if current.value else '-'}"
-        f" mb={current.merge_base[:12]}",
+        f" base={report.base or '-'}"
+        f" mb={current.merge_base[:12] if current.merge_base else '-'}",
         f"扫描正文 {report.bodies_scanned} 条；带标记行 {len(report.marks)} 条",
     ]
     for mark in report.marks:
         lines.append(f"  {mark.state} {mark.short} {mark.kind}")
     short = (current.value or report.head or "")[:12]
-    if current.kind == "binary":
+    if current.kind == "unfetchable":
+        lines.append(CONCLUSION_UNFETCHABLE.format(sha=report.head or "-"))
+    elif current.kind == "binary":
         lines.append(CONCLUSION_BINARY.format(paths=",".join(current.paths)))
     elif current.kind == "empty":
         lines.append(CONCLUSION_EMPTY.format(base=report.base or "base"))
@@ -655,11 +733,10 @@ class GitMissingError(PatchIdError):
 class Fingerprint:
     """一段分支内容的指纹。
 
-    ``kind`` ∈ ``{"patch", "binary", "empty"}``；``value`` 只在 ``kind=="patch"``
-    时有值（40 hex），其余为 ``None``；``merge_base`` 是 ``merge-base`` 的 40 hex
-    （报告行要打印它做复核）；``paths`` 是 numstat 里出现过的路径（二进制时点名用；
-    rename 已拆成 delete + add，非 ASCII 名给真名字）；``algo`` 是算出 ``value`` 的
-    算法标识（:data:`FINGERPRINT_ALGO` 或 :data:`FINGERPRINT_ALGO_VERBATIM`）。
+    ``kind`` ∈ ``{"patch", "binary", "empty", "unfetchable"}``；``value`` 只在
+    ``kind=="patch"`` 时有值（40 hex），其余为 ``None``；``merge_base`` 是 ``merge-base``
+    的 40 hex（报告行要打印它做复核；``unfetchable`` 时为空串）；``paths`` 是 numstat
+    里出现过的路径（二进制时点名用）。
 
     **盲区（消费方必须看）**：``algo == FINGERPRINT_ALGO`` 时「同指纹 ≠ 内容相同
     （空白类改动看不见）」—— 只有本 PR 已改过的那一行改缩进才会同指纹，但也足以让

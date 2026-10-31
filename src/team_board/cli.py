@@ -68,13 +68,17 @@
   表示不了中文 → stderr 一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--repo``
   不存在或不是工作树、``--main-branch`` 为空或该分支不存在、stdin 每行字段数 ≠ 4、
   stdin 为空）
-``pr-review-head-audit`` 子命令（只读，判「双问结论是否绑定某条 head sha」）：
-- 0：该 head 上 ``defect`` 与 ``regression`` 各 ≥1 条标记载荷
-- 1：缺一类 / 两类都缺 / 只有别的 sha 的标记（head 变了没重跑双问）
-- 2：参数或环境错误（``reviewhead.ReviewHeadError`` → stderr 恰一行 ``错误: …``、
-  stdout 空、不冒 traceback；含 ``--head`` 不是 40/64 位小写十六进制、``--pr`` 不是
-  1-``MAX_MERGE_PR`` 的 ASCII 十进制正整数、``gh api`` 非 0 / 超时 / PATH 里没有
-  ``gh`` / 输出不是 UTF-8 或不是对象数组）
+``pr-review-head-audit`` 子命令（只读，判「双问结论是否绑定某份**内容**」）：
+- 0：该 head 的内容指纹上 ``defect`` 与 ``regression`` 各 ≥1 条标记载荷
+- 1：缺一类 / 两类都缺 / 只有别的内容的标记（内容变了没重跑双问）/ 指纹算不出
+  （head 对象取不到，含按 sha ``git fetch`` 失败 —— 结论行点名「取不到 <sha>」）
+- 2：参数或环境错误（``reviewhead.ReviewHeadError`` / ``reviewhead.PatchIdError`` →
+  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--head`` 不是 40/64 位
+  小写十六进制、``--pr`` 不是 1-``MAX_MERGE_PR`` 的 ASCII 十进制正整数、``--repo``
+  不是 git 工作树、``--base`` 解析不到、PATH 里没有 git / 超时、``gh api`` 非 0 /
+  超时 / PATH 里没有 ``gh`` / 输出不是 UTF-8 或不是对象数组）
+- ``--repo`` 默认 ``.``；``--base`` 默认 ``origin/main``（解析不到回退 ``main``）；
+  ``--remote`` 默认 ``origin``（只用于按 sha 取历史对象）
 
 ``pr-claim-audit`` 子命令（只读，看「PR 认领唯一性」，R17 的机器闸门）：
 - 0：未结卡里**恰好一张**卡在正文顶格写了 ``PR-CLAIM: #<该 PR>``
@@ -692,7 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     head_cmd = subparsers.add_parser(
         "pr-review-head-audit",
         help=(
-            "判定双问结论是否绑定该 head sha（0 绑定成立 / 1 缺证据或 head 变过 / "
+            "判定双问结论是否绑定该 head 的**内容指纹**（0 绑定成立 / 1 缺证据或内容变过 / "
             "2 参数或环境错误）"
         ),
     )
@@ -708,7 +712,36 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         default=None,
         metavar="SHA",
-        help="要绑定的 head sha（40 或 64 位小写十六进制；41-63 位一律 rc2）",
+        help=(
+            "要绑定的 head 提交（40 或 64 位小写十六进制；判的是它的**内容指纹**，"
+            "41-63 位一律 rc2）"
+        ),
+    )
+    head_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help=(
+            "git 工作树路径（默认 .；git -C <repo> rev-parse --git-dir 失败 → rc2）"
+        ),
+    )
+    head_cmd.add_argument(
+        "--base",
+        default=reviewhead.DEFAULT_BASE,
+        metavar="REF",
+        help=(
+            f"内容比较的 base ref（默认 {reviewhead.DEFAULT_BASE}；解析不到回退 "
+            f"{reviewhead.FALLBACK_BASE}，都解析不到 → rc2）"
+        ),
+    )
+    head_cmd.add_argument(
+        "--remote",
+        default=reviewhead.DEFAULT_REMOTE,
+        metavar="NAME",
+        help=(
+            f"按 sha 取历史对象时用的远端（默认 {reviewhead.DEFAULT_REMOTE}；"
+            "本地没有该对象才会 fetch）"
+        ),
     )
 
     evidence_cmd = subparsers.add_parser(
@@ -1708,23 +1741,41 @@ def _run_push_guard(args: argparse.Namespace) -> int:
         return 2
     return 0
 def _run_pr_review_head_audit(args: argparse.Namespace) -> int:
-    """``pr-review-head-audit`` 子命令：``ReviewHeadError`` → stderr 一行 ``错误: …`` + rc2。
+    """``pr-review-head-audit`` 子命令：按**内容指纹**判，rc 0/1/2。
 
-    取数（两次 ``gh api --paginate``）与判定都在拼报告之前完成，所以 rc2 时 stdout
-    **一个字节都不写**（stderr 恰一行、不冒 traceback）；rc1 只在取数成功、证据不齐
-    时出现。本子命令**只读**：两条 ``gh api GET`` + 一次 ``--head``/``--pr`` 形态校验，
-    不发任何写请求。
+    流程固定：``check_pr`` → ``check_head`` → ``check_repo`` → ``resolve_base`` →
+    ``fingerprint_of_commit`` → ``fetch_bodies`` → ``analyze`` / ``unfetchable`` →
+    ``render``；rc = 0 if ``report.ok`` else 1。
+
+    取数（git + 两次 ``gh api --paginate``）与判定都在拼报告之前完成，所以 rc2 时 stdout
+    **一个字节都不写**（stderr 恰一行、不冒 traceback）。指纹算不出（head 对象取不到，
+    含按 sha fetch 失败）不是环境错误而是证据缺失 → rc1，结论行点名「取不到 <sha>」。
+    本子命令**只读**：git 只跑 ``rev-parse`` / ``merge-base`` / ``cat-file`` / ``diff`` /
+    ``patch-id``（对象不在本地才 ``fetch``），gh 只发两条 GET。
     """
 
     try:
-        head = reviewhead.check_head(args.head)
         pr = reviewhead.check_pr(args.pr)
+        head = reviewhead.check_head(args.head)
+        repo = reviewhead.check_repo(args.repo)
+        base = reviewhead.resolve_base(repo, args.base)
+        fingerprint = reviewhead.fingerprint_of_commit(repo, base, head, args.remote)
+    except (reviewhead.ReviewHeadError, reviewhead.PatchIdError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    try:
         bodies = reviewhead.fetch_bodies(pr)
     except reviewhead.ReviewHeadError as exc:
         _write_stderr_error(str(exc))
         return 2
 
-    report = reviewhead.analyze(head, bodies)
+    if fingerprint is None:
+        report = reviewhead.unfetchable(head, bodies, base=base)
+    else:
+        report = reviewhead.analyze(
+            fingerprint, bodies, repo=repo, base=base, remote=args.remote
+        )
     if not _write_stdout(reviewhead.render(report) + "\n"):
         return 2
     return 0 if report.ok else 1
