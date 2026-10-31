@@ -9,10 +9,21 @@
 
 ## 1. 为什么
 
-返工归因（R14）把每次打回标成 `spec` / `impl` / `env` 三类。实测（2026-10-31，板上
-`changes_requested` 事件的归因分布）：**spec 7 条 / impl 4 条**，另有 4 条历史事件未标因
-（`UNTAGGED`，按 R14 不参与统计）。也就是说，**每 11 条已归因返工里有 7 条是卡面写错**
-（判据自相矛盾、卡内数字与 fixture 冲突、验收标准漏写），不是实现走样。
+返工归因（R14）把每次打回标成 `spec` / `impl` / `env` 三类。实测（2026-10-31 复核截面，
+板上 `changes_requested` 事件的归因分布）：**spec 7 条 / impl 4 条**，另有**若干**历史事件
+未标因（`UNTAGGED`，按 R14 不参与统计）。也就是说，那一截面里 **7/11 的已归因返工是卡面
+写错**（判据自相矛盾、卡内数字与 fixture 冲突、验收标准漏写），不是实现走样。
+
+上述计数是**截面值，随板增长**（板上每多一次打回就变），引用前先自查 —— R14 ⑤ 的唯一校验
+命令，输出第一段即分因占比；另有 `UNTAGGED` 若干条单列，不折进 `spec` / `impl`：
+
+```
+$ sqlite3 -header -column ~/.hermes/kanban/boards/devteam/kanban.db \
+    < ~/.hermes/profiles/ops/workspace/rework_audit.sql
+```
+
+等价读法：取 `task_events` 里 `kind='changes_requested'` 的行，`payload.reason` 首行的
+`REWORK-CAUSE:` 值即归因；无此行的记 `UNTAGGED`。
 
 结论：问题不在验收轮次太少，而在**验收标准出场太晚**——派卡时只有一句「完成目标」，跑完
 才第一次把判据说清，返工必然跑在实现者头上。修法是把验收标准前置：**派卡前写清判据，
