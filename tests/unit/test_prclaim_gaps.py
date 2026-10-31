@@ -217,6 +217,24 @@ class TestRenderGaps:
         assert prclaim.visible("\x00\x7f") == "\\x00\\x7f"
 
 
+    def test_unicode_line_boundaries_do_not_split_the_gap_line(self) -> None:
+        """NEL(U+0085) / U+2028 / U+2029 也是 splitlines() 的行边界，必须一并转义。
+
+        只转 ``\\t`` / ``\\r`` / ``<0x20`` / ``0x7f`` 时，标题里带这三个字符（``\\s*``
+        会把它们吃进 ``hit``）仍会让 ``render_gaps(...).splitlines()`` 变成 4 行。
+        """
+        for code in (0x0085, 0x2028, 0x2029):
+            sep = chr(code)
+            rows = [("t_sep", "running", "engineer", f"合并{sep}PR #5 的收尾", "目标：…")]
+            report = prclaim.audit_gaps(rows)
+            assert report.gaps[0].hit == f"合并{sep}PR #5"  # 判定侧保留原文
+            text = prclaim.render_gaps(report)
+            lines = text.splitlines()
+            assert len(lines) == 3
+            assert f"合并\\u{code:04x}PR #5" in lines[1]
+            assert sep not in text
+
+
 class TestKernelDifferencePin:
     """钉住「缺口稽核」与本仓 :data:`prclaim.CLAIM_RE` 之间刻意保留的差异集。
 

@@ -317,11 +317,16 @@ def exit_code_gaps(report: GapReport) -> int:
 
 
 def visible(text: str) -> str:
-    """把控制字符换成可见转义，供报告里显示。
+    """把控制字符与 Unicode 行分隔符换成可见转义，供报告里显示。
 
     正文首行可能带 ``\\r``（CRLF 卡）或 ``\\t``：原样打进终端时 ``\\r`` 会把光标
     拉回行首、污染整行报告。只动**渲染**，不动判定（:func:`audit_gaps` 的
     ``GapRow.first`` 仍是原文的前 :data:`FIRST_LINE_LIMIT` 个字符）。
+
+    除 ``\\t`` / ``\\r`` / ``<0x20`` / ``0x7f`` 外，还转义 ``str.splitlines()`` 认定的
+    三个 Unicode 行边界：NEL（U+0085）、LINE SEPARATOR（U+2028）、PARAGRAPH
+    SEPARATOR（U+2029）。少转这三个，一条 GAP 照样会被撑成两条物理行；转义后的
+    文本里因此不存在任何 ``splitlines()`` 边界。
     """
     out: list[str] = []
     for ch in text:
@@ -331,6 +336,8 @@ def visible(text: str) -> str:
             out.append("\\r")
         elif ord(ch) < 0x20 or ord(ch) == 0x7F:
             out.append(f"\\x{ord(ch):02x}")
+        elif ch in "\u0085\u2028\u2029":
+            out.append(f"\\u{ord(ch):04x}")
         else:
             out.append(ch)
     return "".join(out)
@@ -344,6 +351,9 @@ def render_gaps(report: GapReport) -> str:
     **五列全部**经 :func:`visible` 转义控制字符后显示（判定不受影响）：
     ``hit`` 来自标题，标题里的换行（``合并\\nPR #5`` 会被 ``\\s*`` 吃掉）与
     ``status`` / ``assignee`` 里的控制字符同样不能让一条 GAP 变成两条物理行。
+    ``visible`` 连 NEL / U+2028 / U+2029 这三个 Unicode 行边界一起转义，转义后的
+    报告里不存在任何 ``str.splitlines()`` 边界，``render_gaps(...).splitlines()``
+    的行数恒为 ``2 + len(report.gaps)``。
     """
     lines = [f"未结卡 {report.pending} 张"]
     lines.extend(
