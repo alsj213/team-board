@@ -85,6 +85,20 @@
   空串 / 非 ASCII 数字，``--db`` 不存在、不是合法 SQLite、打不开、读 ``tasks``
   失败、stdout 编码表示不了中文）
 
+``merge-owner-audit`` 子命令（只读 + 逐个 PR 一次 ``gh pr view``；R8「卡上有 PR 号就有主」的机器闸门）：
+- 0：卡上 PR 全部有归属（``MERGED`` / ``CLOSED`` / 另一张未结卡顶格 ``PR-CLAIM`` /
+  正文或评论顶格 ``PR-MERGE-EXEMPT``）或压根没有 PR 号；gh 取不到状态时**降级放行**
+  （stderr 一行 ``warn: …``，日志 ``<log-dir>/merge-owner-audit-<卡号>.log``）
+- 1：有任一 ``UNOWNED``（即使同时有 ``WARN`` —— 降级不许盖掉真问题）
+- 2：参数或环境错误（``mergeowner.MergeOwnerError`` / ``db.BoardError`` /
+  ``OSError`` / ``sqlite3.Error`` → stderr 恰一行 ``错误: …``、stdout 空、不冒
+  traceback；含卡号形态非法、``--repo`` 不是 ``OWNER/REPO``、``--timeout`` 不是
+  1-600 的 ASCII 十进制整数、``--db`` 不存在 / 不是合法 SQLite / 读失败、卡不存在、
+  stdout 编码表示不了中文）
+- 取数：正文 + **全部评论**（:func:`team_board.db.load_card_text`），认领行复用
+  :func:`team_board.db.iter_claim_rows`；五类判定与渲染全部来自
+  :mod:`team_board.mergeowner`（本子命令不复制第二份判定）
+
 ``merge-record`` 子命令（合并**前**那一半）：
 - 0：生成模式输出成功，或 ``--check-file`` 预检通过
 - 1：``--check-file`` 预检发现认账问题（每处一行 ``问题: <kind>：<detail>``）
@@ -125,6 +139,7 @@ argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=valu
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -132,7 +147,7 @@ import sqlite3
 import subprocess  # nosec B404 - gate 子命令要跑外部检查器，这是本工具的用途
 import sys
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from . import (
@@ -144,6 +159,7 @@ from . import (
     db,
     evidence,
     gatelog,
+    mergeowner,
     merges,
     outputaudit,
     prclaim,
@@ -171,6 +187,14 @@ _PORT_DIGITS = re.compile(r"[0-9]+", re.ASCII)
 #: 13 位毫秒（``1793160000000``）与天文数字（``99999999999999999999``）都属
 #: 「填错了字段」，一律 rc2 而不是收下。
 MAX_MERGE_PR = prclaim.MAX_PR
+
+
+#: ``merge-owner-audit --repo`` 的默认仓库（与 :data:`team_board.reviewhead.REPO`
+#: 同值：本仓的 gh 调用一律指定这个 OWNER/REPO，不吃 ``gh`` 的隐式仓库推断）
+MERGE_OWNER_REPO = "alsj213/team-board"
+
+#: ``merge-owner-audit`` 降级日志的文件名：``<log-dir>/merge-owner-audit-<卡号>.log``
+MERGE_OWNER_LOG_PREFIX = "merge-owner-audit-"
 
 
 def _parse_date(value: str) -> date:
@@ -228,7 +252,10 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十六个**子命令。
+    """建 CLI 前端：prog=team-board，共**十七个**子命令（个数以
+    ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
+    不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
+    与 README 的「共十七个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -261,6 +288,9 @@ def build_parser() -> argparse.ArgumentParser:
     - ``evidence``：``evidence audit`` 判一张卡的四槽证据（0 四槽齐且绑该 head /
       1 判定不通过 / 2 参数或环境错误），吃 ``--card`` / ``--head`` / ``--pr`` /
       ``--db``，**只读**（``mode=ro`` 一条 SELECT）；
+    - ``merge-owner-audit``：稽核卡上 PR 的合并归属（0 有归属或无 PR / 1 有无归属 PR /
+      2 参数或环境错误），吃位置参数 ``card`` / ``--db`` / ``--repo`` / ``--timeout`` /
+      ``--log-dir``，**只读**（发 ``gh pr view``，降级只写日志）；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -692,6 +722,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB,
         metavar="PATH",
         help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+
+    owner_cmd = subparsers.add_parser(
+        "merge-owner-audit",
+        help=(
+            "稽核卡上 PR 的合并归属（0 有归属或无 PR / 1 有无归属 PR / 2 参数或环境错误）"
+        ),
+    )
+    owner_cmd.add_argument(
+        "card",
+        metavar="CARD",
+        help="要稽核的卡号（t_ 加 8 位小写十六进制，例如 t_0123abcd）",
+    )
+    owner_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    owner_cmd.add_argument(
+        "--repo",
+        default=MERGE_OWNER_REPO,
+        metavar="OWNER/REPO",
+        help=f"gh 查 PR 用的仓库（默认 {MERGE_OWNER_REPO}）",
+    )
+    owner_cmd.add_argument(
+        "--timeout",
+        default=str(mergeowner.TIMEOUT_DEFAULT),
+        metavar="N",
+        help=(
+            f"单次 gh 调用的超时秒数"
+            f"（{mergeowner.TIMEOUT_MIN}-{mergeowner.TIMEOUT_MAX}，"
+            f"默认 {mergeowner.TIMEOUT_DEFAULT}；不挂 type=int，越界一律 rc2）"
+        ),
+    )
+    owner_cmd.add_argument(
+        "--log-dir",
+        default="evidence",
+        metavar="DIR",
+        help="降级日志目录（默认 evidence，不存在自动建）",
     )
 
     serve = subparsers.add_parser(
@@ -1599,7 +1669,7 @@ def _run_evidence_audit(args: argparse.Namespace) -> int:
     card = args.card
     if evidence.CARD_RE.fullmatch(card) is None:
         _write_stderr_error(
-            f"--card 非法：{card!r}（应为 t_<8 位小写十六进制>，例 t_2ad370ff）"
+            f"--card 非法：{card!r}（应为 t_<8 位小写十六进制，例 t_2ad370ff）"
         )
         return 2
     head = args.head
@@ -1640,6 +1710,156 @@ def _run_evidence_audit(args: argparse.Namespace) -> int:
     return 0 if judgment.ok else 1
 
 
+def _gh_pr_state(pr: int, repo: str, timeout: int) -> tuple[str | None, str]:
+    """跑一次 ``gh pr view <pr> --repo <repo> --json state,mergedAt``。
+
+    返回 ``(state, reason)``：成功是 ``(压好的状态, "")``，失败是 ``(None, 一句话原因)``。
+    ``reason`` 只有四个定值 —— ``gh 超时 <n>s`` / ``gh 不在 PATH`` / ``gh rc=<n>`` /
+    ``gh 输出非 JSON``：gh 自己的 stderr 原文**不许**流进 reason（一条 4KB 的
+    GraphQL 报错会把报告、降级日志与 output-audit 全顶碎，契约 v2 增量 3）。
+
+    ``OSError`` 里除 ``FileNotFoundError`` 之外（权限、ENOEXEC）同样是「gh 起不来」，
+    四个定值里只有「gh 不在 PATH」表达这个意思，归一到这里。
+    判定方向（取数失败 = ``WARN`` = 降级）不在这里，全在 :mod:`team_board.mergeowner`。
+    """
+
+    argv = ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,mergedAt"]
+    try:
+        # bandit B603/B607 假阳性：可执行文件名写死（"gh"，走 PATH），参数以 argv
+        # 列表传入、shell=False；repo 已由 mergeowner.parse_repo 校验成 OWNER/REPO
+        proc = subprocess.run(  # nosec B603 B607
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"gh 超时 {timeout}s"
+    except FileNotFoundError:
+        return None, "gh 不在 PATH"
+    except OSError:
+        return None, "gh 不在 PATH"
+    except (UnicodeDecodeError, ValueError):
+        return None, "gh 输出非 JSON"
+
+    if proc.returncode != 0:
+        return None, f"gh rc={proc.returncode}"
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, "gh 输出非 JSON"
+    state = payload.get("state") if isinstance(payload, dict) else None
+    if not isinstance(state, str):
+        return None, "gh 输出非 JSON"
+    return state, ""
+
+
+def _body_outside_fences(body: str | None) -> str:
+    """去掉正文里 ``` 围栏包住的整段，只留围栏外的行。
+
+    豁免面是「本卡**正文**的顶格一行」：评论里的示例不算（P2-a），正文里贴进
+    代码围栏的示例也不算 —— 围栏是引用写法，不是本卡声明。围栏不配对时按「从
+    第一个 ``` 起到文末都在围栏内」处理（宁严不宽）。剥完只用于
+    :func:`mergeowner.exempt_prs`；PR 号提取（``extract_prs``）仍吃全文。
+    """
+
+    if not body:
+        return ""
+    kept: list[str] = []
+    in_fence = False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def _append_degrade_log(
+    log_dir: str, card: str, warns: tuple[mergeowner.Verdict, ...]
+) -> str | None:
+    """把每条 ``WARN`` 追加一行到 ``<log-dir>/merge-owner-audit-<卡号>.log``。
+
+    行格式固定 ``<UTC ISO8601（秒精度）> warn pr=<n> <reason>``。
+    ``log-dir`` 不存在就建（``parents=True``）。成功返回 ``None``；写不进去返回
+    一行失败原因（调用点折成 stderr 那一行 ``错误: …`` + rc2）—— **不许**在日志
+    根本没写成时还让 stdout 说「（日志已写）」（P2-c）。
+    """
+
+    path = Path(log_dir) / f"{MERGE_OWNER_LOG_PREFIX}{card}.log"
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            for verdict in warns:
+                handle.write(f"{stamp} warn pr={verdict.pr} {verdict.detail}\n")
+    except OSError as exc:
+        return f"日志写入失败: {exc}"
+    return None
+
+
+def _run_merge_owner_audit(args: argparse.Namespace) -> int:
+    """``merge-owner-audit`` 子命令：有 ``UNOWNED`` → rc1，参数/库错 → rc2，否则 rc0。
+
+    顺序固定：先校验三个参数（rc2 时 gh 一次都不发、stdout 一个字节都不写）→ 读库
+    （正文 + 全部评论 + 认领行）→ 逐个 PR 跑一次 gh → 判定 → 降级日志 → stderr
+    ``warn:`` → 渲染。判定与文案全部来自 :mod:`team_board.mergeowner`，本函数只做
+    接线（取数、gh、降级留痕），不复制第二份判定。降级**只针对 gh**：``--db``
+    打不开 / 卡不存在仍是 rc2。
+    """
+
+    try:
+        card = mergeowner.parse_card(args.card)
+        repo = mergeowner.parse_repo(args.repo)
+        timeout = mergeowner.parse_timeout(args.timeout)
+    except mergeowner.MergeOwnerError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        status, body, comments = db.load_card_text(conn, card)
+        others = db.iter_claim_rows(conn)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    prs = mergeowner.extract_prs(body, *comments)
+    # 豁免面是「**本卡正文**的顶格一行」：评论里的示例不算（契约 v3 增量），
+    # 正文里代码围栏内的示例也不算（围栏只是引用写法，不是声明）
+    exempt = mergeowner.exempt_prs(_body_outside_fences(body))
+    gh: dict[int, mergeowner.GhResult] = {}
+    for pr in prs:
+        state, reason = _gh_pr_state(pr, repo, timeout)
+        gh[pr] = mergeowner.GhResult(status=state or "", error=reason)
+
+    report = mergeowner.judge(card, status, prs, exempt=exempt, gh=gh, others=others)
+
+    # 三条动作的顺序是契约的一部分（P2-b / P2-c）：
+    # ① 先落降级日志 —— 写不成就 rc2（stderr 恰一行 ``错误: …``、stdout 0 字节），
+    #    绝不让 stdout 说一句「（日志已写）」的假话；
+    # ② 再写 stdout —— 编码写不出去仍是 rc2，**此时一句 warn 都不许提前打**，
+    #    否则 rc2 的 stderr 会变成两行；
+    # ③ 最后才打 stderr 的降级 warn。
+    if report.warns:
+        log_error = _append_degrade_log(args.log_dir, card, report.warns)
+        if log_error is not None:
+            _write_stderr_error(log_error)
+            return 2
+
+    if not _write_stdout(mergeowner.render(report) + "\n"):
+        return 2
+
+    if report.warns and not report.unowned:
+        # 有 UNOWNED 时不是「降级放行」（rc 已是 1），只留日志，不打这句误导性的 warn
+        _write_stderr_line(
+            f"warn: gh 不可用（{report.warns[0].detail}）→ 降级放行，晨报须列"
+        )
+    return mergeowner.exit_code(report)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1673,6 +1893,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "evidence":
         return _run_evidence_audit(args)
+
+    if args.command == "merge-owner-audit":
+        return _run_merge_owner_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)
