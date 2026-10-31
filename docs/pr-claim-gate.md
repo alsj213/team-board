@@ -156,6 +156,11 @@ GAP <id> [<status>] <assignee> 触发=<hit> 首行=<first>
 `splitlines()` 边界（列间分隔用的 `\n` 除外），故 `render_gaps(...).splitlines()`
 的行数恒为 `2 + GAP 张数`。
 
+`--pr` 模式的 `CLAIM` / `REF` 行同理：卡号 / 状态 / assignee 三列（以及末行结论里的
+卡号）都走同一个 `visible()`，`assignee` 带 `\n` / `\u0085` NEL / `\u2028` / `\u2029`
+时也是可见转义、不会多出物理行 —— `render(...).splitlines()` 的行数恒为
+`2 + CLAIM 张数 + REF 张数`，判定侧仍用原文。
+
 ## 5. 与内核建卡闸门（卡 `t_c6ab9672`）的关系
 
 - 内核那份在 `hermes_cli/kanban_db.py`：`_PR_CLAIM_TRIGGER_RE` / `_PR_CLAIM_LINE_RE` /

@@ -237,14 +237,27 @@ def render(report: Report) -> str:
 
     四段、顺序固定：``未结卡 N 张`` → 逐张 ``CLAIM <卡号> [status] assignee`` →
     逐张 ``REF <卡号> [status] assignee`` → 末行结论。
+
+    一条卡一行的**每一列**（卡号 / 状态 / assignee，末行的卡号同样）都经
+    :func:`visible` 转义：``assignee`` / ``status`` 里带 ``\\n`` 会把一条 CLAIM 撑成
+    两条物理行（``splitlines()`` 数出来比卡数多），``\\r`` 会把光标拉回行首 —— 与
+    :func:`render_gaps` 同口径，转义只动渲染，判定（:func:`audit`）仍用原文。
+
+    :func:`visible` 连 ``str.splitlines()`` 认的三个 Unicode 行边界（U+0085 NEL /
+    U+2028 / U+2029）一起转义，所以 ``render(...).splitlines()`` 的行数恒为
+    ``2 + CLAIM 张数 + REF 张数``（表头 + 末行结论，加每条卡一行）。
     """
     lines = [f"未结卡 {report.pending} 张"]
     lines.extend(
-        f"CLAIM {row.id} [{row.status}] {row.assignee}" for row in report.claims
+        f"CLAIM {visible(row.id)} [{visible(row.status)}] {visible(row.assignee)}"
+        for row in report.claims
     )
-    lines.extend(f"REF {row.id} [{row.status}] {row.assignee}" for row in report.refs)
+    lines.extend(
+        f"REF {visible(row.id)} [{visible(row.status)}] {visible(row.assignee)}"
+        for row in report.refs
+    )
     if report.ok:
-        lines.append(VERDICT_UNIQUE.format(card=report.claims[0].id))
+        lines.append(VERDICT_UNIQUE.format(card=visible(report.claims[0].id)))
     elif not report.claims:
         lines.append(VERDICT_NONE)
     else:
