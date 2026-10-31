@@ -276,9 +276,10 @@ def fetch_bodies(pr: int) -> tuple[str, ...]:
 #   带出 ``FINGERPRINT_LEGACY_CAVEAT``。``git patch-id --verbatim`` 可用时（探针
 #   :func:`patch_id_supports_verbatim`，判据是 rc 不是版本号）走空白敏感档
 #   ``algo="patch-id-U0-verbatim-v1"``。
-# - **git 配置**：两次 diff 都钉 :data:`DIFF_CONFIG_PIN` + ``--no-renames``，
-#   ``patch-id`` 钉 ``patchid.verbatim``，所以 ``diff.renames`` / ``core.quotePath`` /
-#   ``color.ui`` 这些仓库配置都不许改变指纹或 ``paths`` 的字面（非 ASCII 名给真名字）。
+# - **git 配置**：两次 diff 都钉 :data:`DIFF_CONFIG_PIN` + :data:`DIFF_PREFIX_PIN` +
+#   ``--no-renames``，``patch-id`` 钉 ``patchid.verbatim``，所以 ``diff.renames`` /
+#   ``core.quotePath`` / ``color.ui`` / ``diff.noprefix`` / ``diff.mnemonicPrefix`` 这些
+#   仓库配置都不许改变指纹或 ``paths`` 的字面（非 ASCII 名给真名字）。
 
 #: 指纹算法标识（报告行必须引用它；换算法 = 换这个字符串）
 FINGERPRINT_ALGO = "patch-id-U0-v1"
@@ -312,11 +313,20 @@ DIFF_CONFIG_PIN = (
     "core.quotePath=false",
 )
 
+#: 两次 diff 都钉死的前缀形态：``diff.noprefix`` / ``diff.mnemonicPrefix``（个人机器上很常见）
+#: 会把 ``diff --git a/x b/x`` 改成 ``diff --git x x`` / ``i/x w/x``，patch-id 随之换值 →
+#: 同一内容被判 STALE。``-c diff.noprefix=false`` 也能压住 ``diff.noprefix``，但压不住
+#: ``diff.mnemonicPrefix``；显式给前缀是两个一起钉，且与「默认值」逐字相同。
+#: ``--no-renames``（在调用处显式给）与 :data:`DIFF_CONFIG_PIN` 一起把改名这一维也钉死。
+DIFF_PREFIX_PIN = ("--src-prefix=a/", "--dst-prefix=b/")
+
 #: 单次 git 调用的硬超时（秒）：一次卡住的 git 不许把整张卡拖到 worker 超时
 GIT_TIMEOUT_SECONDS = 120
 
-#: patch-id 的形态：40 位小写十六进制
-PATCH_ID_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+#: patch-id 的形态：40 或 64 位小写十六进制（宽度跟仓库哈希算法走：``git init
+#: --object-format=sha256`` 的仓里 ``git patch-id`` 输出 64 位）。与 :data:`COMMIT_SHA_RE`
+#: 同口径 —— 40/64 只在一处放宽就是新的不对称。
+PATCH_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
 
 #: 二进制文件在 ``git diff --numstat`` 里的行首（``-\t-\t<path>``）
 NUMSTAT_BINARY_PREFIX = "-\t-\t"
@@ -342,14 +352,26 @@ GIT_ENV_STRIP_EXACT = frozenset(
         "GIT_COMMON_DIR",
         "GIT_EXTERNAL_DIFF",
         "GIT_CONFIG_COUNT",
+        # ``git -c k=v`` 及其子进程实际走的环境变量（``GIT_CONFIG_COUNT`` 那组的另一种写法）：
+        # 不摘就等于「调用方（含 pre-push hook 里的 ``git -c``）能注进被测子进程」，
+        # 同一份内容换指纹。
+        "GIT_CONFIG_PARAMETERS",
     }
 )
 
 #: 同上，按前缀摘：``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 成对注入 git 配置
 GIT_ENV_STRIP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 
-#: 「按提交 sha 算指纹」时 sha 的形态：40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径）
-COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+#: 「按提交 sha 算指纹」时 sha 的形态：**40 或 64 位小写十六进制**。与 :data:`HEAD_RE` /
+#: :data:`HEAD_SHAPE_RE`（``REVIEW-HEAD`` 标记）同口径 —— sha256 仓的 ``headRefOid`` 就是
+#: 64 位，只收 40 位会让整层永远 rc2。
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
+
+#: 「看着像 sha」的 rev：40 / 64 位 ASCII 十六进制（**大小写都算像**）。只用来决定要不要对
+#: :func:`fingerprint` 的 head 施加 sha 形态校验 —— 分支名（``feat`` / ``origin/main``）
+#: 不匹配它，正常调用面不受影响；而「40 或 64 位十六进制」这种一定是 sha 的写法，必须与
+#: :func:`fingerprint_of_commit` 得到同一个结论。
+SHA_LIKE_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", re.ASCII)
 
 
 class PatchIdError(Exception):
@@ -397,8 +419,14 @@ def _git_env() -> dict[str, str]:
     摘掉的键见 :data:`GIT_ENV_STRIP_EXACT` / :data:`GIT_ENV_STRIP_PREFIXES`；其余原样
     保留 —— SSH（``GIT_SSH*`` / ``SSH_AUTH_SOCK`` / ``GIT_ASKPASS``）与代理
     （``HTTPS_PROXY`` / ``https_proxy`` 等）凭据变量必须留着，否则 ``fetch`` 会被误判成
-    环境故障。摘 ``GIT_CONFIG_COUNT`` 那组是因为它们能把 ``color.ui=always`` 之类配置
-    注进子进程，破坏「同一份内容 ⇒ 同一指纹」。
+    环境故障。摘 ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_PARAMETERS`` 那两组是因为它们能把
+    ``color.ui=always`` / ``diff.noprefix=true`` 之类配置注进子进程，破坏「同一份内容 ⇒
+    同一指纹」。
+
+    ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` **有意保留**（有些机器靠它注入
+    ``safe.directory`` / ``url.*.insteadOf``，摘掉会让 fetch 静默变成「取不到」）。
+    它们能改的那几维由 :data:`DIFF_CONFIG_PIN` / :data:`DIFF_PREFIX_PIN` 在命令行上钉死
+    —— 环境留着，输出形态不跟着变。
     """
 
     env = dict(os.environ)
@@ -425,11 +453,32 @@ def _check_rev(value: object, what: str) -> str:
 
 
 def _check_commit_sha(value: object) -> str:
-    """提交 sha 形态：40 位小写十六进制，否则 :class:`PatchIdError`。"""
+    """提交 sha 形态：**40 或 64 位小写十六进制**，否则 :class:`PatchIdError`。
+
+    宽度跟仓库的哈希算法走（sha256 仓的 ``headRefOid`` 是 64 位），与 :data:`HEAD_RE` /
+    :data:`HEAD_SHAPE_RE` 对齐；大写一律拒（同一个 sha 的两种写法不该在指纹层得到两种身份）。
+    """
 
     if not isinstance(value, str) or COMMIT_SHA_RE.fullmatch(value) is None:
-        raise PatchIdError(f"提交 sha 非法：{value!r}（应为 40 位小写十六进制）")
+        raise PatchIdError(
+            f"提交 sha 非法：{value!r}（应为 40 或 64 位小写十六进制）"
+        )
     return value
+
+
+def _check_head_rev(value: object, what: str) -> str:
+    """``fingerprint`` 的 head rev 形态：先过 :func:`_check_rev`，sha 形状再走同一校验。
+
+    head 既可以是分支名（``feat`` / ``origin/main``），也可以是裸 sha。**看着像 sha 的**
+    （:data:`SHA_LIKE_RE`）必须过 :func:`_check_commit_sha` —— 否则
+    ``fingerprint(repo, base, <64 位 sha>)`` 与 ``fingerprint_of_commit(repo, base, 同一个
+    sha)`` 会一个能算、一个报「提交 sha 非法」，接线时正好绕开强校验。
+    """
+
+    rev = _check_rev(value, what)
+    if SHA_LIKE_RE.fullmatch(rev) is not None:
+        return _check_commit_sha(rev)
+    return rev
 
 
 def _run_git(
@@ -580,7 +629,7 @@ def fingerprint(
        :data:`DIFF_CONFIG_PIN`）：空输出 → ``kind="empty"``；任一行以
        ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
     3. 否则 ``diff -U0 --no-color --no-renames mb head | patch-id <档位旗标>`` 的第一列
-       40 hex → ``kind="patch"``。档位旗标只有两个形态：旧档 ``--stable``、verbatim 档
+       40/64 hex → ``kind="patch"``。档位旗标只有两个形态：旧档 ``--stable``、verbatim 档
        ``--verbatim``（``--verbatim`` 隐含 ``--stable``，两者**不能同时显式给** ——
        新 git 实测 rc=129 ``options '--verbatim' and '--stable' cannot be used together``）。
 
@@ -592,14 +641,18 @@ def fingerprint(
       **同指纹 ≠ 内容相同（空白类改动看不见）**，报告行必须带出
       :data:`FINGERPRINT_LEGACY_CAVEAT`，消费方不得据此复用证据。
 
-    两次 diff 都带 :data:`DIFF_CONFIG_PIN` + ``--no-renames``：指纹不随调用方仓库的
-    ``diff.renames`` 变（rename 拆成 delete + add），``paths`` 给真名字（非 ASCII 不转义）。
+    两次 diff 都带 :data:`DIFF_CONFIG_PIN` + :data:`DIFF_PREFIX_PIN` + ``--no-renames``：
+    指纹不随调用方仓库的 ``diff.renames`` / ``core.quotePath`` / ``diff.noprefix`` /
+    ``diff.mnemonicPrefix`` 变（rename 拆成 delete + add），``paths`` 给真名字（非 ASCII
+    不转义）。``base_ref`` / ``head_rev`` 以 ``-`` 开头一律 :class:`PatchIdError`；
+    ``head_rev`` 看着像 sha（40 / 64 位十六进制）时还要过 :func:`_check_commit_sha`，
+    与 :func:`fingerprint_of_commit` 同一口径。
     ``verbatim`` 只给测试 / 诊断用（``None`` = 走探针）；显式 ``True`` 在无
     ``--verbatim`` 的 git 上是 :class:`PatchIdError`，不静默降级。
     """
 
     base = _check_rev(base_ref, "base_ref")
-    head = _check_rev(head_rev, "head_rev")
+    head = _check_head_rev(head_rev, "head_rev")
     if verbatim is None:
         verbatim = patch_id_supports_verbatim(repo)
     algo = FINGERPRINT_ALGO_VERBATIM if verbatim else FINGERPRINT_ALGO
@@ -628,6 +681,7 @@ def fingerprint(
                 "--numstat",
                 "--no-color",
                 "--no-renames",
+                *DIFF_PREFIX_PIN,
                 "-U0",
                 merge_base,
                 head,
@@ -657,6 +711,7 @@ def fingerprint(
             "-U0",
             "--no-color",
             "--no-renames",
+            *DIFF_PREFIX_PIN,
             merge_base,
             head,
         ),
@@ -698,7 +753,7 @@ def fingerprint(
                 paths=paths,
                 algo=algo,
             )
-    raise PatchIdError(f"{pid_label} 没有输出 40 hex 的 patch-id（diff 非空却无哈希）")
+    raise PatchIdError(f"{pid_label} 没有输出 40 或 64 位 hex 的 patch-id（diff 非空却无哈希）")
 
 
 def _has_commit(repo: str | Path, rev: str) -> bool:
@@ -721,7 +776,7 @@ def fingerprint_of_commit(
     ``except PatchIdError: return None`` 之前，否则「PATH 里没有 git」会被静默吞成
     「这个 sha 取不到」。
 
-    ``sha`` 必须是 40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
+    ``sha`` 必须是 40 或 64 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
     :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验 —— 两个形态
     校验都在**入口**，早于 ``cat-file`` / ``fetch``，所以「这个 sha 取不到」的结论不会
     把「base_ref 非法」漂成 ``None``。
