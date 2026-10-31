@@ -21,8 +21,9 @@
 1. :class:`Event.payload` 的类型是 ``Mapping[str, object]`` —— 调用方传 ``dict`` 即可
    （SQLite 读出来的 dict、``json.loads`` 的 dict 都符合），本层不复制、不改写它；
 2. :func:`judge` 的 ``pr`` 缺省 ``None`` = 调用方不知道被合并的 PR 号（``evidence audit``
-   的 ``--pr`` 是可选参数）：此时**跳过**「证据串卡」与「缺老板点头」里依赖 PR 相等的那半，
-   其余判定照常。传了 int 就逐条按契约判；
+   的 ``--pr`` 是可选参数）：此时**只跳过依赖 PR 相等的那半** —— 「证据串卡」不判、
+   ``boss_approve`` 不跟 ``pr`` 比；但 ``tier == "C"`` 一律要求存在 ``boss_approve``
+   （没有就是「缺老板点头」，与 ``pr`` 无关）。其余判定照常；
 3. ``tier_required`` 缺省 ``None`` = 不额外要求档位；给了值就要求 tier 槽位证据的
    ``tier`` **恰好等于**它（不等时该槽位记 ``missing``，verdict 落「缺证据」，detail 写清
    要求值与实际值）。
@@ -101,7 +102,7 @@ TIERS: frozenset[str] = frozenset({"A", "B", "C"})
 REVIEW_KINDS: frozenset[str] = frozenset({"defect", "regression"})
 REVIEW_VERDICTS: frozenset[str] = frozenset({"pass", "block"})
 
-# ---- 七个 VERDICT 字面量（全仓只此七种，不出现 STALE 这个词）----
+# ---- 七个 VERDICT 字面量（全仓只此七种，不出现第八个判定词）----
 
 VERDICT_PASS = "PASS"
 VERDICT_MISSING = "缺证据"
@@ -387,11 +388,14 @@ def judge(
         slots.append(Slot(name=name, event=event, state=state))
 
     tier_event = slots[0].event
-    if pr is not None and tier_event is not None and tier_event.payload.get("tier") == "C":
+    if tier_event is not None and tier_event.payload.get("tier") == "C":
+        # 「必须有 boss_approve」这半与 PR 无关：没有 boss 一律缺老板点头；
+        # 只有「boss 存在，要比 pr 是否相等」那半才依赖 pr（pr 缺省时比不了，跳过）。
         boss = _latest(ordered, "boss_approve", None)
         if boss is None:
-            problems[VERDICT_NO_BOSS].append(f"tier=C 但无 boss_approve 事件（pr #{pr}）")
-        elif boss.payload.get("pr") != pr:
+            where = "" if pr is None else f"（pr #{pr}）"
+            problems[VERDICT_NO_BOSS].append(f"tier=C 但无 boss_approve 事件{where}")
+        elif pr is not None and boss.payload.get("pr") != pr:
             problems[VERDICT_NO_BOSS].append(
                 f"tier=C 但 boss_approve pr={boss.payload.get('pr')!r} != {pr}"
             )

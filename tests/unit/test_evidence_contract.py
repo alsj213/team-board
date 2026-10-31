@@ -577,6 +577,44 @@ class TestVerdictNoBossApproval:
         )
         assert evidence.judge(events, HEAD, PR).verdict == evidence.VERDICT_PASS
 
+    def test_tier_c_without_boss_and_without_pr(self) -> None:
+        """回归（qa t_f62480b3 run 524）：tier=C 且无 boss_approve、调用方也没传 ``pr`` 时
+        必须判「缺老板点头」—— 这半条不依赖 PR 相等，不许被 ``pr is None`` 整块跳过。
+        """
+        events = base_events()
+        events[0] = evidence.Event(
+            id=1,
+            kind="tier",
+            payload={"tier": "C", "reason": "碰 .github/ CI", "head_sha": HEAD},
+            run_id=101,
+            profile="pm",
+        )
+        judgment = evidence.judge(events, HEAD)
+        assert judgment.verdict == evidence.VERDICT_NO_BOSS
+        assert "boss_approve" in judgment.detail
+        assert "None" not in judgment.detail
+
+    def test_tier_c_with_boss_and_without_pr_passes(self) -> None:
+        """``pr`` 缺省时只有「boss 存在、要跟 pr 比相等」那半跳过 —— 有 boss 即放行。"""
+        events = base_events()
+        events[0] = evidence.Event(
+            id=1,
+            kind="tier",
+            payload={"tier": "C", "reason": "碰 .github/", "head_sha": HEAD},
+            run_id=101,
+            profile="pm",
+        )
+        events.append(
+            evidence.Event(
+                id=9,
+                kind="boss_approve",
+                payload={"pr": PR, "approved_by": "boss"},
+                run_id=777,
+                profile="paimeng",
+            )
+        )
+        assert evidence.judge(events, HEAD).verdict == evidence.VERDICT_PASS
+
     def test_boss_not_needed_for_tier_b(self) -> None:
         assert evidence.judge(base_events(), HEAD, PR).verdict == evidence.VERDICT_PASS
 
@@ -838,7 +876,11 @@ class TestJudgeLatestWins:
 
 class TestJudgeOptionalKnobs:
     def test_pr_none_skips_pr_bound_checks(self) -> None:
-        """--pr 没给：跨卡与档位-C-需老板点头不判（其余照判）。"""
+        """``--pr`` 没给：只跳过依赖 PR 相等的判定（跨卡；boss 的 pr 相等）。
+
+        tier B 本来就不需要 boss；tier=C 无 boss 仍判「缺老板点头」，见
+        ``TestVerdictNoBossApproval.test_tier_c_without_boss_and_without_pr``。
+        """
         events = base_events()
         events.append(
             evidence.Event(
