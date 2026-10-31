@@ -278,8 +278,11 @@ def fetch_bodies(pr: int) -> tuple[str, ...]:
 #   ``algo="patch-id-U0-verbatim-v1"``。
 # - **git 配置**：两次 diff 都钉 :data:`DIFF_CONFIG_PIN` + :data:`DIFF_PREFIX_PIN` +
 #   ``--no-renames``，``patch-id`` 钉 ``patchid.verbatim``，所以 ``diff.renames`` /
-#   ``core.quotePath`` / ``color.ui`` / ``diff.noprefix`` / ``diff.mnemonicPrefix`` 这些
-#   仓库配置都不许改变指纹或 ``paths`` 的字面（非 ASCII 名给真名字）。
+#   ``core.quotePath`` / ``diff.interHunkContext`` / ``color.ui`` / ``diff.noprefix`` /
+#   ``diff.mnemonicPrefix`` 这些**仓库内**配置都不许改变指纹或 ``paths`` 的字面（非 ASCII
+#   名给真名字）。环境里的配置载体（``GIT_CONFIG_PARAMETERS`` 组 / ``GIT_CONFIG_GLOBAL`` /
+#   ``GIT_CONFIG_SYSTEM``）在算指纹这一路一律关掉（见 :func:`_git_env`），不再有「从哪条
+#   载体注入」的区别；取对象那一路（``git fetch``）反过来一律保留。
 
 #: 指纹算法标识（报告行必须引用它；换算法 = 换这个字符串）
 FINGERPRINT_ALGO = "patch-id-U0-v1"
@@ -306,11 +309,18 @@ FINGERPRINT_LEGACY_CAVEAT = (
 #: - ``core.quotePath=false``：非 ASCII 路径在 numstat / patch 里给**真名字**
 #:   （默认会写成 ``"\\344\\270\\255…"`` 的 C 转义）。真·非 UTF-8 名字仍是
 #:   :class:`PatchIdError`（下游严格按 UTF-8 解码）。
+#: - ``diff.interHunkContext=0``：相邻两个 hunk 之间隔 ≤N 行时 git 会把它们**并成一个**
+#:   hunk，patch 字节跟着变、patch-id 随之换值。默认值本来就是 0，显式给只是不让「仓库
+#:   或环境里配成非 0」把同一份内容算成两个指纹（本机 git 2.34.1 实测：两处改动隔 2 行，
+#:   ``-U0`` 下默认两个 ``@@``，``diff.interHunkContext=2`` 变成一个 ``@@ -2,4 +2,4 @@``，
+#:   patch-id ``cea9cf2c…`` → ``af7f5b85…``）。仓库内配置摘不掉，只能在这里钉死。
 DIFF_CONFIG_PIN = (
     "-c",
     "diff.renames=false",
     "-c",
     "core.quotePath=false",
+    "-c",
+    "diff.interHunkContext=0",
 )
 
 #: 两次 diff 都钉死的前缀形态：``diff.noprefix`` / ``diff.mnemonicPrefix``（个人机器上很常见）
@@ -340,9 +350,9 @@ NUMSTAT_ROW_RE = re.compile(r"(?:[0-9]+|-)\t(?:[0-9]+|-)\t.*", re.ASCII)
 #: 混排输出里 patch 段的起始行前缀（``--numstat`` 之后紧跟的整份 patch）。
 PATCH_SECTION_PREFIXES = ("diff --git ", "diff --cc ", "diff --combined ")
 
-#: git 子进程环境里**必须摘掉**的键（「指向别处」类）：
-#: 留着就会让「在 B 仓算指纹」被静默搬到 A 仓上去算 —— 结果看着正常，算的是另一个仓。
-GIT_ENV_STRIP_EXACT = frozenset(
+#: 无论哪一路都摘：把 git 指向**别处**的开关（留着就会让「在 B 仓算指纹」被静默搬到
+#: A 仓上去算 —— 结果看着正常，算的是另一个仓）。
+GIT_ENV_STRIP_ALWAYS = frozenset(
     {
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -351,16 +361,21 @@ GIT_ENV_STRIP_EXACT = frozenset(
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
         "GIT_EXTERNAL_DIFF",
-        "GIT_CONFIG_COUNT",
-        # ``git -c k=v`` 及其子进程实际走的环境变量（``GIT_CONFIG_COUNT`` 那组的另一种写法）：
-        # 不摘就等于「调用方（含 pre-push hook 里的 ``git -c``）能注进被测子进程」，
-        # 同一份内容换指纹。
-        "GIT_CONFIG_PARAMETERS",
     }
 )
 
+#: 只在**算指纹的那一路**（``merge-base`` / ``diff`` / ``patch-id`` / ``cat-file``）摘：
+#: git 配置载体。「``git -c k=v``」及其子进程实际走的环境变量（``GIT_CONFIG_COUNT`` 那组
+#: 的另一种写法）不摘就等于「调用方（含 pre-push hook 里的 ``git -c``）能注进被测子进程」，
+#: 同一份内容换指纹。
+GIT_ENV_STRIP_CONFIG = frozenset({"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"})
+
 #: 同上，按前缀摘：``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 成对注入 git 配置
-GIT_ENV_STRIP_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+GIT_ENV_STRIP_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+#: 算指纹那一路把「全局 / 系统配置」指向空设备（**不是**删环境变量：删掉 ``GIT_CONFIG_GLOBAL``
+#: 只是让 git 回落到 ``~/.gitconfig``，配置照样进来）。见 :func:`_git_env`。
+GIT_CONFIG_DISABLED = os.devnull
 
 #: 「按提交 sha 算指纹」时 sha 的形态：**40 或 64 位小写十六进制**。与 :data:`HEAD_RE` /
 #: :data:`HEAD_SHAPE_RE`（``REVIEW-HEAD`` 标记）同口径 —— sha256 仓的 ``headRefOid`` 就是
@@ -413,26 +428,44 @@ class Fingerprint:
         return "" if self.algo == FINGERPRINT_ALGO_VERBATIM else FINGERPRINT_LEGACY_CAVEAT
 
 
-def _git_env() -> dict[str, str]:
-    """git 子进程的环境：复制 ``os.environ``，只摘「指向别处」的那些开关。
+def _git_env(*, keep_config_carriers: bool = False) -> dict[str, str]:
+    """git 子进程的环境：复制 ``os.environ``，按「这一路要不要配置」分两档。
 
-    摘掉的键见 :data:`GIT_ENV_STRIP_EXACT` / :data:`GIT_ENV_STRIP_PREFIXES`；其余原样
-    保留 —— SSH（``GIT_SSH*`` / ``SSH_AUTH_SOCK`` / ``GIT_ASKPASS``）与代理
+    **两条路共有的底**（``keep_config_carriers`` 取哪一档都一样）：摘掉
+    :data:`GIT_ENV_STRIP_ALWAYS` 里那些把 git 指向别处的开关。
+
+    **算指纹那一路**（``keep_config_carriers=False``，默认）：所有 git 配置载体一律关掉 ——
+    :data:`GIT_ENV_STRIP_CONFIG` / :data:`GIT_ENV_STRIP_CONFIG_PREFIXES` 这类「``git -c``
+    等价注入」直接删，全局 / 系统配置经 :data:`GIT_CONFIG_DISABLED` 指向空设备。理由：
+    「同一份内容 ⇒ 同一指纹」是这一层的契约，配置注进来的每一维（``diff.algorithm`` /
+    ``diff.interHunkContext`` / ``diff.renames`` …）都能换 patch 字节。删环境变量不够 ——
+    删掉 ``GIT_CONFIG_GLOBAL`` 只是让 git 回落到 ``~/.gitconfig``，配置照样进来。
+
+    **取对象那一路**（``keep_config_carriers=True``，只给 ``git fetch`` 用）：配置载体
+    **一律保留**（``GIT_CONFIG_PARAMETERS`` 组与 ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM``
+    同口径，不再一条摘一条留）。理由有两条：① fetch 只取对象，对象按 sha 内容寻址，配置
+    注入改不了算出来的指纹；② ``url.*.insteadOf`` / ``credential.helper`` / ``safe.directory``
+    恰恰只能靠配置载体注进来（pre-push hook 与 CI wrapper 走 ``git -c``，个人机器走全局
+    配置），摘掉任一条都会让 fetch 静默变成「取不到」。旧版只摘 ``GIT_CONFIG_PARAMETERS``
+    却保留 ``GIT_CONFIG_GLOBAL``：同一份 ``insteadOf`` 换个载体，一个 rc=0 算出指纹、另一个
+    rc=128 静默返回 ``None``（t_9f4673a2 / D1 实测）。
+
+    其余原样保留 —— SSH（``GIT_SSH*`` / ``SSH_AUTH_SOCK`` / ``GIT_ASKPASS``）与代理
     （``HTTPS_PROXY`` / ``https_proxy`` 等）凭据变量必须留着，否则 ``fetch`` 会被误判成
-    环境故障。摘 ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_PARAMETERS`` 那两组是因为它们能把
-    ``color.ui=always`` / ``diff.noprefix=true`` 之类配置注进子进程，破坏「同一份内容 ⇒
-    同一指纹」。
-
-    ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` **有意保留**（有些机器靠它注入
-    ``safe.directory`` / ``url.*.insteadOf``，摘掉会让 fetch 静默变成「取不到」）。
-    它们能改的那几维由 :data:`DIFF_CONFIG_PIN` / :data:`DIFF_PREFIX_PIN` 在命令行上钉死
-    —— 环境留着，输出形态不跟着变。
+    环境故障。
     """
 
     env = dict(os.environ)
     for key in list(env):
-        if key in GIT_ENV_STRIP_EXACT or key.startswith(GIT_ENV_STRIP_PREFIXES):
+        if key in GIT_ENV_STRIP_ALWAYS:
             del env[key]
+    if keep_config_carriers:
+        return env
+    for key in list(env):
+        if key in GIT_ENV_STRIP_CONFIG or key.startswith(GIT_ENV_STRIP_CONFIG_PREFIXES):
+            del env[key]
+    env["GIT_CONFIG_GLOBAL"] = GIT_CONFIG_DISABLED
+    env["GIT_CONFIG_SYSTEM"] = GIT_CONFIG_DISABLED
     return env
 
 
@@ -466,13 +499,21 @@ def _check_commit_sha(value: object) -> str:
     return value
 
 
-def _check_head_rev(value: object, what: str) -> str:
-    """``fingerprint`` 的 head rev 形态：先过 :func:`_check_rev`，sha 形状再走同一校验。
+def _check_rev_shape(value: object, what: str) -> str:
+    """rev 形态校验（``base_ref`` 与 ``head_rev`` 共用一份口径）。
 
-    head 既可以是分支名（``feat`` / ``origin/main``），也可以是裸 sha。**看着像 sha 的**
-    （:data:`SHA_LIKE_RE`）必须过 :func:`_check_commit_sha` —— 否则
-    ``fingerprint(repo, base, <64 位 sha>)`` 与 ``fingerprint_of_commit(repo, base, 同一个
-    sha)`` 会一个能算、一个报「提交 sha 非法」，接线时正好绕开强校验。
+    先过 :func:`_check_rev`（非空、不以 ``-`` 开头）；**看着像 sha 的**（:data:`SHA_LIKE_RE`，
+    40 / 64 位 ASCII 十六进制、大小写都算）再走 :func:`_check_commit_sha` 的同一套小写校验。
+
+    两个位置（base 与 head）用同一个函数是**有意的行为变更**：本 PR 之前
+    ``fingerprint(repo, "A"*40, "topic")`` 会把大写 sha 原样交给 git（git 自己收大写对象名，
+    实测 ``rev-parse`` / ``merge-base`` / ``diff`` / ``cat-file`` 全 rc=0），于是 base 位置
+    「能算」、head 位置却 :class:`PatchIdError` —— 同一个 sha 的两种写法在指纹层得到两种
+    身份。现在两处一起拒（rc2），接线方传大写 sha 会从「能算」变成「参数非法」。
+
+    只对**看着像 sha 的**施加这条：分支名（``feat`` / ``origin/main``）不匹配
+    :data:`SHA_LIKE_RE`，正常调用面不受影响。41–63 位十六进制不匹配它，仍走 rev 路径
+    （P3，本卡不动）。
     """
 
     rev = _check_rev(value, what)
@@ -487,12 +528,14 @@ def _run_git(
     *,
     input_bytes: bytes | None = None,
     what: str = "",
+    keep_config_carriers: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """跑一次 ``git -C repo <argv>``（argv 列表、shell=False、硬超时）。
 
     只在**执行不成立**时抛 :class:`PatchIdError`（缺 git / 超时 / 其它 OSError）；
     rc 由调用方判 —— 有的调用（``merge-base`` / ``cat-file``）本来就允许非 0。
-    环境走 :func:`_git_env`（摘掉 ``GIT_DIR`` 一类「指向别处」的开关）。
+    环境走 :func:`_git_env`（摘掉 ``GIT_DIR`` 一类「指向别处」的开关；配置载体按
+    ``keep_config_carriers`` 分档：只有 ``git fetch`` 那一路传 ``True``）。
     """
 
     label = what or " ".join(argv)
@@ -506,7 +549,7 @@ def _run_git(
             capture_output=True,
             check=False,
             shell=False,
-            env=_git_env(),
+            env=_git_env(keep_config_carriers=keep_config_carriers),
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
@@ -642,17 +685,23 @@ def fingerprint(
       :data:`FINGERPRINT_LEGACY_CAVEAT`，消费方不得据此复用证据。
 
     两次 diff 都带 :data:`DIFF_CONFIG_PIN` + :data:`DIFF_PREFIX_PIN` + ``--no-renames``：
-    指纹不随调用方仓库的 ``diff.renames`` / ``core.quotePath`` / ``diff.noprefix`` /
-    ``diff.mnemonicPrefix`` 变（rename 拆成 delete + add），``paths`` 给真名字（非 ASCII
-    不转义）。``base_ref`` / ``head_rev`` 以 ``-`` 开头一律 :class:`PatchIdError`；
-    ``head_rev`` 看着像 sha（40 / 64 位十六进制）时还要过 :func:`_check_commit_sha`，
-    与 :func:`fingerprint_of_commit` 同一口径。
+    指纹不随调用方仓库的 ``diff.renames`` / ``core.quotePath`` / ``diff.interHunkContext`` /
+    ``diff.noprefix`` / ``diff.mnemonicPrefix`` 变（rename 拆成 delete + add），``paths``
+    给真名字（非 ASCII 不转义）。环境里的 git 配置载体（``git -c`` 等价组 / 全局 / 系统配置）
+    在算指纹这一路**一律关掉**（见 :func:`_git_env`），所以「同一份内容 ⇒ 同一指纹」不再
+    取决于机器配置从哪条通道注入。
+
+    ``base_ref`` 与 ``head_rev`` 同一份形态校验（:func:`_check_rev_shape`）：以 ``-`` 开头
+    一律 :class:`PatchIdError`；看着像 sha（40 / 64 位十六进制，**大小写都算像**）的必须
+    是小写，否则 :class:`PatchIdError`。**这是有意的行为变更**：本 PR 之前大写 sha 在 head
+    位置被拒、在 ``base_ref`` 位置却原样交给 git（能算），同一个 sha 两种写法两种身份；
+    现在两处一起拒（接线方传大写 sha 会从「能算」变 rc2）。
     ``verbatim`` 只给测试 / 诊断用（``None`` = 走探针）；显式 ``True`` 在无
     ``--verbatim`` 的 git 上是 :class:`PatchIdError`，不静默降级。
     """
 
-    base = _check_rev(base_ref, "base_ref")
-    head = _check_head_rev(head_rev, "head_rev")
+    base = _check_rev_shape(base_ref, "base_ref")
+    head = _check_rev_shape(head_rev, "head_rev")
     if verbatim is None:
         verbatim = patch_id_supports_verbatim(repo)
     algo = FINGERPRINT_ALGO_VERBATIM if verbatim else FINGERPRINT_ALGO
@@ -777,13 +826,22 @@ def fingerprint_of_commit(
     「这个 sha 取不到」。
 
     ``sha`` 必须是 40 或 64 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
-    :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验 —— 两个形态
-    校验都在**入口**，早于 ``cat-file`` / ``fetch``，所以「这个 sha 取不到」的结论不会
-    把「base_ref 非法」漂成 ``None``。
+    :class:`PatchIdError`；``base_ref`` 与 ``fingerprint`` 的 ``base_ref`` **同一份形态
+    校验**（:func:`_check_rev_shape`：看着像 sha 就必须是小写）—— 两个形态校验都在**入口**，
+    早于 ``cat-file`` / ``fetch``，所以「这个 sha 取不到」的结论不会把「base_ref 非法」漂成
+    ``None``。
+
+    取对象那一步（``git fetch``）用 :func:`_git_env` 的 ``keep_config_carriers=True`` 那一档：
+    ``GIT_CONFIG_PARAMETERS`` 组与 ``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` **同口径保留**，
+    于是 ``url.*.insteadOf`` / ``credential.helper`` / ``safe.directory`` 不管从哪条载体注入都
+    一样生效（旧版摘掉 ``GIT_CONFIG_PARAMETERS`` 却保留 ``GIT_CONFIG_GLOBAL``：同一份 insteadOf
+    换个载体，一个 rc=0 算出指纹、另一个 rc=128 静默 ``None``）。fetch 只取对象、对象按 sha
+    内容寻址，配置注入改不了算出来的指纹；算指纹那一路仍然把所有配置载体关掉（见
+    :func:`_git_env` 与 :func:`fingerprint`）。
     """
 
     sha = _check_commit_sha(sha)
-    _check_rev(base_ref, "base_ref")
+    _check_rev_shape(base_ref, "base_ref")
     if not _has_commit(repo, sha):
         fetch_label = f"git fetch --no-tags --quiet {remote} {sha}"
         try:
@@ -791,6 +849,8 @@ def fingerprint_of_commit(
                 repo,
                 ("fetch", "--no-tags", "--quiet", remote, sha),
                 what=fetch_label,
+                # 取对象那一路：配置载体一律保留（见 _git_env 的两档）
+                keep_config_carriers=True,
             )
         except GitMissingError:
             # 缺 git 是环境故障，不许被下面那条当成「对象取不到」
