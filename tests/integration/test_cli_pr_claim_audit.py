@@ -208,3 +208,28 @@ class TestScope:
         code, out, err = run(capsys, "pr-claim-audit", "--pr", str(PR), "--db", str(board))
         assert (code, err) == (1, "")
         assert out.splitlines()[-1].startswith("结论: 无未结卡认领该 PR")
+
+    @pytest.mark.parametrize("sep", ["\n", "\r", "\u2028", "\u0085"])
+    def test_control_chars_in_columns_do_not_add_physical_lines(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], sep: str
+    ) -> None:
+        """卡 t_6eb9a960：``assignee`` / ``status`` 带行边界时仍是一张卡一条物理行。
+
+        改前 ``--pr`` 报告 5 行（``\\n`` 把 CLAIM 切成两行）、``\\r`` 把光标拉回行首；
+        改后行数 = 表头 + 末行 + 卡数（2 + 3）。
+        """
+        board = make_db(
+            tmp_path / "ctrl.db",
+            [
+                ("t_a", f"run{sep}ning", f"engi{sep}neer", "PR-CLAIM: #34"),
+                ("t_b", f"to{sep}do", f"p{sep}m", "PR-REF: #34"),
+                ("t_c", f"re{sep}view", f"q{sep}a", "PR-REF: #34"),
+            ],
+        )
+        code, out, err = run(capsys, "pr-claim-audit", "--pr", str(PR), "--db", str(board))
+        assert (code, err) == (0, "")
+        lines = out.splitlines()
+        assert len(lines) == 5  # 未结卡 + CLAIM 1 + REF 2 + 结论
+        assert lines[0] == "未结卡 3 张"
+        assert lines[1].startswith("CLAIM t_a [run")
+        assert lines[-1] == "结论: 认领唯一 → t_a"

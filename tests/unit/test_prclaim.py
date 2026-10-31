@@ -159,6 +159,43 @@ class TestRender:
         assert lines[2].startswith("CLAIM t_b ")
         assert lines[-1].startswith("结论: 重复认领")
 
+    @pytest.mark.parametrize(
+        "sep", ["\n", "\r", "\x0c", "\x1c", "\u0085", "\u2028", "\u2029"]
+    )
+    def test_column_separators_keep_one_line_per_card(self, sep: str) -> None:
+        """``assignee`` / ``status`` 里的行边界不能把一条卡撑成两条物理行。
+
+        卡 t_6eb9a960：``\\n`` 会把一条 ``CLAIM`` 切成两行（``splitlines()`` 数出来
+        5 而不是 4），``\\r`` 把光标拉回行首。七种 ``str.splitlines()`` 边界都在
+        ``visible()`` 的转义范围内。
+        """
+        report = prclaim.audit(
+            [
+                ("t_a", f"run{sep}ning", f"engi{sep}neer", "PR-CLAIM: #34"),
+                ("t_b", f"to{sep}do", f"p{sep}m", "PR-REF: #34"),
+            ],
+            PR,
+        )
+        lines = prclaim.render(report).splitlines()
+        assert len(lines) == 4  # 表头 + CLAIM 1 条 + REF 1 条 + 末行结论
+        assert lines[1].startswith("CLAIM t_a [run")
+        assert lines[2].startswith("REF t_b [to")
+
+    def test_judgement_side_keeps_raw_values(self) -> None:
+        """转义只动渲染：``ClaimRow`` 里仍是原文（判定不受影响）。"""
+        report = prclaim.audit([("t_a", "run\nning", "engi\u2028neer", "PR-CLAIM: #34")], PR)
+        assert report.claims[0].status == "run\nning"
+        assert report.claims[0].assignee == "engi\u2028neer"
+        rendered = prclaim.render(report).splitlines()[1]
+        assert rendered == r"CLAIM t_a [run\x0aning] engi\u2028neer"
+        assert "\n" not in rendered and "\u2028" not in rendered
+
+    def test_nel_and_unicode_line_separators_are_escaped(self) -> None:
+        report = prclaim.audit(
+            [("t_a", "running", "e\u0085n", "PR-CLAIM: #34")], PR
+        )
+        assert prclaim.render(report).splitlines()[1].endswith(r"e\u0085n")
+
 
 class TestParsePr:
     @pytest.mark.parametrize("value", ["1", "34", "999999999"])
