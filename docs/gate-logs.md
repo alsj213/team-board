@@ -217,7 +217,8 @@ $ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名
   （`gatelog.write_log` 里 `encoding="utf-8"`）。四条边界：
   - **stdin 是 `/dev/null`，不是调用方的管道 / tty**：读 stdin 的检查器立刻拿到 EOF，不会挂住。
     实测（本卡 worktree）`printf 'hi from pipe\n' | … gate --gate stdin2 --card t_facc5c45 -- /bin/cat`
-    → rc0、摘要只有 `gate:` / `card:` / `exit:` / `counts:` / `log:`（零非空行，没有「末尾行」一节）、
+    → rc0、摘要是 **6 行**：`gate:` / `card:` / `exit:` / `counts: 未解析` / `失败行（0/0，≤20）:` /
+    `log:` —— `失败行` 一节恒定出现（零非空行时两个数字都是 0），零非空行所以**没有「末尾行」一节**；
     日志 `evidence/stdin2-t_facc5c45.log` **0 字节** —— 管道里的 `hi from pipe` 一个字节都没进日志。
   - **非 UTF-8 字节一律变 `U+FFFD`，与 locale / `PYTHONUTF8` / `PYTHONIOENCODING` 无关，也不截断**：
     解码源是写死的 `utf-8`，不是解释器的文本编码，所以同样的字节在任何 locale 下落盘结果都相同。
