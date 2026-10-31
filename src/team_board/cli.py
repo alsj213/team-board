@@ -36,11 +36,13 @@
   UTF-8、stdout 编码表示不了中文）
 
 ``body-audit`` 子命令（只读，看每张卡 ``tasks.body`` 的字节分布）：
-- 0：没有超限卡
-- 1：有超限卡（``body`` 的 UTF-8 字节数 > ``bodylimit.BODY_LIMIT_BYTES``）
-- 2：参数或环境错误（``db.BoardError`` / ``OSError`` / ``sqlite3.Error`` →
-  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--db`` 不存在、
-  不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
+- 0：没有超限卡、也没有固定段落红卡（**只有 warn 仍是 0**：warn 只报，不改 rc）
+- 1：有超限卡（``body`` 的 UTF-8 字节数 > ``bodylimit.BODY_LIMIT_BYTES``）**或**有
+  固定段落红卡（``created_at`` 不早于 ``--cutoff``、正文命中
+  ``cardtemplate.FIXED_HEADING_RE`` 的卡）
+- 2：参数或环境错误（``--cutoff`` 非整数 / 为负；``db.BoardError`` / ``OSError`` /
+  ``sqlite3.Error`` → stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含
+  ``--db`` 不存在、不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
 
 ``gate`` 子命令（包装外部检查器：全量落盘 + stdout 只回摘要）：
 - 0 / 1 / 其他：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``）
@@ -136,6 +138,7 @@ from pathlib import Path
 from . import (
     bodylimit,
     branches,
+    cardtemplate,
     commands,
     commits,
     db,
@@ -243,8 +246,9 @@ def build_parser() -> argparse.ArgumentParser:
       问题 / 2 参数或环境错误），吃 ``--card`` / ``--by`` / ``--pr`` / ``--branch`` /
       ``--subject`` / ``--body-out`` / ``--repo`` / ``--check-file``；**只打印**那条
       命令模板，不执行任何 git/gh 命令；
-    - ``body-audit``：稽核全板 ``tasks.body`` 的 UTF-8 字节分布与超限清单（0 无超限 /
-      1 有超限 / 2 参数或环境错误），只吃 ``--db`` / ``--all``；
+    - ``body-audit``：稽核全板 ``tasks.body`` 的 UTF-8 字节分布、固定段落红清单与
+      warn 清单（0 无超限无红 / 1 有超限或有红 / 2 参数或环境错误），吃 ``--db`` /
+      ``--all`` / ``--cutoff``；
     - ``push-guard``：git pre-push 的判定本体（0 放行 / 1 拦下 / 2 参数或环境
       错误），吃 ``--repo`` / ``--main-branch`` / ``--check-install``；不带
       ``--check-install`` 时从 stdin 读 pre-push 的 ref 行；
@@ -481,7 +485,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     body_cmd = subparsers.add_parser(
         "body-audit",
-        help="稽核卡正文 body 的字节分布与超限清单（0 无超限 / 1 有超限 / 2 参数或环境错误）",
+        help=(
+            "稽核卡正文 body 的字节分布 + 固定段落红清单 + warn 清单"
+            "（0 无超限无红 / 1 有超限或有红 / 2 参数或环境错误）"
+        ),
     )
     body_cmd.add_argument(
         "--db",
@@ -493,6 +500,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="连 done 卡一起算（默认只算未结卡：status ∉ {done, archived}）",
+    )
+    # 取值校验不交给 argparse 的 type=int：坏值要走本子命令「stderr 恰一行 错误:」
+    # 的契约（见 _parse_cutoff），所以先按字符串收、再自己判。
+    body_cmd.add_argument(
+        "--cutoff",
+        default=None,
+        metavar="INT",
+        help=(
+            "存量切点（Unix 秒；created_at 早于它的卡不判固定段落红）"
+            f"，默认 {cardtemplate.FIXED_SECTION_EPOCH}"
+            "（cardtemplate.FIXED_SECTION_EPOCH）；0 = 全部视作新卡；"
+            "非整数或负数 → rc2"
+        ),
     )
 
     gate_cmd = subparsers.add_parser(
@@ -1276,17 +1296,41 @@ def _run_merge_record(args: argparse.Namespace) -> int:
         return 2
 
 
-def _run_body_audit(args: argparse.Namespace) -> int:
-    """``body-audit`` 子命令：读失败一律 stderr 一行 ``错误: …`` + rc2。
+def _parse_cutoff(raw: str | None) -> int:
+    """``--cutoff`` 的取值校验 → 非负整数（``None`` = 用默认切点）。
 
-    三个码的分工：0 无超限 / 1 有超限 / 2 参数或环境错误。库不可用时 stdout
-    **一个字节都不写**（报告整块在库读成功之后才拼），所以 rc2 与 rc1 不会混。
+    校验放在这里而不是 argparse 的 ``type=int``：argparse 的坏参数会打 usage 两行、
+    退出码虽是 2 但格式与本子命令「stderr 恰一行 ``错误: …``」的契约不符。
     """
+    if raw is None:
+        return cardtemplate.FIXED_SECTION_EPOCH
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise ValueError(f"--cutoff 不是整数：{raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"--cutoff 不许为负：{value}（0 = 全部视作新卡）")
+    return value
+
+
+def _run_body_audit(args: argparse.Namespace) -> int:
+    """``body-audit`` 子命令：参数/读失败一律 stderr 一行 ``错误: …`` + rc2。
+
+    三个码的分工：0 无超限且无固定段落红卡（只有 warn 仍是 0）/ 1 有超限或有红 /
+    2 参数或环境错误。库不可用时 stdout **一个字节都不写**（报告整块在库读成功之后
+    才拼），所以 rc2 与 rc1 不会混。
+    """
+
+    try:
+        cutoff = _parse_cutoff(args.cutoff)
+    except ValueError as exc:
+        _write_stderr_error(str(exc))
+        return 2
 
     conn = None
     try:
         conn = db.connect(args.db)
-        rows = db.iter_body_rows(conn, include_done=args.all)
+        rows = db.iter_body_text_rows(conn, include_done=args.all)
     except (db.BoardError, OSError, sqlite3.Error) as exc:
         _write_stderr_error(str(exc))
         return 2
@@ -1294,12 +1338,12 @@ def _run_body_audit(args: argparse.Namespace) -> int:
         if conn is not None:
             conn.close()
 
-    summary = bodylimit.summarize(rows)
+    summary = bodylimit.summarize(rows, cutoff=cutoff)
     scope = bodylimit.SCOPE_ALL if args.all else bodylimit.SCOPE_PENDING
     text = bodylimit.render(summary, db_path=args.db, scope=scope)
     if not _write_stdout(text + "\n"):
         return 2
-    return 1 if summary.counts["over"] else 0
+    return 1 if (summary.counts["over"] or summary.counts["red"]) else 0
 
 
 def _run_gate(args: argparse.Namespace) -> int:
