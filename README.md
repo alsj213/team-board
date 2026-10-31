@@ -1027,6 +1027,13 @@ $ echo $?
 $ PYTHONPATH=src python3 -m team_board.cli gate --gate pytest --card t_eaa81611 -- .venv/bin/python -m pytest -q
 ```
 
+> **在 worktree 里跑**：`.venv` 在 checkout 根目录不保证存在，照抄上面那行 `.venv/bin/python` 得到的是
+> shell 的 rc=127（`…: No such file or directory`），不是 gate 的退出码。先按
+> [`docs/gate-logs.md`](docs/gate-logs.md) 前置 2/3/4 建环境
+> （`cd <本卡 worktree>; PY=/home/liu/project/team-board/.venv/bin/python; PYSRC=<本卡 worktree>/src`），
+> 再把上面命令里的 `PYTHONPATH=src python3` 换成 `PYTHONPATH=$PYSRC $PY`、`-- .venv/bin/python` 换成
+> `-- /usr/bin/env PYTHONPATH=$PYSRC $PY`，`--card` 换成本卡；三处一起换，原样可复制的三行见同文档「三个可复制样例」。
+
 `--` 之后是要执行的命令（`--` 本身不是命令），**退出码原样透传**（被信号杀记
 `128 + (-rc)`）；2 有两个来源：(a) gate 自身参数/环境错误 (b) 子命令自己返回 2
 —— (a) 含 `--gate` / `--card` 形态非法、`--` 之后没有命令、命令起不来、日志写不进去、
