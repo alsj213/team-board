@@ -1164,6 +1164,10 @@ team-board merge-owner-audit CARD [--db PATH] [--repo OWNER/REPO] [--timeout N] 
 
 - `EXEMPT` —— 本卡**正文**（围栏外）顶格一行 `PR-MERGE-EXEMPT: #<n>`。豁免只认正文：
   评论里的豁免行不算，正文里贴进代码围栏的示例也不算。已判 `EXEMPT` 的号不发 `gh`。
+- `WARN` —— gh 取数失败（`gh 超时 <n>s` / `gh 不在 PATH` / `gh 不可执行（EACCES|ENOEXEC）` /
+  `gh rc=<n>` / `gh 输出非 JSON`），`detail` 一句话；gh 自己的 stderr 原文**既不进报告
+  也不进日志**（一条 4KB 的 GraphQL 报错会把报告和日志全顶碎）。状态未知时**先判 WARN**，
+  不许读成有归属 / 无归属。
 - `MERGED` / `CLOSED` —— gh 的 `state` 先归一（去首尾空白、转大写）再比这两态；
   归一后不是三态的一律按取数失败（`WARN`）算。
 - `CLAIMED` —— gh 说 `OPEN`，且**另一张**未结卡（`status NOT IN ('done','archived')`）
@@ -1172,9 +1176,6 @@ team-board merge-owner-audit CARD [--db PATH] [--repo OWNER/REPO] [--timeout N] 
 - `UNOWNED` —— gh 说 `OPEN` 且没人认领。这一行注明 PR 号**来源**（`正文` / `评论` /
   `正文+评论`）；来源含评论时另提示「需在本卡正文写 `PR-MERGE-EXEMPT: #n`」——
   别人在评论里提的号，卡主只能靠往正文补一行来解，不用去求评论作者。
-- `WARN` —— gh 取数失败（`gh 超时 <n>s` / `gh 不在 PATH` / `gh 不可执行（EACCES|ENOEXEC）` /
-  `gh rc=<n>` / `gh 输出非 JSON`），`detail` 一句话；gh 自己的 stderr 原文**既不进报告
-  也不进日志**（一条 4KB 的 GraphQL 报错会把报告和日志全顶碎）。
 
 输出三段、顺序固定（行数恒为 `1 + 判定数 + 1`）：
 

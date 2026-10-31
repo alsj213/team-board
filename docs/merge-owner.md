@@ -41,10 +41,13 @@ PR #49 MERGED
 | 优先级 | 判定 | 条件 |
 | --- | --- | --- |
 | 1 | `EXEMPT` | 本卡顶格豁免行 `PR-MERGE-EXEMPT: #<n>` 里含这个号 |
-| 2 | `MERGED` / `CLOSED` | `gh pr view` 回 `MERGED` / `CLOSED` |
-| 3 | `CLAIMED <卡号,…>` | PR 仍 `OPEN`，且**另一张**未结卡（`status NOT IN ('done','archived')`、且不是本卡）正文有 `PR-CLAIM: #<n>`；多张卡认领也照样通过，`detail` 是卡号升序逗号分隔 |
-| 4 | `UNOWNED` | PR 仍 `OPEN`，且没有任何「另一张未结卡」认领 |
-| 5 | `WARN <原因>` | `gh` 取数失败（rc≠0、输出非 JSON、状态不在 `MERGED`/`CLOSED`/`OPEN` 三态里） |
+| 2 | `WARN <原因>` | `gh` 取数失败（rc≠0、输出非 JSON、状态不在 `MERGED`/`CLOSED`/`OPEN` 三态里）——状态未知，先判 WARN，不许读成 OPEN/UNOWNED |
+| 3 | `MERGED` / `CLOSED` | `gh pr view` 回 `MERGED` / `CLOSED` |
+| 4 | `CLAIMED <卡号,…>` | PR 仍 `OPEN`，且**另一张**未结卡（`status NOT IN ('done','archived')`、且不是本卡）正文有 `PR-CLAIM: #<n>`；多张卡认领也照样通过，`detail` 是卡号升序逗号分隔 |
+| 5 | `UNOWNED` | PR 仍 `OPEN`，且没有任何「另一张未结卡」认领 |
+
+`WARN` 先于 `MERGED` / `CLAIMED` / `UNOWNED`：取数失败时状态未知，只能降级（rc 仍 0 或 1，
+由**其它**号是否 UNOWNED 决定），不能把该号读成「有归属」或「无归属」。
 
 两条容易踩的细节：
 
