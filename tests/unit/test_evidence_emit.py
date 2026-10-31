@@ -887,6 +887,7 @@ def test_emit_tier_via_flags_rc0(tmp_path: Path, capsys: pytest.CaptureFixture[s
 
     assert rc == 0, err
     assert err == ""
+    assert "kind=tier" in out and "event=" in out
     assert str(event_count(path, kind="tier")) == "1"
     task_id, run_id, kind, payload, _ = latest_event(path)
     assert (task_id, run_id, kind) == (CARD, RUN_ID, "tier")
