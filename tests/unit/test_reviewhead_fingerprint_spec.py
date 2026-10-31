@@ -20,14 +20,8 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from team_board.reviewhead import (
-    FINGERPRINT_ALGO,
-    FINGERPRINT_ALGO_VERBATIM,
-    FINGERPRINT_LEGACY_CAVEAT,
     fingerprint,
-    patch_id_supports_verbatim,
 )
 
 _GIT_ENV = {
@@ -109,87 +103,6 @@ def whitespace_pair(tmp_path: Path) -> Path:
     write(repo, "app.yml", "app:\n  name: demo\n            port: 8080\n")
     commit(repo, "ws12: twelve spaces")
     return repo
-
-
-def test_whitespace_blind_under_legacy_algo(tmp_path: Path) -> None:
-    """旧档（空白不敏感）下只改缩进 → 同 ``value``，且 ``algo`` / ``caveat`` 必须标出来。"""
-
-    repo = whitespace_pair(tmp_path)
-    eight = fingerprint(repo, "main", "ws8", verbatim=False)
-    twelve = fingerprint(repo, "main", "ws12", verbatim=False)
-
-    assert eight.kind == "patch" and twelve.kind == "patch"
-    assert eight.algo == FINGERPRINT_ALGO
-    assert twelve.algo == FINGERPRINT_ALGO
-    assert eight.value is not None and eight.value == twelve.value
-    # 盲区必须随指纹一起交出去：消费方不得据此复用证据
-    assert eight.caveat == FINGERPRINT_LEGACY_CAVEAT
-    assert twelve.caveat == FINGERPRINT_LEGACY_CAVEAT
-
-
-@pytest.mark.skipif(not VERBATIM, reason="本机 git 无 patch-id --verbatim（探针 rc≠0）")
-def test_whitespace_distinguishes_under_verbatim_algo(tmp_path: Path) -> None:
-    """``--verbatim`` 档：只差缩进也必须换 ``value``（空白进哈希），``caveat`` 为空。"""
-
-    repo = whitespace_pair(tmp_path)
-    eight = fingerprint(repo, "main", "ws8", verbatim=True)
-    twelve = fingerprint(repo, "main", "ws12", verbatim=True)
-
-    assert eight.algo == FINGERPRINT_ALGO_VERBATIM
-    assert twelve.algo == FINGERPRINT_ALGO_VERBATIM
-    assert eight.value is not None and twelve.value is not None
-    assert eight.value != twelve.value
-    assert eight.caveat == ""
-
-
-def test_default_algo_follows_probe_not_version(tmp_path: Path) -> None:
-    """不显式给 ``verbatim`` 时走探针：``algo`` 必须与探针结论一致（本机 = 旧档）。"""
-
-    repo = whitespace_pair(tmp_path)
-    assert patch_id_supports_verbatim(repo) is VERBATIM
-    # 探针结果缓存：同一 repo 第二次不再起子进程，结论不变
-    assert patch_id_supports_verbatim(repo) is VERBATIM
-
-    eight = fingerprint(repo, "main", "ws8")
-    assert eight.algo == (FINGERPRINT_ALGO_VERBATIM if VERBATIM else FINGERPRINT_ALGO)
-    assert eight.kind == "patch"
-
-
-def test_probe_runs_once_per_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """探针每个 repo 只跑一次（进程内缓存）：两次 ``fingerprint`` 只能看到一条探针调用。"""
-
-    import team_board.reviewhead as reviewhead
-
-    repo = whitespace_pair(tmp_path)
-    real_run_git = reviewhead._run_git
-    probed: list[tuple[str, ...]] = []
-
-    def spy(where, argv, **kwargs):
-        if tuple(argv) == ("patch-id", "--verbatim"):
-            probed.append(tuple(argv))
-        return real_run_git(where, argv, **kwargs)
-
-    monkeypatch.setattr(reviewhead, "_run_git", spy)
-    reviewhead._VERBATIM_SUPPORT.pop(os.fspath(repo), None)
-
-    first = fingerprint(repo, "main", "ws8")
-    second = fingerprint(repo, "main", "ws12")
-
-    assert len(probed) == 1
-    assert first.algo == second.algo
-
-
-@pytest.mark.skipif(VERBATIM, reason="本机 git 支持 --verbatim：这一侧只验「不支持」时的 fail-closed")
-def test_forcing_verbatim_without_support_fails_closed(tmp_path: Path) -> None:
-    """无 ``--verbatim`` 的 git 上强行要 verbatim 档 → ``PatchIdError``，不静默降级成旧档。"""
-
-    from team_board.reviewhead import PatchIdError
-
-    repo = whitespace_pair(tmp_path)
-    with pytest.raises(PatchIdError):
-        fingerprint(repo, "main", "ws8", verbatim=True)
-
-
 def test_rename_only_gives_two_real_paths(tmp_path: Path) -> None:
     """rename-only 被拆成 delete + add：``paths`` 必须是两个真文件名，不许留 ``a => b``。
 

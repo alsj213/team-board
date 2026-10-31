@@ -1,12 +1,15 @@
-"""``reviewhead`` 指纹层单测：六个内容场景（rebase / 换文件 / 真改 / 上下文位移 / 二进制 / 空）。
+"""``reviewhead`` 指纹层单测：内容场景（rebase / 行号位移 / 换文件 / 真改 / 缩进 / 二进制 / 空）。
 
 这一层不碰 gh、不碰网络：全部用真 ``git`` 在 ``tmp_path`` 里造仓，「main 动了」「改了
 文件」「改了内容」都由真提交产生，判断只走 :func:`fingerprint`。
 
-锁的三件事：
+锁的几件事：
 
-- ``-U0`` 是硬要求：上下文位移（行号变、内容没变）必须同指纹，而同一例用默认
-  ``-U3`` 会换 id（下面 ContextShift 那条用例把两个 id 都算出来做对照）；
+- ``-U0`` + 丢 ``@@`` / ``index`` 行是硬要求：行号位移（纯 rebase、上游在别处插行）
+  必须同指纹；带上下文的 ``-U3`` diff 会整体变（下面 ContextShift 那条用例把两边的
+  diff 都算出来做对照）；
+- **空白 / 缩进是内容**：只改缩进必须换指纹（``git patch-id`` 会归一化空白 → 漏判，
+  这正是 E3 打回的那条 P1）；
 - 换文件 / 真改内容必须换指纹（这两件是「内容真的变了」）；
 - 二进制、空 diff 判不了 / 没有内容，分别返回 ``kind="binary"`` / ``"empty"``，
   不许折成「内容没变」。
@@ -14,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -24,9 +28,9 @@ from team_board.reviewhead import (
     FINGERPRINT_ALGO,
     Fingerprint,
     PatchIdError,
+    UnrelatedHistoryError,
     fingerprint,
     fingerprint_of_commit,
-    patch_id_supports_verbatim,
 )
 
 _GIT_ENV = {
@@ -78,25 +82,34 @@ def make_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def patch_id(repo: Path, base: str, head: str, *diff_args: str) -> str:
-    """不经被测模块直接算 ``patch-id``（只用于对照 ``-U0`` / ``-U3`` 的差别）。
+def raw_diff(repo: Path, base: str, head: str, *diff_args: str) -> bytes:
+    """``git diff <diff_args or -U0> --no-color <base> <head>`` 的原始字节。"""
 
-    档位旗标必须与被测模块一致（:func:`patch_id_supports_verbatim`）：新 git 上
-    ``fingerprint()`` 走 ``--verbatim``（空白敏感），这里再用 ``--stable`` 对比就是拿两套
-    归一化比大小（CI 实测两者哈希不同）。``--verbatim`` 隐含 ``--stable``，但两者不能同时
-    显式给（rc=129），所以是二选一。
-    """
-
-    diff = subprocess.run(
+    return subprocess.run(
         ["git", "-C", str(repo), "diff", *(diff_args or ("-U0",)), "--no-color", base, head],
         capture_output=True,
         env=_GIT_ENV,
         check=True,
     ).stdout
-    mode = ("--verbatim",) if patch_id_supports_verbatim(repo) else ("--stable",)
+
+
+def digest(repo: Path, base: str, head: str, *diff_args: str) -> str:
+    """独立算内容指纹：``sha256(内容行)[:40]``（与被测实现同口径，但另写一遍）。"""
+
+    lines = [
+        line
+        for line in raw_diff(repo, base, head, *diff_args).split(b"\n")
+        if not line.startswith(b"@@") and not line.startswith(b"index ")
+    ]
+    return hashlib.sha256(b"\n".join(lines)).hexdigest()[:40]
+
+
+def patch_id(repo: Path, base: str, head: str, *diff_args: str) -> str:
+    """旧算法 ``git diff | git patch-id --stable``（只用于对照它漏判空白 / 缩进）。"""
+
     out = subprocess.run(
-        ["git", "-C", str(repo), "patch-id", *mode],
-        input=diff,
+        ["git", "-C", str(repo), "patch-id", "--stable"],
+        input=raw_diff(repo, base, head, *diff_args),
         capture_output=True,
         env=_GIT_ENV,
         check=True,
@@ -194,12 +207,74 @@ def test_context_shift_keeps_fingerprint_but_u3_would_not(tmp_path: Path) -> Non
 
     assert before.value is not None and after.value is not None
     assert after.value == before.value  # -U0：内容没变就是没变
-    # 对照：同一例用默认 -U3，patch-id 会因上下文位移而变 —— 这就是必须 -U0 的理由
-    u3_before = patch_id(repo, before.merge_base, old_head, "-U3")
-    u3_after = patch_id(repo, "main", "feat", "-U3")
-    assert patch_id(repo, before.merge_base, old_head) == before.value
-    assert patch_id(repo, "main", "feat") == after.value
+    # 对照：同一例用默认 -U3，diff 里的上下文行一起变 —— 这就是必须 -U0 的理由
+    u3_before = digest(repo, before.merge_base, old_head, "-U3")
+    u3_after = digest(repo, "main", "feat", "-U3")
+    assert digest(repo, before.merge_base, old_head) == before.value
+    assert digest(repo, "main", "feat") == after.value
     assert u3_before != u3_after
+
+
+def test_indent_only_change_changes_fingerprint(tmp_path: Path) -> None:
+    """**只改缩进**（4 空格 → 8 空格）必须换指纹 —— 旧 ``patch-id`` 会给同一个 id。
+
+    这是 E3 打回的那条 P1 的单测版：``git patch-id`` 归一化行首/行尾与连续空白，于是
+    「只改缩进」能复用旧证据；而 Python 里缩进能改语义 → 闸门 fail-open。
+    """
+
+    repo = make_repo(tmp_path)
+    git(repo, "checkout", "-q", "-b", "feat")
+    write(repo, "code.py", "def f():\n    return 1\n")
+    old_sha = commit(repo, "feat: add code.py")
+
+    before = fingerprint(repo, "main", "feat")
+    assert before.kind == "patch"
+
+    # 只动缩进：别的字节一个不改
+    write(repo, "code.py", "def f():\n        return 1\n")
+    commit(repo, "feat: 只改缩进")
+
+    after = fingerprint(repo, "main", "feat")
+    assert after.kind == "patch"
+    assert before.value is not None and after.value is not None
+    assert after.value != before.value, "只改缩进必须换指纹（否则 fail-open）"
+    # 对照：旧算法（patch-id）对同一对 diff 给出同一个 id —— 证明这条用例抓的就是那个缺陷
+    assert patch_id(repo, before.merge_base, old_sha) == patch_id(repo, "main", "feat")
+
+
+@pytest.mark.parametrize(
+    "mutated",
+    ("        x = 1\n", "x  =  1\n", "x = 1 \n", "x\t= 1\n"),
+    ids=("indent", "inner-double-space", "trailing-space", "tab-instead-of-space"),
+)
+def test_any_whitespace_byte_change_changes_fingerprint(
+    tmp_path: Path, mutated: str
+) -> None:
+    """**任意一个空白字节的改动**都必须换指纹（行首 / 行中 / 行尾 / 制表符）。
+
+    E3 卡面点名的两个实测样例就是 ``        x = 1`` 与 ``x  =  1``：旧 ``patch-id`` 对它们
+    都返回同一个 id，于是「改空白」能复用旧证据。缩进那条用例只覆盖行首，这里把行中、
+    行尾、制表符一并锁住 —— 判据是「内容行逐字节进哈希」，不是「只有缩进才算内容」。
+    """
+
+    repo = make_repo(tmp_path)
+    git(repo, "checkout", "-q", "-b", "feat")
+    write(repo, "code.txt", "x = 1\n")
+    old_sha = commit(repo, "feat: add code.txt")
+
+    before = fingerprint(repo, "main", "feat")
+    assert before.kind == "patch"
+    assert before.value is not None
+
+    write(repo, "code.txt", mutated)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "--amend", "--no-edit")
+    after = fingerprint(repo, "main", "feat")
+    assert after.kind == "patch"
+    assert after.value is not None
+    assert after.value != before.value, f"空白改动必须换指纹：{mutated!r}"
+    # 对照：旧算法（patch-id）对同一对 diff 给出同一个 id —— 证明这条用例抓的就是那个缺陷
+    assert patch_id(repo, before.merge_base, old_sha) == patch_id(repo, "main", "feat")
 
 
 def test_binary_diff_is_binary_not_patch(tmp_path: Path) -> None:
@@ -237,9 +312,9 @@ def test_binary_diff_is_binary_not_patch(tmp_path: Path) -> None:
 
 
 def test_empty_diff_is_empty_and_unusable_revs_are_handled(tmp_path: Path) -> None:
-    """空 diff（空提交）→ kind="empty"；取不到的 sha → None；未知 rev → PatchIdError。"""
+    """空 diff（空提交）→ kind="empty"；取不到的 sha → None；无共同祖先 → 专门的异常。"""
 
-    assert FINGERPRINT_ALGO == "patch-id-U0-v1"
+    assert FINGERPRINT_ALGO == "diff-sha256-U0-v1"
 
     repo = make_repo(tmp_path)
     git(repo, "checkout", "-q", "-b", "feat")
@@ -253,6 +328,23 @@ def test_empty_diff_is_empty_and_unusable_revs_are_handled(tmp_path: Path) -> No
 
     # 取不到的对象不是异常：按「不可验证」处理
     assert fingerprint_of_commit(repo, "main", "b" * 40) is None
-    # 而「rev 本身不成立」（不是共同祖先 / 不存在）是参数错，必须抛
+    # 「rev 本身不成立」/ 无共同祖先：两者都抛（UnrelatedHistoryError 是 PatchIdError 子类，
+    # 但 fingerprint_of_commit 会把后者折成 None —— 见下一条断言）
     with pytest.raises(PatchIdError):
         fingerprint(repo, "main", "no-such-rev")
+
+    orphan = _orphan_commit(repo)
+    with pytest.raises(UnrelatedHistoryError, match="没有共同祖先"):
+        fingerprint(repo, "main", orphan)
+    assert fingerprint_of_commit(repo, "main", orphan) is None
+
+
+def _orphan_commit(repo: Path) -> str:
+    """造一条与本仓库主线无共同祖先的提交，返回它的 sha（``merge-base`` 必然失败）。"""
+
+    git(repo, "checkout", "-q", "--orphan", "orphan")
+    git(repo, "rm", "-q", "-r", "-f", "--cached", ".")
+    write(repo, "only.py", "x = 1\n")
+    sha = commit(repo, "orphan root")
+    git(repo, "checkout", "-q", "feat")
+    return sha
