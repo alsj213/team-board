@@ -78,6 +78,15 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
     ``tasks`` 表 / 卡不存在 / 卡没有 assignee 一律 ``MergeAuditError``（rc2，
     **不静默跳过判据**）。``merged-by`` 值本身缺失或格式非法时，``缺字段`` /
     ``格式非法`` 已经报过，判据① 不再重复报第二条，输出行写「不适用」。
+12. **判据②（R15 合并权只归 repo bot）**：``merged-by`` 的 profile 部分必须是
+    :data:`MERGE_BY_PROFILE`（``repo``）。语法（``MERGE_BY_RE``）与身份分开判：
+    ``pm/run9`` 语法合法、身份不合规 → ``merged-by 的 profile 不是 repo``。
+    两个判定点：候选 message 走 :func:`check_message`（``merge_guard`` / ``merge-record``
+    的入口预检，**不豁免**）；已落地的合并提交走 :func:`audit` 的判定段
+    （:func:`check_actor`），**按切换点豁免** —— 判定段按 first-parent 时间正序，
+    最早一条 ``merged-by`` 为 ``repo`` 的合并是分界，它之前的不追溯、它及之后一律判；
+    区间内没有任何 repo 合并时该判定整段不生效（过渡期，``render_report`` 明写）。
+    切换点取**完整判定段**，不随 ``--card`` 漂移。
 """
 
 from __future__ import annotations
@@ -98,6 +107,11 @@ from .model import DEFAULT_DB
 
 #: ``merged-by`` 取值：``<profile>/run<正整数>``，profile 为小写字母开头的短名
 MERGE_BY_RE = re.compile(r"^[a-z][a-z0-9-]*/run[0-9]+$")
+
+#: 合并权归属（R15「合并权只归 repo bot」）：``merged-by`` 的 profile 部分必须恒为
+#: ``repo``。**唯一源** —— 语法（``MERGE_BY_RE``）与身份（本常量）分开判：语法认
+#: ``pm/run9`` 合法，身份不认。``merge_guard`` 只 import 本常量，别在别处写死字符串。
+MERGE_BY_PROFILE = "repo"
 
 #: ``merge-card`` 取值：卡号 ``t_`` + 8 位小写十六进制
 MERGE_CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
@@ -127,6 +141,9 @@ KIND_NOT_MERGE = "不是合并提交"
 
 #: 判据①：``merged-by`` 的 profile 部分与该卡 ``tasks.assignee`` 不符
 KIND_MERGED_BY_MISMATCH = "merged-by 与卡 assignee 不符"
+
+#: 判据②（R15 合并权归 repo bot）：``merged-by`` 的 profile 部分不是 ``repo``
+KIND_ACTOR_NOT_REPO = "merged-by 的 profile 不是 repo"
 
 #: ``audit(require=True)`` 追加的两类「该卡没有可认账的合并」问题
 KIND_MISSING_HISTORY = "缺认账字段（历史，基线前）"
@@ -196,6 +213,10 @@ class MergeReport:
     ``card`` / ``assignee`` 非 ``None`` 表示本次跑过判据①（CLI 给了 ``--card``）：
     ``card`` 是过滤用的卡号，``assignee`` 是从看板库读到的 ``tasks.assignee``。
     两个都默认 ``None``，其余调用方（不含判据① 的场景）构造 `MergeReport` 不用改。
+
+    ``actor_switch`` 是判据②（R15 合并权归 repo bot）的**切换点 sha**：判定段里最早
+    一条 ``merged-by`` 为 ``repo`` 的合并。``None`` = 区间内尚无 repo 合并（过渡期，
+    该判定整段不生效）。调用方不传也合法。
     """
 
     repo: str
@@ -206,6 +227,7 @@ class MergeReport:
     history: tuple[MergeRecord, ...]
     card: str | None = None
     assignee: str | None = None
+    actor_switch: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -298,6 +320,16 @@ def _fields(scan: _Scan, sha: str) -> tuple[dict[str, str | None], list[Problem]
             continue
         values[key] = raw
     return values, problems
+
+
+def actor_of(by: str) -> str:
+    """``merged-by`` 值里的 profile 部分：``"repo/run7" -> "repo"``。
+
+    ``check_message`` / ``build_message`` / :func:`check_actor` / :func:`audit` 共用这一份
+    「怎么切 profile」，别各写一份 ``partition("/")``（切法一改就分叉）。
+    """
+
+    return by.partition("/")[0]
 
 
 def parse_trailers(message: str) -> tuple[dict[str, str], tuple[Problem, ...]]:
@@ -393,6 +425,18 @@ def check_message(
     _, field_problems = _fields(scan, "")
     problems.extend(field_problems)
 
+    # 判据②（R15）：合并权只归 repo bot。候选 message 口径 —— sha 用 ""，与同函数里
+    # 其它结构类问题一致。**这里不豁免**：merge_guard / merge-record 的入口预检靠它拦。
+    merged_by = scan.values.get("merged-by")
+    if merged_by is not None and actor_of(merged_by) != MERGE_BY_PROFILE:
+        problems.append(
+            Problem(
+                KIND_ACTOR_NOT_REPO,
+                "",
+                f"merged-by={merged_by}；合并权归 repo bot（R15），正确写法 repo/run<N>",
+            )
+        )
+
     expected: dict[str, str] = {}
     if card is not None:
         expected["merge-card"] = card
@@ -478,6 +522,26 @@ def check_merged_by(record: MergeRecord, assignee: str) -> tuple[Problem, ...]:
     )
 
 
+def check_actor(record: MergeRecord) -> tuple[Problem, ...]:
+    """判据②（R15 合并权归 repo bot）：``merged-by`` 的 profile 必须是 ``repo``。
+
+    ``source != "trailer"`` 或 ``record.by is None`` → 不判（历史段没有 ``merged-by``
+    值；值缺失 / 格式非法已由 ``缺字段`` / ``格式非法`` 报过，不重复报第二条）。
+    """
+
+    if record.source != "trailer" or record.by is None:
+        return ()
+    if actor_of(record.by) == MERGE_BY_PROFILE:
+        return ()
+    return (
+        Problem(
+            KIND_ACTOR_NOT_REPO,
+            record.sha,
+            f"merged-by={record.by}；合并权归 repo bot（R15），正确写法 repo/run<N>",
+        ),
+    )
+
+
 def build_message(*, card: str, by: str, pr: int, subject: str | None = None) -> str:
     """生成带认账块的合并提交 message（恰好三段：标题 / 空行 / 三行 trailer）。
 
@@ -499,6 +563,12 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
         raise MergeAuditError(f"执行者标识非法：{by!r}（应为 str，形如 pm/run137）")
     if MERGE_BY_RE.fullmatch(by) is None:
         raise MergeAuditError(f"执行者标识非法：{by!r}（应形如 pm/run137）")
+    # 判据②（R15）：语法合法不等于有资格 —— 合并权只归 repo bot。
+    if actor_of(by) != MERGE_BY_PROFILE:
+        raise MergeAuditError(
+            f"执行者必须是 repo：merged-by={by!r}；合并权归 repo bot（R15），"
+            "正确写法 repo/run<N>"
+        )
     if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
         raise MergeAuditError(f"PR 号非法：{pr!r}（应为正整数）")
 
@@ -802,6 +872,12 @@ def audit(
         judged.append(record)
         problems.extend(record_problems)
 
+    # 切换点（R15，历史不追溯）：判定段按 first-parent **时间正序**取 —— ``git log``
+    # 默认 newest-first，这里反转。最早一条 ``merged-by`` 为 ``repo`` 的合并即分界：
+    # 它之前的合并不判 actor（历史里的 ``pm/runN`` 不追溯），它及之后一律判。
+    # 区间内还没有任何 repo 合并 = 过渡期，本规则整段不生效（既不判也不豁免）。
+    order = list(reversed(judged))
+
     history: list[MergeRecord] = []
     history_text = _git_ok(
         root,
@@ -838,6 +914,28 @@ def audit(
         for record in judged:
             problems.extend(check_merged_by(record, assignee))
 
+    # 判据②（R15）：切换点及其之后的合并一律判 actor；切换点之前的不追溯。
+    # 分界取**完整判定段**（``order`` 在 only_card 过滤之前生成）—— 切换点是仓库
+    # 时间线上的事实，不随 ``--card`` 漂移，否则同一区间会得出两种口径。
+    # 也必须放在 ``require`` 之前：非 repo 的合并不算「零问题的认账合并」。
+    actor_switch: str | None = None
+    switch = next(
+        (
+            index
+            for index, record in enumerate(order)
+            if record.source == "trailer"
+            and record.by is not None
+            and actor_of(record.by) == MERGE_BY_PROFILE
+        ),
+        None,
+    )
+    if switch is not None:
+        actor_switch = order[switch].sha
+        enforced = {record.sha for record in order[switch:]}
+        for record in judged:
+            if record.sha in enforced:
+                problems.extend(check_actor(record))
+
     if require:
         bad_shas = {problem.sha for problem in problems}
         clean_trailer = [
@@ -866,6 +964,7 @@ def audit(
         history=tuple(history),
         card=only_card,
         assignee=assignee,
+        actor_switch=actor_switch,
     )
 
 
@@ -937,6 +1036,13 @@ def render_report(report: MergeReport) -> str:
         )
 
     lines.extend(_judgement_one_lines(report))
+
+    # 判据②（R15）的切换点：有分界就打出 sha，否则明写过渡期（不生效 ≠ 通过，
+    # 让读的人一眼看出「这一段现在还没在判」）。
+    if report.actor_switch is None:
+        lines.append("合并权切换点：过渡期（区间内尚无 repo 合并，repo-only 判定未生效）")
+    else:
+        lines.append(f"合并权切换点（首次 repo 合并）：{report.actor_switch}")
 
     lines.append(f"问题（{len(report.problems)} 处）:")
     if not report.problems:

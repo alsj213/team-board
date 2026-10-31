@@ -80,6 +80,10 @@ _GIT_ENV = {
 }
 
 #: 三字段齐全的合并 message（判定段应当 rc0）
+#:
+#: 身份仍是 ``pm/run137``：本文件的既有用例锁的是**过渡期**语义（区间内没有任何
+#: ``repo`` 合并 → R15 判据② 整段不生效），也用来锁判据①（profile == 卡 assignee）。
+#: R15 的红样 / 绿样另见文件末尾 ``test_actor_*``（那里用 ``repo/runN`` 当分界）。
 GOOD_MESSAGE = (
     "Merge PR #1\n"
     "\n"
@@ -1115,3 +1119,117 @@ def test_ascii_stdout_returns_two(repo: Path) -> None:
     assert proc.stdout == b""
     assert proc.stderr.startswith("错误: ".encode())
     assert b"Traceback" not in proc.stderr
+
+
+# --------------------- 判据②（R15 合并权只归 repo bot）：切换点豁免与 rc
+#
+# 本文件上面的夹具保留 ``merged-by: pm/run137``：它们跑在**过渡期**语义下（区间内没有
+# 任何 repo 合并 → 该判定整段不生效），用来锁既有行为不被 R15 改动波及。R15 本身的
+# 红样 / 绿样 / 过渡期文案用下面这组 ``repo/runN`` 与 ``pm/runN`` 的对照。
+
+
+def _message(pr: int, card: str, by: str) -> str:
+    """一条三字段齐全的合并 message；``by`` 决定它是否合规。"""
+
+    return (
+        f"Merge PR #{pr}\n"
+        "\n"
+        f"merged-by: {by}\n"
+        f"merge-card: {card}\n"
+        f"merge-pr: #{pr}"
+    )
+
+
+def test_actor_red_after_switch_point(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """切换点之后的非 repo 合并 → rc1，文案给正确写法，并打出切换点 sha。"""
+
+    base = head(repo)
+    switch = merge_in(
+        repo, _message(4, "t_ad5e7ff6", "repo/run1"), branch="one", name="one.txt"
+    )
+    bad = merge_in(
+        repo, _message(5, "t_11112222", "pm/run9"), branch="two", name="two.txt"
+    )
+
+    rc, out, err = run(["--repo", str(repo), "--baseline", base], capsys)
+
+    assert rc == 1, (rc, out, err)
+    assert err == ""
+    assert f"合并权切换点（首次 repo 合并）：{switch}" in out
+    assert (
+        f"{bad[:7]} merged-by 的 profile 不是 repo："
+        "merged-by=pm/run9；合并权归 repo bot（R15），正确写法 repo/run<N>"
+    ) in out
+    assert "结论：发现 1 个问题" in out
+
+
+def test_actor_green_before_switch_point(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """切换点之前的非 repo 合并不追溯（历史不追溯）→ rc0，切换点照旧渲染。"""
+
+    base = head(repo)
+    merge_in(repo, _message(5, "t_11112222", "pm/run9"), branch="one", name="one.txt")
+    switch = merge_in(
+        repo, _message(4, "t_ad5e7ff6", "repo/run1"), branch="two", name="two.txt"
+    )
+
+    rc, out, err = run(["--repo", str(repo), "--baseline", base], capsys)
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert f"合并权切换点（首次 repo 合并）：{switch}" in out
+    assert "合并权归 repo bot" not in out
+    assert "结论：无问题" in out
+
+
+def test_actor_transition_period_is_printed(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """区间内没有 repo 合并 = 过渡期：该判定不生效，输出里明写（不静默假绿）。"""
+
+    base = head(repo)
+    merge_in(repo, _message(5, "t_11112222", "pm/run9"), branch="one", name="one.txt")
+
+    rc, out, err = run(["--repo", str(repo), "--baseline", base], capsys)
+
+    assert rc == 0, (rc, out, err)
+    assert "合并权切换点：过渡期（区间内尚无 repo 合并，repo-only 判定未生效）" in out
+    assert "合并权切换点（首次 repo 合并）" not in out
+
+
+def test_actor_switch_point_does_not_drift_with_card_filter(
+    repo: Path, capsys: pytest.CaptureFixture[str], board: Path
+) -> None:
+    """``--card`` 只过滤记录，不改分界：同一区间两种口径会让豁免范围随参数漂移。"""
+
+    base = head(repo)
+    switch = merge_in(
+        repo, _message(4, "t_ad5e7ff6", "repo/run1"), branch="one", name="one.txt"
+    )
+    bad = merge_in(
+        repo, _message(5, "t_11112222", "pm/run9"), branch="two", name="two.txt"
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            "t_11112222",
+            "--db",
+            str(board),
+        ],
+        capsys,
+    )
+
+    assert rc == 1, (rc, out, err)
+    assert f"合并权切换点（首次 repo 合并）：{switch}" in out
+    assert f"{bad[:7]} merged-by 的 profile 不是 repo" in out
+    # 判据① 照旧：该卡 assignee=pm、merged-by=pm/run9 → PASS
+    assert "merged-by=pm/run9 → PASS" in out
+

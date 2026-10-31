@@ -14,11 +14,13 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from team_board.merges import (
+    KIND_ACTOR_NOT_REPO,
     KIND_BAD_FORMAT,
     KIND_DUPLICATE,
     KIND_MERGED_BY_MISMATCH,
@@ -26,13 +28,16 @@ from team_board.merges import (
     KIND_MISSING,
     KIND_NOT_MERGE,
     KIND_NOT_TRAILER,
+    MERGE_BY_PROFILE,
     MergeAuditError,
     MergeRecord,
     MergeReport,
     Problem,
+    actor_of,
     audit,
     build_message,
     card_assignee,
+    check_actor,
     check_merged_by,
     check_message,
     legacy_record,
@@ -43,12 +48,21 @@ from team_board.merges import (
 
 SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 CARD = "t_c9f5866a"
-BY = "pm/run137"
+BY = "repo/run137"
 
 GOOD = (
     "Merge PR #15（t_c9f5866a）\n"
     "\n"
-    "merged-by: pm/run137\n"
+    "merged-by: repo/run137\n"
+    "merge-card: t_c9f5866a\n"
+    "merge-pr: #15\n"
+)
+
+#: 三字段齐、但执行者不是 repo（语法合法、身份不合规；R15 判据② 的对象）
+NON_REPO_MESSAGE = (
+    "Merge PR #15（t_c9f5866a）\n"
+    "\n"
+    "merged-by: pm/run9\n"
     "merge-card: t_c9f5866a\n"
     "merge-pr: #15\n"
 )
@@ -62,7 +76,7 @@ class TestParseTrailers:
     def test_full_trailer_block_is_parsed_without_problems(self):
         values, problems = parse_trailers(GOOD)
         assert values == {
-            "merged-by": "pm/run137",
+            "merged-by": "repo/run137",
             "merge-card": "t_c9f5866a",
             "merge-pr": "#15",
         }
@@ -77,23 +91,23 @@ class TestParseTrailers:
         message = GOOD + "Signed-off-by: someone <s@example.com>\n"
         values, problems = parse_trailers(message)
         assert "Signed-off-by" not in values
-        assert values["merged-by"] == "pm/run137"
+        assert values["merged-by"] == "repo/run137"
         assert problems == ()
 
     def test_duplicate_key_reports_once_and_keeps_last_value(self):
         message = (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "merged-by: pm/run137\n"
+            "merged-by: repo/run137\n"
             "merge-card: t_c9f5866a\n"
-            "merged-by: pm/run138\n"
+            "merged-by: repo/run138\n"
             "merge-pr: #15\n"
         )
         values, problems = parse_trailers(message)
         assert kinds(problems) == [KIND_DUPLICATE]
         assert "merged-by" in problems[0].detail
         assert "2" in problems[0].detail
-        assert values["merged-by"] == "pm/run138"
+        assert values["merged-by"] == "repo/run138"
         assert problems[0].sha == ""
 
     def test_key_in_body_is_reported_as_not_in_trailer_zone(self):
@@ -101,7 +115,7 @@ class TestParseTrailers:
             "Merge PR #15（t_c9f5866a）\n"
             "merge-card: t_c9f5866a\n"
             "\n"
-            "merged-by: pm/run137\n"
+            "merged-by: repo/run137\n"
             "merge-pr: #15\n"
         )
         values, problems = parse_trailers(message)
@@ -130,7 +144,7 @@ class TestRecordFromCommit:
             sha=SHA,
             subject="Merge PR #15",
             parents=("p1", "p2"),
-            by="pm/run137",
+            by="repo/run137",
             card="t_c9f5866a",
             pr="#15",
             source="trailer",
@@ -300,12 +314,98 @@ class TestCheckMessage:
         assert problems == ()
 
 
+class TestActorMustBeRepo:
+    """判据②（R15 合并权只归 repo bot）：语法合法 ≠ 有资格（``pm/run9`` 语法过、身份不过）。"""
+
+    def test_actor_of_splits_the_profile_part(self):
+        assert MERGE_BY_PROFILE == "repo"
+        assert actor_of("repo/run7") == "repo"
+        assert actor_of("pm/run9") == "pm"
+        assert actor_of("Repo/run1") == "Repo"
+
+    def test_candidate_message_from_non_repo_actor_is_reported(self):
+        problems = check_message(NON_REPO_MESSAGE)
+        assert kinds(problems) == [KIND_ACTOR_NOT_REPO]
+        # 候选 message 口径：sha 为 ""，与同函数里其它结构类问题一致
+        assert problems[0].sha == ""
+        assert problems[0].detail == (
+            "merged-by=pm/run9；合并权归 repo bot（R15），正确写法 repo/run<N>"
+        )
+
+    def test_candidate_message_is_not_exempted_by_the_parameters(self):
+        # 候选 message 口径**不豁免**：给了合法参数也照样报（merge_guard 入口预检靠它拦）
+        message = build_message(card=CARD, by=BY, pr=15).replace("repo/run137", "pm/run137")
+        problems = check_message(message, card=CARD, by="pm/run137", pr=15)
+        assert kinds(problems) == [KIND_ACTOR_NOT_REPO]
+
+    def test_build_message_rejects_non_repo_actor(self):
+        with pytest.raises(MergeAuditError) as excinfo:
+            build_message(card=CARD, by="pm/run9", pr=15)
+        assert "执行者必须是 repo" in str(excinfo.value)
+        assert "合并权归 repo bot" in str(excinfo.value)
+        assert "repo/run<N>" in str(excinfo.value)
+
+    def test_build_message_accepts_repo_actor(self):
+        message = build_message(card=CARD, by="repo/run7", pr=15)
+        assert "merged-by: repo/run7" in message
+        assert check_message(message, card=CARD, by="repo/run7", pr=15) == ()
+
+    def test_record_from_commit_does_not_judge_actor(self):
+        # audit 的判定段走 record_from_commit；actor 由 audit 按切换点另判（见 TestActorSwitchPoint）
+        _, problems = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), NON_REPO_MESSAGE)
+        assert KIND_ACTOR_NOT_REPO not in kinds(problems)
+        assert problems == ()
+
+    def test_check_actor_judges_a_trailer_record(self):
+        problems = check_actor(make_record("pm/run9"))
+        assert [problem.kind for problem in problems] == [KIND_ACTOR_NOT_REPO]
+        assert [problem.sha for problem in problems] == [SHA]
+        assert problems[0].detail == (
+            "merged-by=pm/run9；合并权归 repo bot（R15），正确写法 repo/run<N>"
+        )
+
+    def test_check_actor_accepts_repo(self):
+        assert check_actor(make_record("repo/run9")) == ()
+
+    def test_check_actor_skips_missing_and_legacy_records(self):
+        # 值缺失 / 格式非法已由「缺字段 / 格式非法」报过；历史段没有 merged-by 值
+        assert check_actor(make_record(None)) == ()
+        assert check_actor(replace(make_record("pm/run9"), source="legacy")) == ()
+
+    def test_render_marks_transition_period_when_no_switch_point(self):
+        text = render_report(
+            MergeReport(
+                repo="/repo/team-board",
+                baseline="origin/main",
+                rev="HEAD",
+                records=(),
+                problems=(),
+                history=(),
+            )
+        )
+        assert "合并权切换点：过渡期（区间内尚无 repo 合并，repo-only 判定未生效）" in text
+
+    def test_render_prints_the_switch_point_sha(self):
+        text = render_report(
+            MergeReport(
+                repo="/repo/team-board",
+                baseline="origin/main",
+                rev="HEAD",
+                records=(),
+                problems=(),
+                history=(),
+                actor_switch=SHA,
+            )
+        )
+        assert f"合并权切换点（首次 repo 合并）：{SHA}" in text
+
+
 class TestBuildMessage:
     def test_default_subject_uses_expected_wording(self):
         assert build_message(card=CARD, by=BY, pr=15) == (
             "Merge PR #15（t_c9f5866a）\n"
             "\n"
-            "merged-by: pm/run137\n"
+            "merged-by: repo/run137\n"
             "merge-card: t_c9f5866a\n"
             "merge-pr: #15\n"
         )
@@ -314,7 +414,7 @@ class TestBuildMessage:
         message = build_message(card=CARD, by=BY, pr=15, subject="Merge PR #15")
         assert message.split("\n\n") == [
             "Merge PR #15",
-            "merged-by: pm/run137\nmerge-card: t_c9f5866a\nmerge-pr: #15\n",
+            "merged-by: repo/run137\nmerge-card: t_c9f5866a\nmerge-pr: #15\n",
         ]
 
     @pytest.mark.parametrize("card", ["t_ZZZZZZZZ", "t_c9f5866", "", "c9f5866a"])
@@ -364,7 +464,7 @@ class TestRenderReport:
         assert "基线: origin/main" in text
         assert "区间: HEAD" in text
         assert "判定（1 条）:" in text
-        assert "  1. a1b2c3d t_c9f5866a #15 by=pm/run137" in text
+        assert "  1. a1b2c3d t_c9f5866a #15 by=repo/run137" in text
         assert "问题（0 处）:" in text
         assert "历史（未判定，1 条）:" in text
         assert "  1. a1b2c3d t_f43fa954 #9 by=无法判定" in text
@@ -389,10 +489,10 @@ class TestRenderReport:
 DUP_MESSAGE = (
     "Merge PR #15（t_c9f5866a）\n"
     "\n"
-    "merged-by: pm/run1\n"
+    "merged-by: repo/run1\n"
     "merge-card: t_c9f5866a\n"
     "merge-pr: #15\n"
-    "merged-by: pm/run2\n"
+    "merged-by: repo/run2\n"
 )
 
 #: 键写在正文里、末尾块里没有（结构类问题：字段未落在 trailer 区）
@@ -400,7 +500,7 @@ MISPLACED_MESSAGE = (
     "merge-card: t_c9f5866a\n"
     "正文第二行\n"
     "\n"
-    "merged-by: pm/run1\n"
+    "merged-by: repo/run1\n"
     "merge-pr: #15\n"
 )
 
@@ -563,7 +663,7 @@ class TestOldUppercaseKeysRejected:
 
     def test_build_message_emits_lowercase_only(self):
         message = build_message(card=CARD, by=BY, pr=15)
-        assert "merged-by: pm/run137" in message
+        assert "merged-by: repo/run137" in message
         assert "merge-card: t_c9f5866a" in message
         assert "merge-pr: #15" in message
         for upper in ("Merge-By", "Merge-Card", "Merge-PR"):
@@ -733,18 +833,20 @@ class TestRenderJudgementOne:
         text = render_report(report_with((record,), card=CARD, assignee="pm"))
         assert (
             f"判据①（merged-by == 卡 assignee）：卡 {CARD} assignee=pm，"
-            "merged-by=pm/run137 → PASS"
+            "merged-by=repo/run137 → PASS"
         ) in text
 
     def test_fail_line_format(self):
         record, _ = record_from_commit(SHA, "Merge PR #15", ("p1", "p2"), GOOD)
-        problem = Problem(KIND_MERGED_BY_MISMATCH, SHA, "merged-by=pm/run137 assignee=engineer")
+        problem = Problem(
+            KIND_MERGED_BY_MISMATCH, SHA, "merged-by=repo/run137 assignee=engineer"
+        )
         text = render_report(
             report_with((record,), (problem,), card=CARD, assignee="engineer")
         )
         assert (
             f"判据①（merged-by == 卡 assignee）：卡 {CARD} assignee=engineer，"
-            "merged-by=pm/run137 → FAIL"
+            "merged-by=repo/run137 → FAIL"
         ) in text
 
     def test_line_says_not_applicable_when_no_trailer_record(self):
@@ -968,7 +1070,7 @@ SYNC_MSG = "Merge origin/main into wt/t_deadbeef（解冲突：两侧全保留�
 GOOD_PR_MSG = (
     "Merge pull request #999 from alsj213/wt/t_deadbeef\n"
     "\n"
-    "merged-by: pm/run189\n"
+    "merged-by: repo/run189\n"
     "merge-card: t_deadbeef\n"
     "merge-pr: #999\n"
 )
@@ -1152,3 +1254,164 @@ class TestFirstParentOnly:
         assert [record.sha for record in report.history] == [sync]
         assert main_pr not in {record.sha for record in report.history}
         assert report.ok
+
+
+# ------------------------- 判据② 切换点（R15 合并权只归 repo bot，历史不追溯）
+#
+# 分界 = 判定段里**最早一条** ``merged-by`` 为 ``repo`` 的合并（first-parent 时间正序）。
+# 它之前的不判 actor（历史里的 ``pm/runN`` 不追溯），它及之后一律判；区间内没有任何
+# repo 合并时该判定整段不生效（过渡期）。分界取完整判定段，不随 ``--card`` 漂移。
+
+
+def _pr_msg(pr: int, card: str, by: str) -> str:
+    """一条合格形态的合并 message；``by`` 决定它是否合规（repo / pm）。"""
+
+    return (
+        f"Merge pull request #{pr} from alsj213/wt/{card}\n"
+        "\n"
+        f"merged-by: {by}\n"
+        f"merge-card: {card}\n"
+        f"merge-pr: #{pr}\n"
+    )
+
+
+def _merge_into_main(repo: Path, branch: str, message: str) -> str:
+    """从 ``main`` 切出 ``branch``、提交一个文件、再 ``--no-ff`` 合回 main，返回合并 sha。
+
+    合出来的提交在 ``main`` 的 first-parent 链上，正是认账事件（判定对象）。
+    """
+
+    _real_git(repo, "checkout", "-q", "-b", branch, "main")
+    _commit(repo, f"{branch}.txt", f"{branch}\n", f"feat: {branch}")
+    _real_git(repo, "checkout", "-q", "main")
+    _real_git(repo, "merge", "-q", "--no-ff", branch, "-m", message)
+    return _real_git(repo, "rev-parse", "HEAD").strip()
+
+
+def _audit_repo(path: Path, messages: list[str]) -> tuple[str, list[str]]:
+    """造一个「基线 + 依次 N 条 first-parent 合并」的真仓，返回 (基线 sha, 各合并 sha)。"""
+
+    path.mkdir(parents=True, exist_ok=True)
+    _real_git(path, "init", "-q", "-b", "main")
+    baseline = _commit(path, "README.md", "base\n", "chore: 基线")
+    shas = [
+        _merge_into_main(path, f"side{index}", message)
+        for index, message in enumerate(messages, start=1)
+    ]
+    return baseline, shas
+
+
+class TestActorSwitchPoint:
+    """判据② 的分界与豁免（红样 / 绿样 / 过渡期 / ``--card`` 不漂移）。"""
+
+    def test_non_repo_merge_after_switch_point_is_reported(self, tmp_path: Path) -> None:
+        """红样：``repo/run1`` 在前、``pm/run9`` 在后 → 只报后面那条，rc1（``ok`` 为 False）。"""
+
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(
+            repo,
+            [
+                _pr_msg(11, "t_aaaa1111", "repo/run1"),
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+            ],
+        )
+
+        report = audit(repo=repo, baseline=baseline)
+
+        assert report.actor_switch == shas[0]
+        assert [(p.kind, p.sha) for p in report.problems] == [(KIND_ACTOR_NOT_REPO, shas[1])]
+        assert report.problems[0].detail == (
+            "merged-by=pm/run9；合并权归 repo bot（R15），正确写法 repo/run<N>"
+        )
+        assert not report.ok
+        assert f"合并权切换点（首次 repo 合并）：{shas[0]}" in render_report(report)
+
+    def test_non_repo_merge_before_switch_point_is_exempt(self, tmp_path: Path) -> None:
+        """绿样：``pm/run9`` 在前（切换点之前）、``repo/run2`` 在后 → 不报，rc0。"""
+
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(
+            repo,
+            [
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+                _pr_msg(11, "t_aaaa1111", "repo/run2"),
+            ],
+        )
+
+        report = audit(repo=repo, baseline=baseline)
+
+        # 分界 = 最早的 repo 合并（第 2 条）；它之前的 pm 合并不追溯
+        assert report.actor_switch == shas[1]
+        assert report.problems == ()
+        assert report.ok
+        assert f"合并权切换点（首次 repo 合并）：{shas[1]}" in render_report(report)
+
+    def test_transition_period_reports_no_actor_problem(self, tmp_path: Path) -> None:
+        """过渡期：区间内一条 repo 合并都没有 → 该判定整段不生效（不判也不豁免）。"""
+
+        repo = tmp_path / "repo"
+        baseline, _ = _audit_repo(
+            repo,
+            [
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+                _pr_msg(13, "t_cccc3333", "pm/run3"),
+            ],
+        )
+
+        report = audit(repo=repo, baseline=baseline)
+
+        assert report.actor_switch is None
+        assert report.problems == ()
+        text = render_report(report)
+        assert "合并权切换点：过渡期（区间内尚无 repo 合并，repo-only 判定未生效）" in text
+        assert "合并权切换点（首次 repo 合并）" not in text
+
+    def test_switch_point_does_not_drift_with_card_filter(self, tmp_path: Path) -> None:
+        """分界取完整判定段：``--card`` 只过滤记录，不改分界（否则同一区间两种口径）。"""
+
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(
+            repo,
+            [
+                _pr_msg(11, "t_aaaa1111", "repo/run1"),
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+                _pr_msg(13, "t_cccc3333", "pm/run3"),
+            ],
+        )
+        board = make_board(tmp_path / "board.db", {"t_cccc3333": "pm"})
+
+        report = audit(repo=repo, baseline=baseline, only_card="t_cccc3333", db_path=board)
+
+        # 记录只留该卡那条，但分界仍是区间里最早的 repo 合并（第 1 条）
+        assert [record.sha for record in report.records] == [shas[2]]
+        assert report.actor_switch == shas[0]
+        # 该卡这条在切换点之后 → 判 actor（同时判据① 也照旧）
+        kinds_here = [problem.kind for problem in report.problems]
+        assert KIND_ACTOR_NOT_REPO in kinds_here
+        assert [p.sha for p in report.problems if p.kind == KIND_ACTOR_NOT_REPO] == [shas[2]]
+
+    def test_actor_problem_is_not_swallowed_by_require(self, tmp_path: Path) -> None:
+        """非 repo 的合并不算「零问题的认账合并」：``--require`` 不许把它糊成通过。"""
+
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(
+            repo,
+            [
+                _pr_msg(11, "t_aaaa1111", "repo/run1"),
+                _pr_msg(12, "t_bbbb2222", "pm/run9"),
+            ],
+        )
+        board = make_board(tmp_path / "board.db", {"t_bbbb2222": "pm"})
+
+        report = audit(
+            repo=repo,
+            baseline=baseline,
+            only_card="t_bbbb2222",
+            require=True,
+            db_path=board,
+        )
+
+        kinds_here = [problem.kind for problem in report.problems]
+        assert KIND_ACTOR_NOT_REPO in kinds_here
+        assert not report.ok
+
