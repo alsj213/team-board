@@ -244,6 +244,32 @@ class TestLoadPlanRejects:
             vb.load_plan(tmp_path / "nope.json")
         assert "读不到 plan 文件" in str(excinfo.value)
 
+    @pytest.mark.parametrize(
+        "raw_bytes",
+        [
+            pytest.param(
+                b'{"units":[{"card":"t_aaaaaaaa","pr":53,"head":"a\xff"}]}',
+                id="非法UTF-8字节",
+            ),
+            pytest.param(
+                '{"units":[{"card":"t_aaaaaaaa","pr":53,"head":"é"}]}'.encode("gbk"),
+                id="GBK编码",
+            ),
+        ],
+    )
+    def test_non_utf8_plan(self, tmp_path: Path, raw_bytes: bytes) -> None:
+        """非 UTF-8 的 plan 必须也是 VerifyBatchError（不能漏成 UnicodeDecodeError）。
+
+        UnicodeDecodeError 是 UnicodeError/ValueError 子类、不是 OSError，只 catch
+        OSError 会让这条输入变成 traceback + rc1，打穿「一律 rc2」契约。
+        """
+        path = tmp_path / "plan.json"
+        path.write_bytes(raw_bytes)
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.load_plan(path)
+        assert "读不到 plan 文件" in str(excinfo.value)
+        assert "UnicodeDecodeError" in type(excinfo.value.__cause__).__name__
+
 
 class TestBatchId:
     def test_shape_and_length(self) -> None:

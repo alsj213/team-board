@@ -322,7 +322,9 @@ def load_plan(path: str | os.PathLike[str]) -> Plan:
 
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # UnicodeDecodeError 不是 OSError（它是 UnicodeError/ValueError 子类），
+        # 漏掉它会让非 UTF-8 的 plan 变成 traceback + rc1，打穿「不合法一律 rc2」契约。
         raise VerifyBatchError(f"读不到 plan 文件 {os.fspath(path)}: {exc}") from exc
     try:
         raw = json.loads(text)
