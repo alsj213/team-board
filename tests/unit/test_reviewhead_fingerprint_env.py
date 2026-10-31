@@ -9,7 +9,9 @@
    ``--no-color``；对照组证明不带时确实会上色）；
 3. criss-cross 多基 → ``merge-base --all`` 候选 2 个，fail-closed 抛 ``PatchIdError``；
 4. ``-`` 开头的 base_ref / head_rev / sha → ``PatchIdError``（不许被 git 当选项吃）；
-5. PATH 里没有 git → ``fingerprint_of_commit`` 抛 ``GitMissingError``（不许吞成 ``None``）。
+   含 ``fingerprint_of_commit`` 里「sha 取不到」的那条路径（base_ref 非法不许漂成 ``None``）；
+5. PATH 里没有 git → ``fingerprint_of_commit`` 抛 ``GitMissingError``（不许吞成 ``None``），
+   含 ``_has_commit`` 为假、走进 ``fetch`` 分支的那条路径（锁 ``except`` 顺序）。
 
 全部不碰网络。
 """
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+import team_board.reviewhead as reviewhead
 from team_board.reviewhead import (
     PATCH_ID_RE,
     GitMissingError,
@@ -187,6 +190,56 @@ def test_missing_git_raises_git_missing_error_not_none(
     assert len(sha) == 40
 
     empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+
+    with pytest.raises(GitMissingError, match="找不到 git"):
+        fingerprint_of_commit(repo, "main", sha)
+
+
+def test_dash_base_ref_rejected_even_when_sha_is_unreachable(tmp_path: Path) -> None:
+    """``fingerprint_of_commit`` 的 base_ref 形态校验早于「sha 取不到」的结论。
+
+    同一函数对同一个非法 base_ref 只许给一种类别：``PatchIdError``。曾经 sha 本地没有、
+    远端也取不到时会先撞上「取不到 ⇒ None」而把非法 base_ref 漂成 ``None``。
+    """
+
+    repo = make_repo(tmp_path, "dash-commit", "base\ndash-commit\n")
+    unreachable = "f" * 40  # 本地没有这个对象，仓里也没有 remote 能取到
+
+    probe = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{unreachable}^{{commit}}"],
+        capture_output=True,
+        env=_GIT_ENV,
+        check=False,
+    )
+    assert probe.returncode != 0  # 前提成立：确实取不到
+
+    # 对照组：合法 base_ref + 取不到的 sha → 仍是 None（不许变成异常）
+    assert fingerprint_of_commit(repo, "main", unreachable) is None
+
+    # 非法 base_ref：sha 取不到时也必须报 base_ref，不许漂成 None
+    with pytest.raises(PatchIdError, match="base_ref"):
+        fingerprint_of_commit(repo, "--all", unreachable)
+    # sha 本地已有时 → 同一类别（不随本地有没有对象而变）
+    with pytest.raises(PatchIdError, match="base_ref"):
+        fingerprint_of_commit(repo, "--all", git(repo, "rev-parse", "topic"))
+
+
+def test_missing_git_on_fetch_path_raises_not_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_has_commit`` 为假 → 走 ``fetch`` 分支，缺 git 仍抛 ``GitMissingError``。
+
+    ``GitMissingError`` 是 ``PatchIdError`` 的子类：``except PatchIdError: return None``
+    若排在前面，这条路径会把「PATH 里没有 git」静默吞成「这个 sha 取不到」。
+    """
+
+    repo = make_repo(tmp_path, "nogit-fetch", "base\nnogit-fetch\n")
+    sha = git(repo, "rev-parse", "topic")
+
+    monkeypatch.setattr(reviewhead, "_has_commit", lambda *args, **kwargs: False)
+    empty_bin = tmp_path / "empty-bin-fetch"
     empty_bin.mkdir()
     monkeypatch.setenv("PATH", str(empty_bin))
 

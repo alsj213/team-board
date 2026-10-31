@@ -570,10 +570,13 @@ def fingerprint_of_commit(
     「这个 sha 取不到」。
 
     ``sha`` 必须是 40 位小写十六进制（与 ``REVIEW-HEAD`` 同口径），否则
-    :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验。
+    :class:`PatchIdError`；``base_ref`` 同 :func:`fingerprint` 的形态校验 —— 两个形态
+    校验都在**入口**，早于 ``cat-file`` / ``fetch``，所以「这个 sha 取不到」的结论不会
+    把「base_ref 非法」漂成 ``None``。
     """
 
     sha = _check_commit_sha(sha)
+    _check_rev(base_ref, "base_ref")
     if not _has_commit(repo, sha):
         fetch_label = f"git fetch --no-tags --quiet {remote} {sha}"
         try:
