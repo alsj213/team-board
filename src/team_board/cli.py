@@ -58,6 +58,24 @@
 - stdout 只有摘要（``gate:`` / ``card:`` / ``exit:`` / ``counts:`` /
   ``失败行（n/m，≤20）:`` / ``log:``），日志原文**不再打印一次**
 
+``verify-batch`` 子命令（按 patch-id 分组跑全套检查；契约见
+``/home/liu/project/tb-contracts/t_f4e71bd3.md``）：
+- 0：全部 unit PASS（或 ``--dry-run`` 下 plan 合法且分组成功）
+- 1：有任一 unit FAIL（组级检查失败打全组、unit 自检失败只打自己）
+- 2：参数或环境错误（``verifybatch.VerifyBatchError`` / ``OSError`` → stderr 恰一行
+  ``错误: …``、stdout 空、不冒 traceback；含 plan 文件读不到 / 不是合法 JSON /
+  ``units`` 为空或形态非法（``card`` / ``pr`` / ``head`` / ``checks``）/
+  ``base`` 解析不成提交 / 该 ``head`` 不在仓库里 / worktree 建不起来或删不掉 /
+  日志与账本写不进 / stdout 编码表示不了中文）
+- stdout **只回摘要**（每组 ``batch:`` 段 + ``  group: exit:`` + 每组 ``log:`` /
+  ``batch-json:``，以及 ``counts:``；solo 组多一行 ``degraded:``）；全量输出落
+  ``<log-dir>/batch-<batch_id>.log``、每组一份账本 ``<log-dir>/batch-<batch_id>.json``
+- ``--dry-run`` 只解析 plan + 分组：**不建 worktree、不跑检查、不写账本**，打印
+  ``若批量，今天 N 次验证可压成 M 次（下降 X%）`` 与每组一行
+  ``plan: b-xxx kind=… units=… heads=…``，rc0
+- 环境变量只用于定位 git：``--repo`` 默认当前目录；``--log-dir`` 默认 ``evidence``
+  （相对 CWD，不存在就建）；``--keep-worktrees`` 时保留临时 worktree 并把路径打进摘要
+
 ``push-guard`` 子命令（git pre-push 的判定本体，只读，不写任何东西）：
 - 0：放行（stdout 恰一行 ``push-guard: 放行 N 条 ref（checkout=…，HEAD=…）``）；
   给 ``--check-install`` 时表示 pre-push 钩子已装好
@@ -196,6 +214,7 @@ from . import (
     prclaim,
     pushguard,
     reviewhead,
+    verifybatch,
     web,
 )
 from .model import DEFAULT_DB
@@ -327,6 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
     - ``merge-owner-audit``：稽核卡上 PR 的合并归属（0 有归属或无 PR / 1 有无归属 PR /
       2 参数或环境错误），吃位置参数 ``card`` / ``--db`` / ``--repo`` / ``--timeout`` /
       ``--log-dir``，**只读**（发 ``gh pr view``，降级只写日志）；
+    - ``verify-batch``：按 patch-id 分组跑全套检查（0 全 PASS / 1 有 FAIL / 2 参数或
+      环境错误），吃 ``--plan`` / ``--repo`` / ``--dry-run`` / ``--log-dir`` /
+      ``--keep-worktrees``；stdout 只回摘要，全量输出落
+      ``<log-dir>/batch-<batch_id>.log``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -907,6 +930,52 @@ def build_parser() -> argparse.ArgumentParser:
         default="evidence",
         metavar="DIR",
         help="降级日志目录（默认 evidence，不存在自动建）",
+    )
+
+    vb_cmd = subparsers.add_parser(
+        "verify-batch",
+        help=(
+            "按 patch-id 分组跑全套检查，stdout 只回摘要"
+            "（0 全 PASS / 1 有 FAIL / 2 参数或环境错误）"
+        ),
+    )
+    vb_cmd.add_argument(
+        "--plan",
+        required=True,
+        default=None,
+        metavar="PATH",
+        help=(
+            "plan JSON 路径（契约 §1：``base`` / ``group_checks`` / ``units``；"
+            "不合法一律 rc2）"
+        ),
+    )
+    vb_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="要跑检查的 git 仓库路径（默认当前目录）",
+    )
+    vb_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "只解析 plan + 分组：不建 worktree、不跑检查、不写批次账本，"
+            "只打印压缩率与每组一行 plan"
+        ),
+    )
+    vb_cmd.add_argument(
+        "--log-dir",
+        default=gatelog.LOG_DIR_DEFAULT,
+        metavar="DIR",
+        help=(
+            f"日志与批次账本目录（默认 {gatelog.LOG_DIR_DEFAULT}，相对当前目录；"
+            "不存在就建）"
+        ),
+    )
+    vb_cmd.add_argument(
+        "--keep-worktrees",
+        action="store_true",
+        help="跑完不删临时 worktree，路径打进摘要（默认删掉）",
     )
 
     serve = subparsers.add_parser(
@@ -1646,6 +1715,103 @@ def _run_gate(args: argparse.Namespace) -> int:
     return rc
 
 
+def _verify_batch_dry_run_text(
+    repo: str,
+    plan: verifybatch.Plan,
+    groups: tuple[verifybatch.Group, ...],
+) -> str:
+    """``--dry-run`` 的 stdout 文本（契约 §4，不带尾随换行）。
+
+    第一行是压缩率：``N`` = plan 的 unit 总数、``M`` = 组数、``X`` = ``(N-M)/N`` 的百分比
+    （一位小数，§4 的 ``下降 50.0%``）。
+
+    之后每组一行 ``plan: b-xxx kind=… units=… heads=…``。``heads`` 按组内 unit 的
+    **既有排序**（§3.5：``(card, pr)`` 升序）逐个取 7 位短 sha —— ``Group`` 只携带组级
+    落点 ``head_sha``（首 unit 那个），同 patch 双胞胎的 head 各不相同，只能逐个
+    :func:`verifybatch.resolve_head` 再取。排序由 ``build_groups`` 保证，所以同一份
+    plan、同一份仓库状态两次输出逐字相同（§0 D6）。
+
+    这里**不做任何写操作**：不建 worktree、不跑检查、不落账本（§4 的 ``--dry-run``）。
+    ``resolve_head`` 失败照旧 ``VerifyBatchError``（调用点转 rc2）。
+    """
+
+    total = len(plan.units)
+    compressed = len(groups)
+    # units 已由 load_plan 校验为非空，total >= 1，不会除零
+    ratio = (total - compressed) * 100.0 / total
+    lines = [f"若批量，今天 {total} 次验证可压成 {compressed} 次（下降 {ratio:.1f}%）"]
+    for group in groups:
+        heads = [
+            verifybatch.resolve_head(repo, unit.head)[: verifybatch.SHORT_SHA_LEN]
+            for unit in group.units
+        ]
+        lines.append(
+            f"plan: {group.batch_id} kind={group.kind} units={len(group.units)} "
+            f"heads={','.join(heads)}"
+        )
+    return "\n".join(lines)
+
+
+def _run_verify_batch(args: argparse.Namespace) -> int:
+    """``verify-batch`` 子命令：分组 → 每组跑一次全套 → stdout 只回摘要。
+
+    退出码（契约 §4）：**0** 全部 PASS / **1** 有任一 unit FAIL / **2** 参数或环境错误。
+
+    三个顺序上的硬约束，都是为了「rc2 一律 stdout 0 字节」：
+
+    1. 先 ``load_plan`` + ``build_groups``（``--dry-run`` 到此为止），plan 不合法、
+       base/head 解析不成提交都在打印之前失败；
+    2. 真跑时先 ``run_groups`` 再 ``write_batch_json``，两者都成功才拼摘要 —— 账本写不进去
+       也要 rc2 且 stdout 空（摘要里的 ``batch-json:`` 行恒指向已经存在的文件）；
+    3. 摘要整块 :func:`_write_stdout` 一次写出（编码表示不了中文 → rc2，一个字节都不落）。
+
+    ``--dry-run`` 的 ``plan:`` 行要做 :func:`verifybatch.resolve_head`，所以放在同一个
+    ``try`` 里：组都分完了还解析不出 head 只能是环境问题，照样 rc2 一行。
+    """
+
+    try:
+        plan = verifybatch.load_plan(args.plan)
+        groups = verifybatch.build_groups(args.repo, plan)
+    except verifybatch.VerifyBatchError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    if args.dry_run:
+        try:
+            text = _verify_batch_dry_run_text(args.repo, plan, groups)
+        except verifybatch.VerifyBatchError as exc:
+            _write_stderr_error(str(exc))
+            return 2
+        if not _write_stdout(text + "\n"):
+            return 2
+        return 0
+
+    try:
+        runs = verifybatch.run_groups(
+            args.repo,
+            groups,
+            log_dir=args.log_dir,
+            group_checks=plan.group_checks,
+            keep_worktrees=args.keep_worktrees,
+        )
+        verifybatch.write_batch_json(args.log_dir, runs, base=plan.base)
+    except verifybatch.VerifyBatchError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    except OSError as exc:
+        # 账本/日志目录落在只读盘、磁盘满等：环境级错误，不是「有 FAIL」
+        _write_stderr_error(f"写批次账本失败: {exc}")
+        return 2
+
+    text = verifybatch.render_summary(runs, batch_dir=args.log_dir)
+    if not _write_stdout(text + "\n"):
+        return 2
+    # 判定只看 unit（§0 D3）：组级失败已把该组每个 unit 打成 FAIL，不需要再看 group_rc
+    if any(result.verdict != verifybatch.VERDICT_PASS for run in runs for result in run.results):
+        return 1
+    return 0
+
+
 def _run_output_audit(args: argparse.Namespace) -> int:
     """``output-audit`` 子命令：读失败一律 stderr 一行 ``错误: …`` + rc2。
 
@@ -2259,6 +2425,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "merge-owner-audit":
         return _run_merge_owner_audit(args)
+
+    if args.command == "verify-batch":
+        return _run_verify_batch(args)
 
     if args.command == "serve":
         return _run_serve(args)
