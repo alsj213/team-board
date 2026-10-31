@@ -50,6 +50,7 @@ EXPECTED_SUBCOMMANDS = (
     "pr-review-head-audit",
     "evidence",
     "merge-owner-audit",
+    "verify-batch",
     "serve",
 )
 
@@ -68,6 +69,7 @@ CN_DIGITS = {
     15: "十五",
     16: "十六",
     17: "十七",
+    18: "十八",
 }
 
 
