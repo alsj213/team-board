@@ -29,27 +29,43 @@ FIRST_CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$")
 - 比 `CLAIM_RE`（正文任意顶格行）**同形态、更严**，不会更宽 —— 首行过了，后面的
   唯一性判定一定也认它（`merge_guard` 认认领行只看 `CLAIM_RE`）。
 
-### 与内核建卡闸门的差异集（恰好 4 种形态）
+### 与内核建卡闸门的差异集（4 类形态，字符级变体 20+ 种）
 
-内核 `_validate_pr_claim` 取首行用 `ln.strip()` + `str.splitlines()`（缩进 / tab /
-CRLF / 行尾空格都放行）；本仓 `first_line()` **不 strip、按 `\n` 切**。于是：
+内核 `_validate_pr_claim` 取首行用 `ln.strip()` + `str.splitlines()`；本仓 `first_line()`
+**不 strip、按 `\n` 切**。内核对首行做的两件事各带来一批差异，归成 **4 类**：
 
-| 首行形态 | 内核建卡 | `--gaps` 稽核 | 为什么稽核判死 |
-| --- | --- | --- | --- |
-| `··PR-CLAIM: #47`（前导空格） | ACCEPT | GAP | `CLAIM_RE` 只认顶格行，`merge_guard` 不认它 |
-| `\tPR-CLAIM: #47` | ACCEPT | GAP | 同上 |
-| `PR-CLAIM: #47\r`（CRLF） | ACCEPT | GAP | `\r` 是尾随字符 |
-| `PR-CLAIM: #47·`（行尾空格） | ACCEPT | GAP | 尾随字符 |
+| 类 | 字符级变体（同一类的不同字符） | 首行形态示例 | 内核建卡 | `--gaps` 稽核 |
+| --- | --- | --- | --- | --- |
+| 前导空白 | 空格、tab、NBSP(U+00A0)、VT(`\x0b`)、FF(`\x0c`)、FS(`\x1c`)、U+2028、U+2029、U+3000、CR —— `strip()` 全吃掉 | `··PR-CLAIM: #47` | ACCEPT | GAP |
+| 行尾空白 | 空格、tab、NBSP、U+3000、VT、FF、FS、U+2028、U+2029、CR（真在行尾时）—— 同样是 `strip()` 吃掉的 | `PR-CLAIM: #47·` | ACCEPT | GAP |
+| CRLF 行尾 | `\r\n`（行尾是 `\r`） | `PR-CLAIM: #47\r` | ACCEPT | GAP |
+| 其它换行符 | `\r`（单独）、`\v`、`\f`、`\x1c`、`\u2028`、`\u2029` —— `splitlines()` 在**这些字符处也断行**，本仓只认 `\n` | `PR-CLAIM: #47\r目标` | ACCEPT | GAP |
+
+前两类来自 `strip()`；后两类来自 `splitlines()` 与本仓 `split("\n")` 的差别。
+每类为什么稽核判死：`CLAIM_RE`（`merge_guard` 认认领行时只看它）要求**顶格、行尾无
+尾随字符**，上面这些首行在它眼里都不是认领行（`\r` / 尾随空白 / 前导空白全不认）。
 
 方向是刻意选的：放宽成「mirror 内核」会造出**反向缺口** —— 稽核通过、`merge_guard`
-却拒绝合并；而建卡时被放过的这 4 种形态，补一行顶格认领行即可闭合。差异集钉在
-`tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin`（内联期望表：多一条少一条
-都会红）。**那张表只钉本仓一侧**，不 import 内核 —— 表里「内核建卡」列是写死的期望
-字符串，内核侧改成同样严格它不会自己红。内核侧由同一文件的
-`TestKernelLiveComparison` 复核：找得到内核源码（环境变量 `HERMES_KERNEL_KANBAN_DB`，
-否则默认 `~/.hermes/hermes-agent/hermes_cli/kanban_db.py`）时 exec 内核那两条正则与
-`_validate_pr_claim`，逐条与「内核建卡」列比对，并断言两条正则文本与本仓逐字相同；
-找不到内核源码就 `skip`（CI runner 上没有 Hermes 源码，本仓 CI 不依赖它）。
+却拒绝合并；而建卡时被放过的这些形态，补一行顶格认领行即可闭合。**反向缺口实测 0 条**
+（内核 REJECT / 本仓 OK 的形态一个都没有）：本仓只可能更严，不会更宽。
+
+字符级变体钉在 `tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin` 的 `TABLE`
+（内联期望表：表里多一条差异而没归到 4 类之一、或归错类都会红）。**那张表只钉本仓一侧**，
+不 import 内核 —— 表里「内核建卡」列是写死的期望字符串，内核侧改成同样严格它不会自己红。
+本机实跑一份 28 形态探针（前导 10 种字符 + 行尾 9 种 + 8 种换行符）得到 22 种差异，
+全部落在上表 4 类里、方向全为「内核 ACCEPT / 本仓 GAP」，反向 0 条 ——
+**数字随探针矩阵变，判据是「4 类 + 方向唯一 + 反向 0」，不是这几个数**。
+
+内核侧由同一文件的 `TestKernelLiveComparison` 复核：**只认环境变量
+`HERMES_KERNEL_KANBAN_DB` 指向的 `kanban_db.py`**（不设默认路径 —— 全量 pytest 不许
+依赖仓库外的文件），设了且存在时 exec 内核那两条正则与 `_validate_pr_claim`，
+逐条与「内核建卡」列比对，并断言两条正则文本与本仓逐字相同；没设或指不到就 `skip`
+（CI runner 上没有 Hermes 源码，本仓 CI 不依赖它）。本机复跑：
+
+```bash
+HERMES_KERNEL_KANBAN_DB=~/.hermes/hermes-agent/hermes_cli/kanban_db.py \
+  PYTHONPATH=src python3 -m pytest tests/unit/test_prclaim_gaps.py -q
+```
 
 ## 3. 为什么只看标题前缀（实测依据）
 
@@ -110,8 +126,12 @@ PYTHONPATH=src python3 -m team_board.cli pr-claim-audit --pr 47 --db <看板.db>
 - `--gaps`：rc `0` 无缺口 / `1` 有缺口 / `2` 参数或读库错；
 - `--pr`：rc `0` 恰好一张卡认领 / `1` 无人认领或重复认领 / `2` 参数或环境错；
 - rc2 的 stderr 分两类，**都** stdout 零字节（报告整块在库读成功后才拼）：
-  - **运行期错误**（`--pr` 取值非法、读库失败：不存在 / 非 SQLite / 缺 `title` 列 /
-    无 `tasks` 表）→ stderr **恰一行**以 `错误: ` 开头，不冒 traceback；
+  - **运行期错误** → stderr **恰一行**以 `错误: ` 开头，不冒 traceback；
+    两种模式的公共部分：`--pr` 取值非法、读库失败（`--db` 不存在 / 非 SQLite /
+    打不开 / 无 `tasks` 表）；
+    **只属 `--gaps`**：「老库缺 `tasks.title` 列」—— `--pr` 路径不选该列，
+    同一个无 `title` 列的库它照旧 rc0/rc1（实测：`--pr 47` → rc0「认领唯一 → t_a」，
+    `--gaps` → rc2 `错误: 读取 tasks.title/body 失败: no such column: title`）；
   - **argparse 级错误**（`--pr` 与 `--gaps` 同给、两个都不给、未知参数）→ argparse
     原样 **2 行**：`usage: …` + `…: error: …`（全仓所有子命令同一形态）；
 - 两种模式都只读（`mode=ro`），绝不写库。
@@ -126,8 +146,10 @@ GAP <id> [<status>] <assignee> 触发=<hit> 首行=<first>
 ```
 
 `<hit>` 是命中的标题片段（`合并卡` / `收口卡` / `合并 PR #47` / `收口：`），
-`<first>` 是正文第一个非空行、截 40 字符后**控制字符转义显示**（`\r` / `\t` / `\xNN`）——
-`\r` 原样输出会把光标拉回行首、污染报告；转义只动渲染，不动判定。
+`<first>` 是正文第一个非空行、截 40 字符。**这一行的每一列**（`<id>` / `<status>` /
+`<assignee>` / `触发=` / `首行=`）都**控制字符转义显示**（`\r` / `\t` / `\xNN`）——
+`\r` 原样输出会把光标拉回行首、标题里的换行（`合并\nPR #5` 被 `\s*` 吃掉）会把一条
+GAP 撑成两条物理行、污染报告；转义只动渲染，不动判定。
 
 ## 5. 与内核建卡闸门（卡 `t_c6ab9672`）的关系
 
@@ -136,9 +158,10 @@ GAP <id> [<status>] <assignee> 触发=<hit> 首行=<first>
 - **触发谓词逐字相同**（§1 那两行 `re.compile`）：改一处必须同轮改另一处，否则
   「建卡时放过的卡稽核时报缺口」或「稽核认的卡建卡时被拦」；
 - **首行判据不同、方向固定**：`needs_claim` 两边一致；`first_claim_pr` 比内核严格
-  （内核 `strip()`，本仓不 strip），差异集就是 §2 那 4 种形态。两个测试都在
+  （内核 `strip()` + `splitlines()`，本仓不 strip、只按 `\n` 切），差异集就是 §2 那
+  4 类（字符级变体 20+ 种、方向恒为内核 ACCEPT / 本仓 GAP）。两个测试都在
   `tests/unit/test_prclaim_gaps.py`：`TestKernelDifferencePin` 钉**本仓一侧**（内联期望，
-  不读内核），`TestKernelLiveComparison`（有内核源码时，否则 skip）exec 内核那两条正则
-  与 `_validate_pr_claim` 逐条复核。改内核那一侧前先跑后者；
+  不读内核），`TestKernelLiveComparison`（设了 `HERMES_KERNEL_KANBAN_DB` 且文件存在时；
+  否则 skip）exec 内核那两条正则与 `_validate_pr_claim` 逐条复核。改内核那一侧前先跑后者；
 - 本仓这份是 `pr-claim-audit --gaps` 的唯一实现，不新增第二份判定（不加 allowlist、
   不改 CI job 顺序、不动 `merge_guard` 的认领闸门语义）。

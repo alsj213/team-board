@@ -10,7 +10,8 @@
 - ``needs_claim`` / ``first_claim_pr`` / ``audit_gaps`` / ``render_gaps``：
   ``pr-claim-audit --gaps`` 的缺口判据（标题命中合并语义、正文首行却不是
   ``PR-CLAIM: #<N>``）。触发谓词与内核建卡闸门逐字相同，**首行判据刻意更严**
-  （不 strip），差异集 4 种形态见 ``docs/pr-claim-gate.md`` 第 2 节。
+  （不 strip、按 ``\\n`` 切），差异集 4 类（缩进 / 行尾空白 / CRLF / 其它换行符，
+  字符级变体含 NBSP、VT、FF、``\\x1c``、U+2028 等）见 ``docs/pr-claim-gate.md`` 第 2 节。
 
 判定口径（照 R17 原文，一个字都不放宽）：
 
@@ -44,7 +45,8 @@ REF_RE = re.compile(r"^PR-REF: #([1-9][0-9]*)$", re.MULTILINE)
 TRIGGER_RE = re.compile(r"^(?:合并卡|收口卡|合并\s*PR\s*#\s*\d+|收口[：:（(])")
 
 #: 正文首行认领行（与 :data:`CLAIM_RE` 同形态，但**只判首行**且不做 MULTILINE。
-#: 刻意**不** ``strip()``：比内核建卡闸门更严，差异集 4 种形态钉在
+#: 刻意**不** ``strip()``、不用 ``str.splitlines()``：比内核建卡闸门更严，
+#: 差异集 4 类 / 字符级变体钉在
 #: ``tests/unit/test_prclaim_gaps.py`` 的 ``TestKernelDifferencePin``）
 FIRST_CLAIM_RE = re.compile(r"^PR-CLAIM: #([1-9][0-9]*)$")
 
@@ -163,9 +165,9 @@ def first_line(body: str | None) -> str:
 
     这是**刻意**比内核建卡闸门更严的地方（内核 ``_validate_pr_claim`` 用
     ``ln.strip()`` + ``str.splitlines()``）：稽核与 :data:`CLAIM_RE` 对齐，
-    因为 ``merge_guard`` 认认领行时只看 ``CLAIM_RE``。差异集恰好 4 种形态
-    （首行缩进 / tab / CRLF / 行尾空格），钉在
-    ``tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin``。
+    因为 ``merge_guard`` 认认领行时只看 ``CLAIM_RE``。差异集 4 类 —— 前导空白 /
+    行尾空白 / CRLF / 其它换行符（字符级变体含 NBSP、VT、FF、``\\x1c``、U+2028 等），
+    钉在 ``tests/unit/test_prclaim_gaps.py::TestKernelDifferencePin``。
     """
     if not body:
         return ""
@@ -339,12 +341,14 @@ def render_gaps(report: GapReport) -> str:
 
     三段、顺序固定：``未结卡 N 张`` → 逐张
     ``GAP <卡号> [status] assignee 触发=<hit> 首行=<first>`` → 末行结论。
-    ``<first>`` 经 :func:`visible` 转义控制字符后显示（判定不受影响）。
+    **五列全部**经 :func:`visible` 转义控制字符后显示（判定不受影响）：
+    ``hit`` 来自标题，标题里的换行（``合并\\nPR #5`` 会被 ``\\s*`` 吃掉）与
+    ``status`` / ``assignee`` 里的控制字符同样不能让一条 GAP 变成两条物理行。
     """
     lines = [f"未结卡 {report.pending} 张"]
     lines.extend(
-        f"GAP {row.id} [{row.status}] {row.assignee} 触发={row.hit} "
-        f"首行={visible(row.first)}"
+        f"GAP {visible(row.id)} [{visible(row.status)}] {visible(row.assignee)} "
+        f"触发={visible(row.hit)} 首行={visible(row.first)}"
         for row in report.gaps
     )
     if report.ok:

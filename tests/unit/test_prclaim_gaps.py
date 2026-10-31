@@ -9,7 +9,7 @@ import ast
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -179,6 +179,38 @@ class TestRenderGaps:
         assert line == r"GAP t_crlf [running] engineer 触发=合并卡 首行=PR-CLAIM: #47\r"
         assert "\r" not in line
 
+    def test_title_newline_does_not_split_the_gap_line(self) -> None:
+        """标题带换行（``合并\\nPR #5``）时，报告物理行数仍固定为 3 行。
+
+        ``TRIGGER_RE`` 里的 ``\\s*`` 会吃掉换行，``hit`` 于是带真换行；只转义
+        ``first`` 的话一条 GAP 会被撑成两条物理行，下游按行解析直接错位。
+        """
+        rows = [("t_nl", "running", "engineer", "合并\nPR #5 的收尾", "目标：…")]
+        report = prclaim.audit_gaps(rows)
+        assert report.gaps[0].hit == "合并\nPR #5"  # 判定侧保留原文
+        lines = prclaim.render_gaps(report).splitlines()
+        assert len(lines) == 3
+        assert lines[1] == (
+            r"GAP t_nl [running] engineer 触发=合并\x0aPR #5 首行=目标：…"
+        )
+
+    def test_other_columns_are_escaped_too(self) -> None:
+        """id / status / assignee 同样走 :func:`prclaim.visible`：任一列带控制字符都不许断行。"""
+        report = prclaim.GapReport(
+            pending=1,
+            gaps=(
+                prclaim.GapRow(
+                    id="t_a\x00", status="run\rning", assignee="engi\tneer",
+                    hit="合并卡", first="目标：…",
+                ),
+            ),
+        )
+        lines = prclaim.render_gaps(report).splitlines()
+        assert len(lines) == 3
+        assert lines[1] == (
+            r"GAP t_a\x00 [run\rning] engi\tneer 触发=合并卡 首行=目标：…"
+        )
+
     def test_visible_leaves_normal_text_alone(self) -> None:
         assert prclaim.visible("目标：…)") == "目标：…)"
         assert prclaim.visible("a\tb") == "a\\tb"
@@ -190,14 +222,22 @@ class TestKernelDifferencePin:
 
     内核 ``_validate_pr_claim`` 取首行用 ``ln.strip()`` + ``str.splitlines()``；
     本仓 :func:`prclaim.first_line` 不 strip、按 ``\\n`` 切（与 :data:`CLAIM_RE`
-    对齐，``merge_guard`` 也只看 ``CLAIM_RE``）。因此两边在**恰好 4 种形态**上
-    不同：首行缩进 / tab / CRLF / 行尾空格 —— 内核 ACCEPT，稽核报 GAP。
+    对齐，``merge_guard`` 也只看 ``CLAIM_RE``）。两边在 **4 类**形态上不同：
+
+    - 前导空白（``strip()`` 吃掉）：空格 / tab / NBSP / VT / FF / FS / U+2028 …
+    - 行尾空白（``strip()`` 吃掉）：空格 / tab / 上表各类空白
+    - CRLF 行尾（行尾是 ``\\r``）
+    - 其它换行符（``splitlines()`` 额外在这些字符处断行）：单独 ``\\r`` / ``\\v`` /
+      ``\\f`` / ``\\x1c`` / ``\\u2028`` / ``\\u2029``
+
+    每一类里的**字符级变体**都在 ``TABLE`` 里有代表行；方向恒为「内核 ACCEPT /
+    本仓 GAP」（:meth:`test_kernel_never_accepts_what_audit_rejects_interchangeably`）。
 
     本表**只钉本仓一侧**：表里「内核建卡」列是写死的期望字符串，**不 import 内核**，
     所以内核那边改成同样严格时这张表**不会**自己红（说它会红就是假话）。本仓改成
     mirror 内核、或稽核放宽/收紧，这张表才红，逼着同轮改 ``docs/pr-claim-gate.md``
-    §2/§5。内核侧的现行行为由 :class:`TestKernelLiveComparison` 在本机能找到内核
-    源码时 exec 核对（CI runner 上没有 Hermes 源码 → skip）。
+    §2/§5。内核侧的现行行为由 :class:`TestKernelLiveComparison` 在设了
+    ``HERMES_KERNEL_KANBAN_DB`` 时 exec 核对（CI runner 上没有 Hermes 源码 → skip）。
     """
 
     TITLE = "合并卡（pm）：k"
@@ -207,8 +247,13 @@ class TestKernelDifferencePin:
         ("正常", "PR-CLAIM: #47\n目标", "ACCEPT", "OK"),
         ("首行缩进", "  PR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
         ("首行 tab", "\tPR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
+        ("前导 NBSP", "\xa0PR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
+        ("前导 VT", "\x0bPR-CLAIM: #47\n目标", "ACCEPT", "GAP"),
         ("CRLF", "PR-CLAIM: #47\r\n目标", "ACCEPT", "GAP"),
         ("行尾空格", "PR-CLAIM: #47 \n目标", "ACCEPT", "GAP"),
+        ("行尾 tab", "PR-CLAIM: #47\t\n目标", "ACCEPT", "GAP"),
+        ("CR 断行", "PR-CLAIM: #47\r目标", "ACCEPT", "GAP"),
+        ("VT 断行", "PR-CLAIM: #47\x0b目标", "ACCEPT", "GAP"),
         ("行尾尾随文字", "PR-CLAIM: #47 我领了\n目标", "REJECT", "GAP"),
         ("冒号后缺空格", "PR-CLAIM:#47\n目标", "REJECT", "GAP"),
         ("#0", "PR-CLAIM: #0\n目标", "REJECT", "GAP"),
@@ -217,6 +262,21 @@ class TestKernelDifferencePin:
         ("第二行才有", "目标：…\nPR-CLAIM: #47", "REJECT", "GAP"),
         ("完全没有", "目标：…", "REJECT", "GAP"),
     )
+
+    #: 差异行名 → 所属类。4 类固定 = {前导空白, 行尾空白, CRLF, 其它换行符}。
+    #: ``test_diff_rows_are_exactly_the_four_classes`` 断言「差异行集合 = 本表键集合」
+    #: 且「类集合恰是 4 类」—— 表里新增一条差异却没归类、或归成第 5 类，都会红。
+    DIFF_CLASSES: ClassVar[dict[str, str]] = {
+        "首行缩进": "前导空白",
+        "首行 tab": "前导空白",
+        "前导 NBSP": "前导空白",
+        "前导 VT": "前导空白",
+        "行尾空格": "行尾空白",
+        "行尾 tab": "行尾空白",
+        "CRLF": "CRLF",
+        "CR 断行": "其它换行符",
+        "VT 断行": "其它换行符",
+    }
 
     @staticmethod
     def _audit(body: str) -> str:
@@ -227,9 +287,21 @@ class TestKernelDifferencePin:
         expected = {name: a for name, _b, _k, a in self.TABLE}
         assert actual == expected
 
-    def test_diff_set_is_exactly_the_four_stripped_forms(self) -> None:
+    def test_diff_rows_are_exactly_the_four_classes(self) -> None:
+        """差异行 == 归类表键集合，且只占 4 类（多一类 / 少一条差异都红）。"""
         diffs = [name for name, _b, k, a in self.TABLE if (k == "ACCEPT") != (a == "OK")]
-        assert diffs == ["首行缩进", "首行 tab", "CRLF", "行尾空格"]
+        assert sorted(self.DIFF_CLASSES) == sorted(diffs)
+        assert set(self.DIFF_CLASSES.values()) == {
+            "前导空白",
+            "行尾空白",
+            "CRLF",
+            "其它换行符",
+        }
+
+    def test_every_class_has_at_least_one_row(self) -> None:
+        """4 类都要有代表行：字符级变体是同一类的不同字符，不是新类。"""
+        for cls in {*self.DIFF_CLASSES.values()}:
+            assert [n for n, c in self.DIFF_CLASSES.items() if c == cls], cls
 
     def test_kernel_never_accepts_what_audit_rejects_interchangeably(self) -> None:
         """稽核只在「内核放过、我们判死」方向差 —— 没有反向差异（我们更宽）。"""
@@ -261,8 +333,6 @@ class TestKernelDifferencePin:
 
 # --------------------------------------------------------------------------- 内核实跑复核
 
-_KERNEL_DEFAULT = Path.home() / ".hermes" / "hermes-agent" / "hermes_cli" / "kanban_db.py"
-
 #: 从内核源码里只 exec 这几段（不 import ``hermes_cli``：CI 没装 Hermes）
 _KERNEL_NAMES = (
     "_PR_CLAIM_TRIGGER_RE",
@@ -273,11 +343,17 @@ _KERNEL_NAMES = (
 
 
 def _kernel_source_path() -> Path | None:
-    """内核 ``kanban_db.py`` 的位置：环境变量优先，否则 :data:`_KERNEL_DEFAULT`。"""
+    """内核 ``kanban_db.py`` 的位置 —— **只认** ``HERMES_KERNEL_KANBAN_DB``。
+
+    不设默认路径：默认指 ``~/.hermes/hermes-agent/...`` 会让全量 pytest 依赖**仓库外**
+    的文件 —— 换一台没装 Hermes 源码、或内核改了路径的机器上，这里会红成仓库自身的失败。
+    没设 / 指不到 → ``None`` → 整个类 skip（本仓 CI 不依赖它）。
+    """
     raw = os.environ.get("HERMES_KERNEL_KANBAN_DB", "").strip()
-    candidates = [Path(raw)] if raw else []
-    candidates.append(_KERNEL_DEFAULT)
-    return next((path for path in candidates if path.is_file()), None)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.is_file() else None
 
 
 def _load_kernel(path: Path) -> dict[str, Any]:
@@ -313,9 +389,10 @@ def _load_kernel(path: Path) -> dict[str, Any]:
 class TestKernelLiveComparison:
     """用**真内核源码**复核 :class:`TestKernelDifferencePin` 那张表的「内核建卡」列。
 
-    那张表的这一列是硬编码字符串，内核侧改动它不会自己红；本类在找得到内核
-    ``kanban_db.py`` 时 exec 两条正则与 ``_validate_pr_claim``，按真实内核重判每一行，
-    并断言两条正则文本与本仓逐字相同。找不到内核源码就整类 skip（CI 上就是这样）。
+    那张表的这一列是硬编码字符串，内核侧改动它不会自己红；本类在
+    ``HERMES_KERNEL_KANBAN_DB`` 指向的 ``kanban_db.py`` 存在时 exec 两条正则与
+    ``_validate_pr_claim``，按真实内核重判每一行，并断言两条正则文本与本仓逐字相同。
+    没设 / 指不到就整类 skip（CI 上就是这样；本仓不设默认路径，全量测试不依赖仓库外的文件）。
     """
 
     @staticmethod
