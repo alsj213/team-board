@@ -5,9 +5,10 @@
 > `ops/workspace/playbook.md` 的 R16 待 ops 同步 —— **本文件不是条文第二源**，两份冲突时
 > 以章程条文为准，本文件只负责「口径 + 实测 + 边界」。
 >
-> 两条腿的实现卡：建卡拦截 `t_1564c165`、全板扫描 `t_d3625ec7`（`body-audit` 子命令），
-> 固定段落红 / 1200B warn / 存量切点由 `t_7c17f775`（`cardtemplate.py`）与 `t_339b3d36`
-> （`body-audit` 扩容）落地；渲染本文件的卡是 `t_2f0b87d2`。模板见 [`docs/card-template.md`](card-template.md)。
+> 两条腿的实现卡：建卡拦截 `t_1564c165`、全板扫描 `t_d3625ec7`（`body-audit` 子命令）；
+> 渲染本文件的卡是 `t_2f0b87d2`。模板见 [`docs/card-template.md`](card-template.md)。
+> 模板 v3（五段骨架 + 固定段落锚点 + 目标 ≤800B）：[`docs/card-template.md`](card-template.md)；装到内核模板目录与漂移检查 `bash scripts/install-card-template.sh --check`（rc1 = 漂移或缺目标）——脚本已随 **#65** 合入；扫描判定 `cardtemplate.scan` 已随 #63 合入；默认落点须等于内核 `_card_template_path()` = `${HERMES_KANBAN_HOME:-$HOME/.hermes}/templates/card-template.md`（`~/.hermes` 实为 `get_default_hermes_root()`，另受 `HERMES_HOME` 影响；**不是** `~/.hermes/kanban/…`）；本 PR `#62` 合入后即可执行。
+> 固定段落红 / 1200B warn / 存量切点由 `t_7c17f775`（`cardtemplate.py`）与 `t_339b3d36`（`body-audit` 扩容）落地。
 
 ## 一、口径
 

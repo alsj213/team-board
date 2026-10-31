@@ -1012,15 +1012,16 @@ $ echo $?
 2
 ```
 
-条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（六段模板，
-`assignee=engineer` 的实现卡另加第 7 块「验收标准」；字节计数样例 834 字节，**只用于演示
-字节 vs 字符、不能当卡正文抄**）见
-[`docs/card-template.md`](docs/card-template.md)，第 7 块的闸门口径见
-[`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
+条文、六节说明与边界见 [`docs/card-limit.md`](docs/card-limit.md)；卡正文骨架（v3 五段骨架 +
+固定段落锚点 + 实测 650 字节样例，**样例只用于演示字节 vs 字符、不能当卡正文抄**）见
+[`docs/card-template.md`](docs/card-template.md)；实现卡的 `## 验收标准` 段与 `QA-SPEC: qa`
+签署闸门见 [`docs/qa-spec-gate.md`](docs/qa-spec-gate.md)。
 
-装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（默认 `${HERMES_KANBAN_HOME:-${HERMES_HOME:-$HOME/.hermes}}/templates/card-template.md`，`--dest` 覆盖；`--check` 只比 sha256、rc1 = 漂移或缺目标）。
-
-补：内核 `_card_template_path()` 优先 `$HERMES_CARD_TEMPLATE`（该文件存在时）；`--check` 目标是符号链接或非普通文件 → rc2；写入走 temp+rename，不毁旧文件。
+装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（默认
+`${HERMES_KANBAN_HOME:-${HERMES_HOME:-$HOME/.hermes}}/templates/card-template.md`，`--dest`
+覆盖；`--check` 只比 sha256，rc1 = 漂移或缺目标，rc2 = 符号链接 / 非普通文件）。内核
+`_card_template_path()` 优先 `$HERMES_CARD_TEMPLATE`（该文件存在时）；写入走 temp+rename，
+不毁旧文件。
 
 ## 闸门日志（gate）
 
