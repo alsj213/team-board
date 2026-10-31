@@ -1,15 +1,16 @@
-"""``verify-batch`` 的分组契约层：plan 校验 + head 解析 + patch-id 分组（E1）。
+"""``verify-batch`` 的契约层与执行层：分组（E1）+ 每组一次全套跑检查（E2）。
 
 口径唯一源是需求卡 ``t_f4e71bd3`` 冻结的契约 v1
-（``/home/liu/project/tb-contracts/t_f4e71bd3.md`` §1–§3、§8）。本模块只做**分组**：
+（``/home/liu/project/tb-contracts/t_f4e71bd3.md`` §1–§5、§8）。
 
-- ``load_plan`` —— 读 ``plan.json`` 并按 §1 的规则校验，不合法一律 :class:`VerifyBatchError`
-  （CLI 层转 rc2：stderr 恰一行 ``错误: …``、stdout 0 字节、零 traceback）；
-- ``resolve_head`` / ``patch_id`` —— 只调 git，不算别的东西；
-- ``batch_id_for`` / ``build_groups`` —— 纯逻辑（除 ``resolve_head`` / ``patch_id`` 两次 git 调用）。
+- E1（分组契约层）：``load_plan`` —— 读 ``plan.json`` 并按 §1 的规则校验，不合法一律
+  :class:`VerifyBatchError`（CLI 层转 rc2：stderr 恰一行 ``错误: …``、stdout 0 字节、零 traceback）；
+  ``resolve_head`` / ``patch_id`` —— 只调 git；``batch_id_for`` / ``build_groups`` —— 分组。
+- E2（执行层，§4）：``run_groups`` 每组一个临时 worktree、组级检查跑一次、unit 自检逐条跑，
+  日志落 ``<log_dir>/batch-<batch_id>.log``；``write_batch_json`` 每组一个账本（§5）；
+  ``render_summary`` 只回摘要、**不打印**任何原始输出（本模块也确实不 print —— 打印归 E3 的 CLI）。
 
-**本模块不跑检查、不建 worktree、不写日志、不 print**：``run_groups`` / ``write_batch_json`` /
-``render_summary`` / ``emit_commands`` 是 E2 及之后的卡的事，本卡（E1）只建分组契约层。
+没接 CLI 的边界（E3 的活）：本模块不做 argparse、不决定 rc0/1/2、不打 ``--dry-run`` 的压缩率行。
 
 三条容易写错的契约点，写在这里免得下游再猜：
 
@@ -32,14 +33,19 @@ import hashlib
 import json
 import os
 import re
+import shutil
 
-# bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git / _git_raw），
-# 调用形式为 argv 列表、shell=False，不拼 shell 字符串
+# bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git / _git_raw）与 plan 里的检查命令，
+# 调用形式一律 argv 列表、shell=False，不拼 shell 字符串
 import subprocess  # nosec B404
 import sys
+import tempfile
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from team_board import gatelog
 
 __all__ = [
     "CARD_RE",
@@ -51,15 +57,23 @@ __all__ = [
     "KIND_PATCH",
     "KIND_SOLO",
     "MAX_PR",
+    "SHORT_SHA_LEN",
+    "VERDICT_FAIL",
+    "VERDICT_PASS",
     "Group",
+    "GroupRun",
     "Plan",
     "Unit",
+    "UnitResult",
     "VerifyBatchError",
     "batch_id_for",
     "build_groups",
     "load_plan",
     "patch_id",
+    "render_summary",
     "resolve_head",
+    "run_groups",
+    "write_batch_json",
 ]
 
 #: 卡号：``t_`` + 8 位小写十六进制（与 ``branches.CARD_RE`` 同一口径，本卡不改别的文件）
@@ -81,6 +95,13 @@ DEFAULT_BASE = "origin/main"
 KIND_PATCH = "patch"
 KIND_HEAD = "head"
 KIND_SOLO = "solo"
+
+#: 逐 unit 的两种判定（§0 D3；只有这两种，没有「未知」）
+VERDICT_PASS = "PASS"  # nosec B105 —— 判定文案，不是口令
+VERDICT_FAIL = "FAIL"  # nosec B105 —— 同上，成对出现
+
+#: 摘要里的短 sha 宽度（§4 示例 ``head=af45471`` 是 7 位；固定宽度才与 ``git`` 配置无关、可复现）
+SHORT_SHA_LEN = 7
 
 #: ``group_checks`` 缺省值（§1）：与卡面示例同三条，但解释器用 ``sys.executable``
 DEFAULT_GROUP_CHECKS: tuple[tuple[str, ...], ...] = (
@@ -126,6 +147,46 @@ class Group:
     patch_id: str | None
     head_sha: str
     units: tuple[Unit, ...]
+
+
+@dataclass(frozen=True)
+class UnitResult:
+    """一个 unit 的判定（§0 D3）：组级失败打全组，unit 自检失败只打自己。
+
+    ``rc`` 是**导致这个 verdict 的**那次检查的退出码：PASS 恒 0；``failed_check`` 以 ``group:``
+    开头时是组级检查的 rc，以 ``unit:`` 开头时是该 unit 自己那条检查的 rc。
+    """
+
+    card: str
+    pr: int
+    head_sha: str
+    batch_id: str
+    verdict: str
+    rc: int
+    failed_check: str | None
+
+
+@dataclass(frozen=True)
+class GroupRun:
+    """一个组的执行结果。
+
+    前四个字段是契约 §2 逐字规定的；后三个是 E2 执行层不得已的扩展（都带缺省值，
+    用契约的四参数构造仍然成立）：
+
+    - ``worktree``：``--keep-worktrees`` 时保留的临时 worktree 绝对路径，删掉时为 ``None``，
+      否则 §4「保留并打进摘要」无处取路径；
+    - ``failed_lines`` / ``failed_total``：日志里按 :mod:`team_board.gatelog` 口径挑出的失败行
+      （已截断到 ≤20 行）与命中总数，供 :func:`render_summary` 做**纯函数**渲染 ——
+      否则渲染器得回读日志文件，摘要就依赖磁盘状态了。
+    """
+
+    group: Group
+    group_rc: int
+    log_path: str
+    results: tuple[UnitResult, ...]
+    worktree: str | None = None
+    failed_lines: tuple[str, ...] = ()
+    failed_total: int = 0
 
 
 # --------------------------------------------------------------------------- git 调用
@@ -586,3 +647,357 @@ def build_groups(repo: str | os.PathLike[str], plan: Plan) -> tuple[Group, ...]:
 
     groups.sort(key=lambda group: (group.kind, group.key))
     return tuple(groups)
+
+
+# --------------------------------------------------------------------------- 执行层（§4、§5）
+#
+# 判定规则（§0 D3，一个字都不许改）：
+#   组级检查任一 rc≠0 → 该组**每个** unit 都 FAIL，failed_check = ``group:<argv>``；
+#   unit 自检任一 rc≠0 → **只有该 unit** FAIL，failed_check = ``unit:<argv>``，同组其它 unit 不受影响；
+#   组内一个 unit 失败不影响别的 unit。所以「一个 PR 红、其余绿」靠 unit 自检，不靠组级检查。
+
+
+#: 账本 / 日志文件名里的 batch_id 形态（``b-`` + 8 位小写十六进制，见 :func:`batch_id_for`）
+_BATCH_ID_RE = re.compile(r"^b-[0-9a-f]{8}$")
+
+
+def _check_batch_id(batch_id: object) -> str:
+    """``batch_id`` 要拼进文件名，落盘前先卡形态（同时拦住 ``../`` 之类的路径穿越）。"""
+
+    if not isinstance(batch_id, str) or not _BATCH_ID_RE.match(batch_id):
+        raise VerifyBatchError(f'batch_id 形态非法（须为 b-[0-9a-f]{{8}}）："{batch_id}"')
+    return batch_id
+
+
+def _short(sha: str) -> str:
+    """摘要里的短 sha（固定 7 位，与 ``git`` 的 abbrev 配置无关 → 可复现）。"""
+
+    return sha[:SHORT_SHA_LEN]
+
+
+def _log_path(log_dir: str | os.PathLike[str], batch_id: str) -> str:
+    return os.path.abspath(os.path.join(os.fspath(log_dir), f"batch-{_check_batch_id(batch_id)}.log"))
+
+
+def _batch_json_path(path_dir: str | os.PathLike[str], batch_id: str) -> str:
+    """账本路径；:func:`write_batch_json` 与 :func:`render_summary` 共用这一处命名。"""
+
+    return os.path.abspath(
+        os.path.join(os.fspath(path_dir), f"batch-{_check_batch_id(batch_id)}.json")
+    )
+
+
+def _ensure_dir(path: str | os.PathLike[str]) -> None:
+    try:
+        os.makedirs(os.fspath(path), exist_ok=True)
+    except OSError as exc:
+        raise VerifyBatchError(f"建不了目录 {os.fspath(path)}: {exc}") from exc
+
+
+def _write_text(path: str, text: str) -> None:
+    """写文本文件（UTF-8、``\\n`` 换行、末尾保证一个换行）；失败 → ``VerifyBatchError``（rc2）。"""
+
+    payload = text if text.endswith("\n") else text + "\n"
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        raise VerifyBatchError(f"写不进文件 {path}: {exc}") from exc
+
+
+def _worktree_add(repo: str | os.PathLike[str], worktree: Path, head_sha: str) -> None:
+    """``git worktree add --detach <worktree> <head_sha>``；失败 → ``VerifyBatchError``（rc2）。"""
+
+    proc = _git(repo, "worktree", "add", "--detach", os.fspath(worktree), head_sha)
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = lines[-1] if lines else f"退出码 {proc.returncode}"
+        raise VerifyBatchError(f"worktree 建不起来（{worktree}）: {tail}")
+
+
+def _worktree_remove(repo: str | os.PathLike[str], worktree: Path) -> None:
+    """``git worktree remove --force <worktree>``；失败 → ``VerifyBatchError``。"""
+
+    proc = _git(repo, "worktree", "remove", "--force", os.fspath(worktree))
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = lines[-1] if lines else f"退出码 {proc.returncode}"
+        raise VerifyBatchError(f"worktree 删不掉（{worktree}）: {tail}")
+
+
+def _run_check(
+    argv: Sequence[str], worktree: Path, pieces: list[str], *, label: str
+) -> int:
+    """在 ``worktree`` 里跑一条检查（argv 列表、``shell=False``），原始输出追加进 ``pieces``。
+
+    返回子进程 rc。可执行文件不存在 → 127、其它 ``OSError`` → 126，都只记进日志，
+    不抛异常（一条坏命令不该把整批打成 rc2 —— 它是「这条检查失败」，判定归 D3）。
+    """
+
+    pieces.append(f"--- {label}: {' '.join(argv)}  (cwd={worktree}) ---")
+    try:
+        # bandit B603/B607 假阳性：argv 来自 plan（非空字符串数组、不经 shell），
+        # 可执行文件名由 plan 给全（通常是 sys.executable 或工具名，走 PATH 与逐卡验证一致）
+        proc = subprocess.run(  # nosec B603 B607
+            list(argv),
+            cwd=os.fspath(worktree),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=_git_env(),
+        )
+    except FileNotFoundError:
+        pieces.append(f"<无法执行：找不到可执行文件 {argv[0]}>")
+        pieces.append(f"--- {label}: rc=127 ---")
+        return 127
+    except OSError as exc:
+        pieces.append(f"<无法执行: {exc}>")
+        pieces.append(f"--- {label}: rc=126 ---")
+        return 126
+
+    raw = (proc.stdout or "") + (proc.stderr or "")
+    if raw:
+        pieces.append(raw.rstrip("\n"))
+    pieces.append(f"--- {label}: rc={proc.returncode} ---")
+    return proc.returncode
+
+
+def _digest(text: str) -> tuple[tuple[str, ...], int]:
+    """失败行摘要：``(≤20 条已列行, 第一轮命中总数)``。
+
+    直接复用 :mod:`team_board.gatelog` 的选行实现（本仓失败行口径的唯一来源）——
+    跨模块取私有名这件事是刻意的：另写一份就等于两个口径。
+
+    只认第一轮（含 ``FAILED`` / ``ERROR`` / ``error:`` / ``错误:`` / ``Traceback`` / 行首 ``E   `` 的行）；
+    gatelog 里「第一轮零命中就退回末尾 N 行」的兜底在这里**不用** —— 那是把原始输出搬上 stdout
+    （§4 要求 stdout 只回摘要），零命中就老老实实 ``0/0``，细节看日志。
+    """
+
+    shown, from_first_round, total = gatelog._select(text, gatelog.FAIL_LINE_LIMIT)
+    if not from_first_round:
+        return (), 0
+    return tuple(shown), total
+
+
+def run_groups(
+    repo: str | os.PathLike[str],
+    groups: Sequence[Group],
+    *,
+    log_dir: str | os.PathLike[str] = gatelog.LOG_DIR_DEFAULT,
+    group_checks: Sequence[Sequence[str]] = (),
+    keep_worktrees: bool = False,
+) -> tuple[GroupRun, ...]:
+    """逐组执行（§4）：每组一个临时 worktree → 组级检查跑一次 → unit 自检逐条跑。
+
+    参数（契约 §2 的 ``run_groups(repo, groups, *, log_dir)`` 之外，那两个关键字参数是
+    **必须**的补充，否则 E3 无法接线）：
+
+    - ``group_checks``：plan 的 ``group_checks``（§4「组级检查 = plan 的 group_checks」）。
+      契约的 ``Group`` 不携带检查命令，只能由调用方传进来；缺省 = 不跑组级检查。
+    - ``keep_worktrees``：``--keep-worktrees`` 时不删临时 worktree，路径进 :class:`GroupRun`
+      并由 :func:`render_summary` 打进摘要。
+
+    行为细节：
+
+    - 组级检查**全部跑完**（任一失败也继续跑后面的），``group_rc`` 记第一条非 0 的 rc ——
+      为了诊断，不是为了「整批绿」；
+    - unit 自检在该 unit **所属组的** worktree 里跑（§4）；组级已失败时 unit 自检仍跑（日志留证），
+      但判定按 D3 一律 FAIL、``failed_check`` 报组级那条；
+    - 全量输出按写入顺序进 ``<log_dir>/batch-<batch_id>.log``；返回 :class:`GroupRun` 只带摘要，
+      调用方拿它渲染 stdout（原始输出不上 stdout）。
+
+    环境级失败一律 :class:`VerifyBatchError`（CLI 层 rc2）：建不了日志目录、worktree 建不起来 /
+    删不掉、日志写不进、``batch_id`` 形态非法。
+    """
+
+    checks = tuple(tuple(argv) for argv in group_checks)
+    _ensure_dir(log_dir)
+    tmp_root = Path(tempfile.mkdtemp(prefix="verify-batch-"))
+    runs: list[GroupRun] = []
+    try:
+        for group in groups:
+            _check_batch_id(group.batch_id)
+            worktree = tmp_root / f"vb-{group.batch_id}"
+            _worktree_add(repo, worktree, group.head_sha)
+
+            pieces = [
+                f"===== batch {group.batch_id} kind={group.kind} key={group.key} "
+                f"head={group.head_sha} units={len(group.units)} ====="
+            ]
+            group_rc = 0
+            group_failed: tuple[str, ...] | None = None
+            results: list[UnitResult] = []
+            removal_error: VerifyBatchError | None = None
+            try:
+                for argv in checks:
+                    rc = _run_check(argv, worktree, pieces, label="group")
+                    if rc != 0 and group_failed is None:
+                        group_rc, group_failed = rc, argv
+
+                for unit in group.units:
+                    head_sha = resolve_head(repo, unit.head)
+                    unit_rc = 0
+                    unit_failed: tuple[str, ...] | None = None
+                    for argv in unit.checks:
+                        rc = _run_check(argv, worktree, pieces, label=f"unit {unit.card}")
+                        if rc != 0 and unit_failed is None:
+                            unit_rc, unit_failed = rc, argv
+
+                    if group_failed is not None:
+                        verdict, failed_check, final_rc = (
+                            VERDICT_FAIL,
+                            f"group:{' '.join(group_failed)}",
+                            group_rc,
+                        )
+                    elif unit_failed is not None:
+                        verdict, failed_check, final_rc = (
+                            VERDICT_FAIL,
+                            f"unit:{' '.join(unit_failed)}",
+                            unit_rc,
+                        )
+                    else:
+                        verdict, failed_check, final_rc = VERDICT_PASS, None, 0
+
+                    results.append(
+                        UnitResult(
+                            card=unit.card,
+                            pr=unit.pr,
+                            head_sha=head_sha,
+                            batch_id=group.batch_id,
+                            verdict=verdict,
+                            rc=final_rc,
+                            failed_check=failed_check,
+                        )
+                    )
+            finally:
+                if not keep_worktrees:
+                    try:
+                        _worktree_remove(repo, worktree)
+                    except VerifyBatchError as exc:
+                        # 清理失败不许盖掉真正的失败原因：先记下，正常跑完再抛
+                        removal_error = exc
+            if removal_error is not None:
+                raise removal_error
+
+            log_path = _log_path(log_dir, group.batch_id)
+            log_text = "\n".join(pieces)
+            _write_text(log_path, log_text)
+            failed_lines, failed_total = _digest(log_text)
+
+            runs.append(
+                GroupRun(
+                    group=group,
+                    group_rc=group_rc,
+                    log_path=log_path,
+                    results=tuple(results),
+                    worktree=os.fspath(worktree) if keep_worktrees else None,
+                    failed_lines=failed_lines,
+                    failed_total=failed_total,
+                )
+            )
+    finally:
+        # 临时根目录只在「不保留」时整个删掉；保留时连目录一起留给 --keep-worktrees 的排查用
+        if not keep_worktrees:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+    return tuple(runs)
+
+
+def write_batch_json(
+    path_dir: str | os.PathLike[str],
+    runs: Sequence[GroupRun],
+    *,
+    base: str = DEFAULT_BASE,
+) -> tuple[str, ...]:
+    """每组一个账本 ``<path_dir>/batch-<batch_id>.json``（§5），返回写的文件绝对路径。
+
+    ``base`` 是 plan 的 base（§5 的 ``"base"`` 字段）：``GroupRun`` 不携带它，同 :func:`run_groups`
+    的 ``group_checks`` 一样由调用方补齐，缺省 ``origin/main``。
+
+    序列化口径：``sort_keys=True``、``ensure_ascii=False``、缩进 2、末尾换行；
+    ``created_at`` 取写盘那一刻的 epoch 秒 —— 除它之外，两次跑逐字相同（§0 D6）。
+    """
+
+    _ensure_dir(path_dir)
+    paths: list[str] = []
+    for run in runs:
+        path = _batch_json_path(path_dir, run.group.batch_id)
+        payload = {
+            "batch_id": run.group.batch_id,
+            "kind": run.group.kind,
+            "key": run.group.key,
+            "base": base,
+            "head_sha": run.group.head_sha,
+            "created_at": int(time.time()),
+            "group_rc": run.group_rc,
+            "units": [
+                {
+                    "card": result.card,
+                    "pr": result.pr,
+                    "head_sha": result.head_sha,
+                    "verdict": result.verdict,
+                    "rc": result.rc,
+                    "failed_check": result.failed_check,
+                    "log": run.log_path,
+                }
+                for result in run.results
+            ],
+        }
+        _write_text(path, json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2))
+        paths.append(path)
+    return tuple(paths)
+
+
+def render_summary(
+    runs: Sequence[GroupRun], *, batch_dir: str | os.PathLike[str] = gatelog.LOG_DIR_DEFAULT
+) -> str:
+    """渲染 stdout 摘要（§4，不带尾随换行）：**只有摘要行，没有一行原始输出**。
+
+    结构：每组一段（``batch:`` / ``  group: exit: … 失败行（n/m，≤20）:`` / 若干 ``  unit:`` 行 /
+    solo 组的 ``degraded:`` 行 / 保留 worktree 时的 ``worktree:`` 行），然后一行 ``counts:``，
+    最后每个组一对 ``log:`` / ``batch-json:``。
+
+    ``batch_dir`` 必须与 :func:`write_batch_json` 的 ``path_dir`` 一致 —— 账本路径由
+    :func:`_batch_json_path` 同一处算出（契约不把账本路径放进 :class:`GroupRun`）。
+    """
+
+    lines: list[str] = []
+    groups_count = units_count = pass_count = fail_count = 0
+
+    for run in runs:
+        group = run.group
+        groups_count += 1
+        lines.append(
+            f"batch: {group.batch_id}  kind={group.kind}  head={_short(group.head_sha)}  "
+            f"units={len(group.units)}"
+        )
+        lines.append(
+            f"  group: exit:{run.group_rc}  "
+            f"失败行（{len(run.failed_lines)}/{run.failed_total}，≤{gatelog.FAIL_LINE_LIMIT}）:"
+        )
+        lines.extend(f"    {line}" for line in run.failed_lines)
+        for result in run.results:
+            units_count += 1
+            if result.verdict == VERDICT_PASS:
+                pass_count += 1
+            else:
+                fail_count += 1
+            lines.append(
+                f"  unit: {result.card} pr={result.pr} verdict={result.verdict}  "
+                f"failed_check={result.failed_check or '-'}"
+            )
+        # §0 D4 / pm 2026-10-31 口径：degraded 只在 solo（= 组内 unit 数 <2）时打，
+        # 不按「patch_id 为 None」判
+        if group.kind == KIND_SOLO and len(group.units) < 2:
+            lines.append(f"degraded: {group.batch_id} 单 unit 走逐卡流程")
+        if run.worktree:
+            lines.append(f"worktree: {run.worktree}")
+
+    lines.append(
+        f"counts: groups={groups_count} units={units_count} pass={pass_count} fail={fail_count}"
+    )
+    for run in runs:
+        lines.append(f"log: {run.log_path}")
+        lines.append(f"batch-json: {_batch_json_path(batch_dir, run.group.batch_id)}")
+    return "\n".join(lines)
