@@ -58,7 +58,9 @@
   `hermes_cli/kanban_db.py:2909`，不看段、不看 assignee）—— 段外随手写一行 `QA-SPEC: qa`
   虽然过不了建卡闸门，**照样把这张卡锁给 qa 收口**。所以别把签署行当注释写进别的段落。
 - 必填范围：**`assignee=engineer` 的实现卡必填** —— 缺段或缺签署行，内核建卡闸门直接拒
-  （rc=2，卡不落库）；其余 assignee（pm / qa / repo / ops，以及老板手写的需求卡）可选。
+  （rc=2，卡不落库；闸门代码目前只在本机 hermes-agent 的未提交工作区，**未合入上游**，
+  见 [`docs/qa-spec-gate.md`](qa-spec-gate.md) §0）；其余 assignee（pm / qa / repo / ops，以及
+  老板手写的需求卡）可选。
   反过来，正文带签署行的卡**只能由 qa 的 run 收口**：pm 的验收 run 只许
   `kanban_request_changes` / `kanban_comment`，不许 `complete`。
 - 谁写：qa 写、qa 签；pm 拆卡时转抄 qa 的结论，不代签。存量卡不追溯 —— 不补签、不改写、
