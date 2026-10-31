@@ -20,17 +20,32 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 | --- | --- | --- |
 | `--gate <名>` | 是 | 闸门名，日志文件名前缀。字母数字开头，其后字母数字与 `._-` |
 | `--card t_xxxxxxxx` | 是 | 卡号，日志文件名后缀。`t_` + 8 位小写十六进制 |
-| `--log-dir DIR` | 否 | 日志目录，默认 `evidence` |
+| `--log-dir DIR` | 否 | 日志目录，默认 `evidence`。**必须写在 `--` 之前** —— 写到后面会被当成子命令的参数（后果见下方硬约束） |
 | `--` 之后 | 否（**一律带上**） | 要执行的命令与参数，按列表 exec、**不经 shell** |
+
+**硬约束：所有 gate 选项（`--gate` / `--card` / `--log-dir`）必须写在 `--` 之前。**
+`--` 之后整段是按列表原样交给子命令的（`argparse.REMAINDER`），写在后面的选项**不会报错**，
+只会被静默吞成子命令的参数。位置一错，两条后果同时发生（2026-10-31 本卡 worktree 实测）：
+
+① `--log-dir` 形同没给：目录**不创建**，日志落回 **cwd 的 `evidence/`**。实测
+`gate --gate ord --card t_facc5c45 -- /bin/echo hi --log-dir <tmp>/should_not_exist` → rc0、
+`<tmp>/should_not_exist` 未创建、`log:` 是 `<cwd>/evidence/ord-t_facc5c45.log`、摘要末尾行带着
+`hi --log-dir <tmp>/should_not_exist` —— cwd 若是主 checkout，这正是前置第 3 条定义的假证据；
+② 真检查器多收一个未知参数，rc 变味：`pytest … --log-dir …` 实测 rc **4**（`unrecognized
+arguments`），ruff 同类 rc **2** —— 看着像「检查器失败」，实际是选项写错了位置。
+
+自查：摘要的 `--gate` / `--card` 值与 `log:` 路径对得上，且回显（末尾行）里**不含** `--log-dir`
+字样，才算位置对。
 
 `--` 之后为空 → rc2（`错误: 缺少要执行的命令（-- 之后至少一个）`）。
 
 `--` 严格说可省，但**一律带上**：首个 token 不像选项时 parser 直接把它当位置参数 —— 实测
 `gate --gate nosep --card t_facc5c45 --log-dir /tmp/gl472 /bin/echo hi` → 摘要齐全、rc0；
 首个 token **像选项**（`-q`、`--foo`）时会被**顶层** parser 吞掉，落的是顶层文案而不是
-`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行**（本卡树 253
-字节；主 checkout @ `21d40b9` 少了 `output-audit` 子命令 → 240 字节 —— 字节数随 usage 那一行的
-子命令列表变，**别拿它当判据**，判据只有「3 行 + 首末行原文」），
+`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行**（下面两个字节数
+**已过期，以当场输出为准**：写文档时本卡树 253 字节、主 checkout @ `21d40b9` 因少了 `output-audit` /
+`evidence` 子命令是 240 字节；2026-10-31 21:40 CST 同一命令在本卡树实测 **262 字节**，差额就是后来
+新增的子命令 —— 字节数随 usage 那一行的子命令列表变，**别拿它当判据**，判据只有「3 行 + 首末行原文」），
 首行 `usage: team-board [-h]`、末行 `team-board: error: unrecognized arguments: -q`、
 stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: error:`」的例外里）。
 
@@ -51,10 +66,14 @@ stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: er
    `…/team-board/src/team_board/gatelog.py`；外层 `…/tb-wt/t_facc5c45/src` →
    `…/tb-wt/t_facc5c45/src/team_board/gatelog.py`。
 2. **解释器写绝对路径**。`.venv` 在 checkout 根目录**不保证存在**：`t_eaa81611` 根目录就没有
-   （个别 worktree 有：2026-10-31 14:14 CST 当日实跑，`/home/liu/project/tb-wt` 下 41 个里 6 个有
-   `.venv`），所以下面外层跑 `gate` 与 `--` 之后跑检查器，
+   （个别 worktree 有：写文档时当日实跑 `/home/liu/project/tb-wt` 下 41 个里 6 个有 `.venv` ——
+   这两个数**已过期，以当场 `ls -d /home/liu/project/tb-wt/*/ | wc -l` 与
+   `ls -d /home/liu/project/tb-wt/*/.venv | wc -l` 为准**；2026-10-31 21:45 CST 复核是 47 个目录
+   里 6 个有），所以下面外层跑 `gate` 与 `--` 之后跑检查器，
    都用 `/home/liu/project/team-board/.venv/bin/python`。照抄 `.venv/bin/python` 在没有 `.venv`
-   的 checkout 里会得到 `No such file or directory`、rc=127（2026-10-31 实测）。
+   的 checkout 里会得到 `No such file or directory`、rc=127（2026-10-31 实测）。**rc=127 只属外层
+   shell**（解释器本身不存在，stderr 是 shell 自己那句 `…: No such file or directory`）；`--` 之后
+   的命令起不来是另一条路 —— gate 自己拦下，rc **2** + 恰一行 `错误: 启动失败：…`（§3）。
 3. **cwd = 本卡 worktree**，不是主 checkout。日志本身合法不代表验的是本卡：在主 checkout 里
    「把卡号换成自己的」跑出来的是主 checkout 的代码，本卡 diff 一行没验 —— 那是假证据。同理
    `--` 之后的检查器要用 `/usr/bin/env PYTHONPATH=<本卡 worktree>/src` 把 import 拉回本卡
@@ -78,14 +97,22 @@ stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: er
 把 `t_facc5c45` 换成自己那张卡的卡号、`cd` 换成本卡的 worktree，**三处一起换**（卡号、`cd`、
 `PYSRC`；只换卡号不改 cwd 就是前置第 3 条的假证据）。下面是 2026-10-31 14:14–14:17 CST 在**本卡
 worktree**`/home/liu/project/tb-wt/t_facc5c45` 里的同一轮本机实跑原文，摘要逐字照贴（`log:` 指向
-该 worktree 的 `evidence/`）。三个样例共用下面四行环境准备（`PYSRC` 写绝对路径，理由见前置第 4 条）：
+该 worktree 的 `evidence/`）。三个样例共用下面四行环境准备（`PYSRC` 写绝对路径，理由见前置第 4 条）。
+**这四行不带 `$` 提示符、注解全放在独立的 `#` 注释行里 —— 可以整块原样复制粘贴**
+（2026-10-31 实测：行尾带 `←` 注解时 `bash` 会 `export: '←': not a valid identifier`、`cd: too many
+arguments`，rc1，`PYTHONPATH` 压根没设上，后面三个样例就静默从 editable 的主 checkout import）：
 
 ```
-$ cd /home/liu/project/tb-wt/t_facc5c45                  ← 换成你自己卡的 worktree
-$ PY=/home/liu/project/team-board/.venv/bin/python
-$ PYSRC=/home/liu/project/tb-wt/t_facc5c45/src           ← 本卡树，绝对路径（别写相对的 src）
-$ export PYTHONPATH=$PYSRC                               ← 外层：gate 自己也从这棵树 import
+# 换成你自己卡的 worktree（绝对路径）
+cd /home/liu/project/tb-wt/t_facc5c45
+PY=/home/liu/project/team-board/.venv/bin/python
+# 本卡树的绝对路径：别写相对的 src（前置第 4 条）
+PYSRC=/home/liu/project/tb-wt/t_facc5c45/src
+# 外层：gate 自己也从这棵树 import
+export PYTHONPATH=$PYSRC
 ```
+
+下面三个样例块里的 `$ ` **只是提示符**，复制命令时别带上（`#` / `←` 一律不进命令行）。
 
 通过的 `pytest`：
 
@@ -207,7 +234,10 @@ $ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名
   `open(path, "w", encoding="utf-8", newline="\n")`（`team_board.gatelog.write_log`），上一轮的内容
   一个字都不留。想留痕就先把手上的摘要/日志另存，或者换个 `--gate` / `--log-dir` 让文件名不同；
   否则「上一轮通过、这一轮失败」只剩最后一次的现场，回看时连有没有过过都看不出来。
-- **`--log-dir DIR`**：换目录，创建规则同上；给了它就不再碰 `evidence/`。
+- **`--log-dir DIR`**：换目录，创建规则同上；给了它就不再碰 `evidence/` —— **前提是它写在 `--`
+  之前**。写到 `--` 之后会被 REMAINDER 吞进子命令参数：目录**不建**、日志落回 cwd 的 `evidence/`，
+  真检查器还会多收一个未知参数、rc 变成 4（pytest）/ 2（ruff）—— 看着像检查器失败（§1「硬约束」
+  有实测命令原文与两条后果）。
 - **名字形态在落盘之前校验**（唯一判据 `team_board.gatelog.log_filename`）：`--gate a/b`、
   空串、`--card t_XYZ` 一律 rc2 且**不产生文件** —— 路径分隔符必须在拼路径之前被拦住，
   否则一次 `--gate a/b` 就会在日志目录下造出子目录。
@@ -341,6 +371,12 @@ log: <日志文件的绝对路径>
    `/tmp/a1` 200144 字节 vs `/tmp/a1234567890` 200153 字节，目录名长 9 字节、摘要也长 9 字节；
    日志两次都是 200001 字节）。复跑以当场 `wc -c` 为准：
    先量再贴，摘要 `| wc -c` 超 8192 就只贴 `log:` 路径 + `sed -n '<a>,<b>p' <日志>` 取段；
+   **但接管道量字节会吞掉 rc**（`$?` 取的是管道最后一段 `wc` 的 rc，不是 gate 的）：实测
+   `gate … -- /bin/sh -c 'echo "1 failed"; exit 1' | wc -c` → 输出是摘要的字节数（当次 234，随
+   `log:` 路径长度变，别当判据）、`$?` = **0**，同一条不接管道 rc = **1**（2026-10-31 本卡
+   worktree）。所以**量字节与取 rc 分两次跑**：判定值取摘要的 `exit:` 或不接管道时的 `$?`，
+   字节数单独跑一条带管道的（或 `… > <文件> 2>&1; wc -c <文件>`），
+   别让 `| wc -c` 那一行的 rc 进卡 —— 那是把失败记成 PASS 的标准姿势；
 5. 同一条边界也管**评论 / `tasks.result` 本身**：UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
    全文贴法一超就违规。这一条由 `output-audit` 子命令**机器判定**（已合入 `main`，实现在
    `src/team_board/outputaudit.py`）：rc0 = 无超限 / rc1 = 有超限 / rc2 = 参数或环境错误；
