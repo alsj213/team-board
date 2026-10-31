@@ -28,50 +28,66 @@ python -m team_board.cli gate --gate <名> --card t_xxxxxxxx [--log-dir DIR] -- 
 `--` 严格说可省，但**一律带上**：首个 token 不像选项时 parser 直接把它当位置参数 —— 实测
 `gate --gate nosep --card t_facc5c45 --log-dir /tmp/gl472 /bin/echo hi` → 摘要齐全、rc0；
 首个 token **像选项**（`-q`、`--foo`）时会被**顶层** parser 吞掉，落的是顶层文案而不是
-`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行** 253 字节，
+`team-board gate:` —— 实测 `… --log-dir /tmp/gl472 -q true` → rc2、stderr **3 行 240 字节**，
 首行 `usage: team-board [-h]`、末行 `team-board: error: unrecognized arguments: -q`、
 stdout 0 字节、无日志（不落在 §3 那条「两行 `team-board gate: error:`」的例外里）。
 
 ### 前置：`gate` 只在含 PR #50 的树里；解释器写绝对路径；cwd 是本卡 worktree
 
-三条前置，缺一条样例都跑不通：
+四条前置，缺一条样例都跑不通：
 
 1. **`gate` 子命令只存在于含 PR #50 的树**（2026-10-31 CST 合入 `main`，merge `21d40b9`）。
    **不是「任何 checkout 都能跑」**：2026-10-31 在引入 `gatelog.py` 的那个提交之前（`00c523e^`，
    `git archive 00c523e^ | tar -x -C <dir>` 解出的树）实测
    `team-board: error: argument command: invalid choice: 'gate'`、rc2、无日志。自查：外层用
-   `PYTHONPATH=src <绝对解释器> -m team_board.cli gate --help`，rc=0 才继续；rc≠0 就把外层的
+   `PYTHONPATH=<树>/src <绝对解释器> -m team_board.cli gate --help`，rc=0 才继续；rc≠0 就把外层的
    `PYTHONPATH` 换成**含 gate 的树的绝对路径**（下面样例就是这么写的）。
+   **卡本身改 `gate` / `gatelog` / `cli` 时，外层 `PYTHONPATH` 必须指本卡树**（`<本卡 worktree>/src`
+   的绝对路径），否则 gate 自己那份实现是从 `main` 的树 import 的，摘要由旧实现渲染 —— 本卡
+   diff 一行没验。实测同一 worktree、只换外层 `PYTHONPATH` 跑同一个探针（`import team_board,
+   team_board.gatelog` 后打 `__file__`）：外层 `…/team-board/src` →
+   `…/team-board/src/team_board/gatelog.py`；外层 `…/tb-wt/t_facc5c45/src` →
+   `…/tb-wt/t_facc5c45/src/team_board/gatelog.py`。
 2. **解释器写绝对路径**。`.venv` 在 checkout 根目录**不保证存在**：`t_eaa81611` 根目录就没有
    （个别 worktree 有，2026-10-31 当日 29 个里 6 个），所以下面外层跑 `gate` 与 `--` 之后跑检查器，
    都用 `/home/liu/project/team-board/.venv/bin/python`。照抄 `.venv/bin/python` 在没有 `.venv`
    的 checkout 里会得到 `No such file or directory`、rc=127（2026-10-31 实测）。
 3. **cwd = 本卡 worktree**，不是主 checkout。日志本身合法不代表验的是本卡：在主 checkout 里
    「把卡号换成自己的」跑出来的是主 checkout 的代码，本卡 diff 一行没验 —— 那是假证据。同理
-   `--` 之后的检查器要用 `/usr/bin/env PYTHONPATH=src` 把 import 拉回本卡 worktree，否则外层
-   `PYTHONPATH` 的绝对路径会一路带下去，pytest 跑的仍是那棵树（同一 cwd 实测 `team_board.__file__`：
-   外层 `PYTHONPATH=/home/liu/project/team-board/src` → `…/team-board/src/team_board/__init__.py`；
-   加 `env PYTHONPATH=src` → `/home/liu/project/tb-wt/t_facc5c45/src/team_board/__init__.py`）。
+   `--` 之后的检查器要用 `/usr/bin/env PYTHONPATH=<本卡 worktree>/src` 把 import 拉回本卡
+   worktree，否则外层 `PYTHONPATH` 的绝对路径会一路带下去，pytest 跑的仍是那棵树（同一 cwd
+   实测 `team_board.__file__`：外层 `PYTHONPATH=/home/liu/project/team-board/src` →
+   `…/team-board/src/team_board/__init__.py`；加 `env PYTHONPATH=src` →
+   `/home/liu/project/tb-wt/t_facc5c45/src/team_board/__init__.py`）。
    `R21` 管的是建卡时的 `workspace_kind`，**不约束运行目录**；但样例 cwd 必须是**你自己那张卡**的
    worktree，借别人的 worktree 跑出来的日志不算本卡证据。
+4. **`PYTHONPATH` 一律写绝对路径**。相对 `src` 只在**仓库根**成立 —— 它是按 **cwd** 解析的，
+   不是按解释器所在的那棵树解析。cwd 一旦不在仓库根（子目录、`cd` 进 `docs/`、脚本里换了目录），
+   相对 `src` 会**静默**退到 `.venv` 里 editable 装的主 checkout：不报错、rc 照样 0。
+   实测同一 worktree 跑同一个 `which_tree` 探针（打完 `team_board.__init__` / `team_board.gatelog`
+   的 `__file__`）：`cwd=<worktree 根>` + `PYTHONPATH=src` → `…/tb-wt/t_facc5c45/src/team_board/__init__.py`；
+   `cwd=<worktree>/docs` + 同一个 `PYTHONPATH=src` → `…/team-board/src/team_board/__init__.py`
+   （**主 checkout**）；把值换成 `/home/liu/project/tb-wt/t_facc5c45/src` → 又回到本卡树。
+   所以样例统一用 `$PYSRC` 存绝对路径，不带相对的 `src`。
 
 ### 三个可复制样例（pytest / ruff / body-audit）
 
-把 `t_facc5c45` 换成自己那张卡的卡号、`cd` 换成本卡的 worktree，**两处一起换**（只换卡号不改
-cwd 就是前置第 3 条的假证据）。下面是 2026-10-31 CST 在**本卡 worktree**
+把 `t_facc5c45` 换成自己那张卡的卡号、`cd` 换成本卡的 worktree，**三处一起换**（卡号、`cd`、
+`PYSRC`；只换卡号不改 cwd 就是前置第 3 条的假证据）。下面是 2026-10-31 CST 在**本卡 worktree**
 `/home/liu/project/tb-wt/t_facc5c45` 里的本机实跑原文，摘要逐字照贴（`log:` 指向该 worktree
-的 `evidence/`）。三个样例共用下面三行环境准备：
+的 `evidence/`）。三个样例共用下面四行环境准备（`PYSRC` 写绝对路径，理由见前置第 4 条）：
 
 ```
-$ cd /home/liu/project/tb-wt/t_facc5c45                    ← 换成你自己卡的 worktree
+$ cd /home/liu/project/tb-wt/t_facc5c45                  ← 换成你自己卡的 worktree
 $ PY=/home/liu/project/team-board/.venv/bin/python
-$ export PYTHONPATH=/home/liu/project/team-board/src       ← 含 gate 的树；本卡分支已含 PR #50 时写 src
+$ PYSRC=/home/liu/project/tb-wt/t_facc5c45/src           ← 本卡树，绝对路径（别写相对的 src）
+$ export PYTHONPATH=$PYSRC                               ← 外层：gate 自己也从这棵树 import
 ```
 
 通过的 `pytest`：
 
 ```
-$ $PY -m team_board.cli gate --gate pytest --card t_facc5c45 -- /usr/bin/env PYTHONPATH=src $PY -m pytest tests/unit/test_gatelog.py -q
+$ $PY -m team_board.cli gate --gate pytest --card t_facc5c45 -- /usr/bin/env PYTHONPATH=$PYSRC $PY -m pytest tests/unit/test_gatelog.py -q
 gate: pytest
 card: t_facc5c45
 exit: 0
@@ -79,7 +95,7 @@ counts: passed=49 failed=0 error=0 skipped=0
 失败行（0/0，≤20）:
 末尾行（2/2，≤20）:
   .................................................                        [100%]
-  49 passed in 0.10s
+  49 passed in 14.03s
 log: /home/liu/project/tb-wt/t_facc5c45/evidence/pytest-t_facc5c45.log
 ```
 
@@ -90,7 +106,7 @@ log: /home/liu/project/tb-wt/t_facc5c45/evidence/pytest-t_facc5c45.log
 `counts: … error=2 …`、`末尾行（20/27，≤20）` 里带着 `Found 2 errors.`）：
 
 ```
-$ $PY -m team_board.cli gate --gate ruff --card t_facc5c45 -- /usr/bin/env PYTHONPATH=src $PY -m ruff check src tests
+$ $PY -m team_board.cli gate --gate ruff --card t_facc5c45 -- /usr/bin/env PYTHONPATH=$PYSRC $PY -m ruff check src tests
 gate: ruff
 card: t_facc5c45
 exit: 0
@@ -104,24 +120,24 @@ log: /home/liu/project/tb-wt/t_facc5c45/evidence/ruff-t_facc5c45.log
 `body-audit`（真板全量 `--all`；rc=1，见下方注）：
 
 ```
-$ $PY -m team_board.cli gate --gate body-audit --card t_facc5c45 -- /usr/bin/env PYTHONPATH=src $PY -m team_board.cli body-audit --all
+$ $PY -m team_board.cli gate --gate body-audit --card t_facc5c45 -- /usr/bin/env PYTHONPATH=$PYSRC $PY -m team_board.cli body-audit --all
 gate: body-audit
 card: t_facc5c45
 exit: 1
 counts: 未解析
 失败行（0/0，≤20）:
-末尾行（20/284，≤20）:
-    t_46b43968  done       pm         1090  ok
+末尾行（20/292，≤20）:
     t_9515987a  done       pm         1067  ok
     t_f51328fe  done       pm         1025  ok
     t_b42125ae  todo       pm         1014  ok
     t_e0866bd4  done       ops        1008  ok
     t_216a3cf7  done       qa          963  ok
-    t_a5b444fc  running    pm          959  ok
+    t_a5b444fc  running    qa          959  ok
     t_9abe2b3b  done       pm          951  ok
     t_f0a27fe4  done       pm          944  ok
     t_facc5c45  done       engineer    929  ok
     t_844fc961  done       pm          924  ok
+    t_472f2d63  done       engineer    876  ok
     t_341e9163  done       pm          874  ok
     t_5158a9e8  done       pm          861  ok
     t_bd5e3f2b  done       pm          773  ok
@@ -134,10 +150,10 @@ counts: 未解析
 log: /home/liu/project/tb-wt/t_facc5c45/evidence/body-audit-t_facc5c45.log
 ```
 
-注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算（当日 `合计：270 张；超限：142 张`）；
-**不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：当日 19 张、超限 0 张）时 rc=0 ——
+注：`exit: 1` 来自真板的**历史存量** —— `--all` 把已 `done` 的卡一起算（当日 `合计：278 张；超限：142 张`）；
+**不是**本文档 / 本卡造成。同一命令去掉 `--all`（只看未结卡：当日 18 张、超限 0 张）时 rc=0 ——
 两者都是 rc 原样透传。上面与这里的数字是 **2026-10-31 CST 当日快照**，真板卡数会漂移，复跑以当场输出为准。
-**别整行贴「超限清单」**：它是**单行**、随卡数线性增长（实测 142 张 = 1591 字节 ≈ 11.2 字节/卡），
+**别整行贴「超限清单」**：它是**单行**、随卡数线性增长（实测 142 张 = 1590 字节 ≈ 11.2 字节/卡），
 卡再多几百张就顶到 8192 的单条上限（§4 第 5 条）。卡上只贴到「末尾行」节，或把该行截成
 `超限清单（142 张）：t_f43fa954 …` 再给 `log:` 路径。
 
@@ -148,17 +164,28 @@ PR #50 之前的树，或还没把 `21d40b9` rebase 进来的 worktree，`gate` 
 用等价的纯 shell 写法落盘 —— 全量照旧进文件，只是摘要要自己补：
 
 ```
-$ cd /home/liu/project/tb-wt/t_xxxxxxxx          # 本卡 worktree
-$ env PYTHONPATH=src <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
+$ cd /home/liu/project/tb-wt/t_xxxxxxxx || { echo '错目录: 不是本卡 worktree' >&2; exit 2; }
+$ mkdir -p evidence
+$ env PYTHONPATH=/home/liu/project/tb-wt/t_xxxxxxxx/src <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
 ```
 
-`env PYTHONPATH=src` 这个前缀不是装饰：`.venv` 里 `team-board` 是**已安装**的、指主 checkout，
-而前置第 1 条又让你 `export PYTHONPATH=<含 gate 的树>/src`。少了前缀，pytest 跑的是主 checkout
-的代码 —— 本卡 diff 一行没验，rc 照样是 0，就是前置第 3 条说的假证据。同 cwd 实测
-`team_board.__file__`：沿用外层 `PYTHONPATH` → `/home/liu/project/team-board/src/team_board/__init__.py`；
-加 `env PYTHONPATH=src` → `/home/liu/project/tb-wt/t_facc5c45/src/team_board/__init__.py`。
-**别用 `unset PYTHONPATH` 代替**：实测 unset 之后 import 到的仍是
-`/home/liu/project/team-board/src/…`（editable 装的就是那棵树），一样验错树。
+三段都有用，别省：
+
+- **`cd … || { …; exit 2; }`**：`cd` 失败时用 `;` 接着跑，等于在**错的 cwd** 里跑检查器、日志也写进
+  错的目录，`rc=` 照样是 0 —— 假证据。实测 `cd /nonexistent && echo hi` → rc=2（shell 的，不是
+  检查器的）；`cd /nonexistent; echo hi > evidence/x.log` → **rc=0**（echo 成功，最危险的那种）。
+  `|| { … exit 2; }` 把「目录不对」与「检查器失败」分开：前者固定 2 且先打印错目录。
+- **`mkdir -p evidence`**：`evidence/` 不存在时 `> evidence/<名>-<卡号>.log` 的重定向本身失败，
+  shell 返回 2、检查器**根本没跑** —— 这个 2 会被当成检查器「有环境错误」。实测目标目录不存在
+  → rc=2 且无日志；先 `mkdir -p` → rc=0。
+- **`env PYTHONPATH=<本卡 worktree>/src` 这个前缀不是装饰**（写绝对路径，理由见前置第 4 条）：
+  `.venv` 里 `team-board` 是**已安装**的、指主 checkout，而前置第 1 条又让你
+  `export PYTHONPATH=<含 gate 的树>/src`。少了前缀，pytest 跑的是主 checkout 的代码 —— 本卡
+  diff 一行没验，rc 照样是 0，就是前置第 3 条说的假证据。同 cwd 实测 `team_board.__file__`：
+  沿用外层 `PYTHONPATH` → `/home/liu/project/team-board/src/team_board/__init__.py`；
+  加 `env PYTHONPATH=src` → `/home/liu/project/tb-wt/t_facc5c45/src/team_board/__init__.py`。
+  **别用 `unset PYTHONPATH` 代替**：实测 unset 之后 import 到的仍是
+  `/home/liu/project/team-board/src/…`（editable 装的就是那棵树），一样验错树。
 
 `$?` 是被包装命令自己的 rc（2026-10-31 实测 `/bin/sh -c 'exit 1'` → `rc=1`，日志里有它的输出）。
 代价是**没有摘要**：`counts:` / 失败行 / 末尾行 一律没有，卡上能贴的只剩 `rc=` 和日志绝对路径。
@@ -168,7 +195,11 @@ $ env PYTHONPATH=src <命令> > evidence/<名>-<卡号>.log 2>&1; echo rc=$?
 - **命名**：`<gate>-<card>.log`，两个参数都是文件名的组成部分。
 - **默认目录**：`evidence`，**相对当前工作目录**（不是相对仓库根，也不是相对卡 worktree），
   不存在就连父目录一起创建。
-- **覆盖**：`--log-dir DIR` 换目录，创建规则同上；给了它就不再碰 `evidence/`。
+- **覆盖语义**：同名 `<gate>-<card>.log` **再跑一次是整份覆盖**，不是追加 —— 实现就是
+  `open(path, "w", encoding="utf-8", newline="\n")`（`team_board.gatelog.write_log`），上一轮的内容
+  一个字都不留。想留痕就先把手上的摘要/日志另存，或者换个 `--gate` / `--log-dir` 让文件名不同；
+  否则「上一轮通过、这一轮失败」只剩最后一次的现场，回看时连有没有过过都看不出来。
+- **`--log-dir DIR`**：换目录，创建规则同上；给了它就不再碰 `evidence/`。
 - **名字形态在落盘之前校验**（唯一判据 `team_board.gatelog.log_filename`）：`--gate a/b`、
   空串、`--card t_XYZ` 一律 rc2 且**不产生文件** —— 路径分隔符必须在拼路径之前被拦住，
   否则一次 `--gate a/b` 就会在日志目录下造出子目录。
@@ -277,21 +308,31 @@ log: <日志文件的绝对路径>
    **但摘要 ≠ R3 全套证据**：R3 要的是「rc0 / rc1 / rc2 各一条复跑命令」加声明过的取值域边界
    （0 / 负数 / 13 位毫秒 / 天文数字 / 空串各一条），gate 摘要只覆盖**它包装的那一条命令**。
    拿一条 `pytest` 的 `exit: 0` 当全套证据，照样会被打回 —— 缺的那几条得自己再跑、再贴；
+   **`counts:` 是全文计数行累加出来的**，不是「最后一次跑的结果」：`gatelog.counts_line` 对整段
+   输出 `findall` 后逐项相加（`totals[key] += int(raw)`），同名项在整份日志里出现几次就加几次。
+   所以它只对「一个工具、一段输出」成立；多步命令（`sh -c 'pytest …; ruff …'`、一个脚本里连跑
+   几个检查器）里两条 `12 passed` 会加成 `passed=24`，`error` / `skipped` 同理。
+   **多步命令只认 `exit:`**：实测两条计数行（`3 passed` / `2 failed`）+ 末条 `exit 0` →
+   `exit: 0`、`counts: passed=3 failed=2 error=0 skipped=0` ——「failed=2 却 exit 0」不是 gate
+   判错，是它不重算、也只拿得到最后一条命令的 rc；要每步的判定值就分几次 gate 跑；
 4. **摘要按行截断，不按字节**：失败行 / 末尾行各 ≤20 **行**，单行长度不设上限 —— 单行巨长
    （JSON dump、长 lint 行、`body-audit --all` 的超限清单单行）时摘要**自己**就超 8192，
-   照第 1 条贴照样违规。实测一条 200000 字符的单行：日志 200004 字节、摘要 **200166 字节**
-   （摘要总共才 8 行）。先量再贴：摘要 `| wc -c`，超 8192 就只贴 `log:` 路径 +
-   `sed -n '<a>,<b>p' <日志>` 取段；
+   照第 1 条贴照样违规。实测一条 200000 字符的单行：摘要与日志**各约 200 KB**（摘要总共才 8 行）。
+   **这两个数别照抄**：它们只是**当次实测**，随命令输出量与 `log:` 路径长度漂移 —— 同一条命令
+   只把 `--log-dir` 换成更长的目录名，摘要字节数就等量跟着变（实测 `/tmp/a1` 200154 字节 vs
+   `/tmp/a1234567890` 200163 字节，目录名长 9 字节、摘要也长 9 字节）。复跑以当场 `wc -c` 为准：
+   先量再贴，摘要 `| wc -c` 超 8192 就只贴 `log:` 路径 + `sed -n '<a>,<b>p' <日志>` 取段；
 5. 同一条边界也管**评论 / `tasks.result` 本身**：UTF-8 字节上限 `gatelog.OUTPUT_LIMIT_BYTES` = 8192，
    全文贴法一超就违规。这一条由 `output-audit` 子命令**机器判定**（已合入 `main`，实现在
    `src/team_board/outputaudit.py`）：rc0 = 无超限 / rc1 = 有超限 / rc2 = 参数或环境错误；
    默认只算未结卡，`--all` 连 `done` 卡一起算。
 
-   自检命令写死「**在本卡 worktree** + `env PYTHONPATH=src`」：
+   自检命令写死「**在本卡 worktree** + `env PYTHONPATH=<本卡 worktree>/src`」（绝对路径，
+   理由见 §1 前置第 4 条）：
 
    ```
-   $ cd <本卡 worktree> && env PYTHONPATH=src /home/liu/project/team-board/.venv/bin/python \
-       -m team_board.cli output-audit --help
+   $ cd /home/liu/project/tb-wt/t_facc5c45 && env PYTHONPATH=/home/liu/project/tb-wt/t_facc5c45/src \
+       /home/liu/project/team-board/.venv/bin/python -m team_board.cli output-audit --help
    ```
 
    rc0 才算树对了。**主 checkout 若还没 fetch 到 `ff679a7`**（output-audit 进 `main` 的那个提交），
@@ -326,7 +367,7 @@ log: <日志文件的绝对路径>
 | 通过 | `pytest tests/unit/test_gatelog.py -q` | 0 |
 | 通过 | `ruff check src tests` | 0 |
 | 通过 | `mypy src` | 0 |
-| 有历史存量 | `body-audit --all` | 1（`counts: 未解析`，`末尾行（20/284）`，142 张 done 卡超限） |
+| 有历史存量 | `body-audit --all` | 1（`counts: 未解析`，`末尾行（20/292）`，142 张超限） |
 | 失败透传 | `pytest` 一个必失败用例 | 1（`counts: passed=0 failed=1`） |
 | 透传 2 | `/bin/sh -c 'echo hi; exit 2'` | 2（有摘要、无 stderr） |
 | 被信号杀 | `/bin/sh -c 'kill -9 $$'` | 137（`128 + 9`，摘要里不带负数） |
