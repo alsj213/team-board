@@ -13,12 +13,17 @@
 
 三条容易写错的契约点，写在这里免得下游再猜：
 
-1. **比不出来的不批量**（§0 D5）：``patch_id`` 返回 ``None`` 的 unit 用 ``head:<sha>`` 做组键，
-   绝不靠猜并组。注意单 unit 的组按 §3.3 一律 ``kind="solo"`` —— 「patch_id 为 None 且独占组」
-   仍归 ``solo``，``kind="head"`` 只出现在**同 head 的 ≥2 个 unit**上（契约 §3.3 优先于卡面措辞）。
+1. **同内容 = 同 tree**（pm 2026-10-31 决定，返工卡 ``t_600d3378``）：组键是 ``<head>^{tree}``，
+   不是 ``git patch-id``。patch-id 会**剥空白**（``X = 2`` 与 `` X = 2`` 同 patch-id、tree 不同），
+   拿它当组键会把一个语法坏掉的 unit 并进正常 unit 的组，而组级检查只跑在组首 unit 的
+   ``head_sha`` 上 —— 坏 unit 白拿 PASS。unit 共用同一 ``base``，所以「同 tree」⇔「改动逐字相同」；
+   ``patch_id`` 仍然算，但**只进日志/展示**（``Group.patch_id``），不参与分桶。tree 解析失败属于
+   环境级错误（整条命令失败），没有「比不出来 → 单独一个桶」这条退化路径。
+   注意单 unit 的组按 §3.3 一律 ``kind="solo"``；``kind="head"`` 只出现在**同 head 的 ≥2 个
+   unit** 上，``kind="patch"`` 是同 tree 但不同 head 的 ≥2 个 unit（契约 §3.3 优先于卡面措辞）。
 2. **组键与组内 unit 顺序都是确定的**（§0 D6）：组按 ``(kind, key)`` 升序，组内 unit 按
    ``(card, pr)`` 升序；``batch_id`` 只吃组内 head_sha 排序后的集合，与 plan 里的书写顺序无关。
-3. **组级检查跑在组首 unit 的 head_sha 上**（§3.6）：同 patch ⇒ 同内容，首 unit 取排序后的第一个。
+3. **组级检查跑在组首 unit 的 head_sha 上**（§3.6）：同 tree ⇒ 同内容，首 unit 取排序后的第一个。
 """
 
 from __future__ import annotations
@@ -145,16 +150,44 @@ _GIT_LOCATION_ENV = frozenset(
     }
 )
 
+#: 会**注入 git 配置**的环境变量（无文件也能改配置）：``GIT_CONFIG_COUNT`` 加
+#: ``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 成对使用，``GIT_CONFIG_PARAMETERS``
+#: 是同一机制的内部展开形态。宿主里一个 ``color.ui=always`` 就能让 ``git diff`` 吐着色输出、
+#: 让 ``patch-id`` 无输出 —— 见 :func:`_git_env`。
+_GIT_CONFIG_ENV = frozenset({"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"})
+_GIT_CONFIG_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+#: ``git diff`` 前必须钉死的全局配置（``-c`` 必须写在子命令**之前**）：
+#: 输出不许着色（``patch-id`` 解析不了 ANSI 转义），改名检测必须开着
+#: （``diff.renames`` 只有 true/false 两种，关了同一份改动会算成 delete+add 两个补丁）。
+_DIFF_CONFIG = ("-c", "color.ui=false", "-c", "diff.renames=true")
+
+#: ``git diff`` 的固定开关：``--no-color`` 兜住 ``color.ui=always`` 的残留、
+#: ``--no-ext-diff`` 挡 ``GIT_EXTERNAL_DIFF`` / ``diff.external`` 换掉 diff 实现、
+#: ``--no-textconv`` 挡 ``.gitattributes`` 里的 textconv 驱动程序改写内容形态。
+_DIFF_FLAGS = ("--no-color", "--no-ext-diff", "--no-textconv", "--binary")
+
 
 def _git_env() -> dict[str, str]:
-    """``os.environ`` 的一份副本，剔掉 :data:`_GIT_LOCATION_ENV` 里的定位变量。
+    """``os.environ`` 的一份副本，剔掉 :data:`_GIT_LOCATION_ENV` / :data:`_GIT_CONFIG_ENV`。
 
     ``subprocess.run(env=...)`` 传 ``None`` 等于继承父进程全部环境（含 ``GIT_DIR``），
     传 ``{}`` 又等于清空（``PATH`` 没了）；所以这里显式构造「剔除后的副本」。
+
+    第二类剔除是**配置注入**（pm 复审 P2）：``GIT_CONFIG_COUNT=1`` + ``GIT_CONFIG_KEY_0`` /
+    ``GIT_CONFIG_VALUE_0`` 能在不落地任何文件的前提下把 ``color.ui=always`` 塞进 git，
+    着色后的 diff 喂给 ``patch-id`` 直接**没有输出**，于是所有 unit 静默降级成 solo/head 组、
+    整条命令 rc0 放行 —— 配置写错却看不出来。``GIT_CONFIG_PARAMETERS`` 是同一机制的内部形态，
+    一并剔除；``GIT_CONFIG_GLOBAL`` / ``GIT_CONFIG_SYSTEM`` 属于「读哪个配置文件」，不清洗
+    （用例靠 ``GIT_CONFIG_GLOBAL=os.devnull`` 屏蔽宿主全局配置，清了就把那层保护也拆掉）。
     """
 
     return {
-        key: value for key, value in os.environ.items() if key not in _GIT_LOCATION_ENV
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GIT_LOCATION_ENV
+        and key not in _GIT_CONFIG_ENV
+        and not key.startswith(_GIT_CONFIG_ENV_PREFIXES)
     }
 
 
@@ -394,6 +427,26 @@ def load_plan(path: str | os.PathLike[str]) -> Plan:
 # --------------------------------------------------------------------------- git 侧
 
 
+def _resolve_commit(
+    repo: str | os.PathLike[str], rev: str, what: str
+) -> str:
+    """``git rev-parse <rev>^{commit}`` 取 40 位 sha；解析不出来 → ``VerifyBatchError`` 点名 ``what``。
+
+    fail-closed 的唯一落点：``what`` 是 ``head`` / ``base``，错误消息里必须带出来，
+    否则 base 写错时用户只能看到「某个 unit 比不出来」，看不出是配置的问题。
+    """
+
+    proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    sha = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = detail[-1] if detail else f"退出码 {proc.returncode}"
+        raise VerifyBatchError(
+            f"{what} {_echo(rev)} 解析失败（不是本仓库里的提交）: {tail}"
+        )
+    return sha
+
+
 def resolve_head(repo: str | os.PathLike[str], rev: str) -> str:
     """``git rev-parse <rev>^{commit}`` 取 40 位 head sha；失败 → ``VerifyBatchError``。
 
@@ -402,32 +455,51 @@ def resolve_head(repo: str | os.PathLike[str], rev: str) -> str:
 
     if not isinstance(rev, str) or not rev.strip():
         raise VerifyBatchError("head 不许为空串")
-    proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
-    sha = proc.stdout.strip()
-    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+    return _resolve_commit(repo, rev, "head")
+
+
+def _head_tree(repo: str | os.PathLike[str], head_sha: str) -> str:
+    """``git rev-parse <head_sha>^{tree}`` 取 tree sha —— **组键的唯一来源**。
+
+    同 tree = 工作区内容逐字相同（这才是「同内容」，``patch-id`` 会剥空白）。
+    head 已经 ``resolve_head`` 过了，这里再失败就是环境级的怪状态，按环境错误抛。
+    """
+
+    proc = _git(repo, "rev-parse", "--verify", "--quiet", f"{head_sha}^{{tree}}")
+    tree = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", tree):
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         tail = detail[-1] if detail else f"退出码 {proc.returncode}"
-        raise VerifyBatchError(f"head {_echo(rev)} 解析失败（不是本仓库里的提交）: {tail}")
-    return sha
+        raise VerifyBatchError(
+            f"head {_echo(head_sha)} 的 tree 解析失败（组键取不到，不许猜）: {tail}"
+        )
+    return tree
 
 
 def patch_id(repo: str | os.PathLike[str], base: str, head_sha: str) -> str | None:
     """``merge-base`` → ``diff --binary`` → ``patch-id --stable`` 的首要字段。
 
-    任何一步失败（merge-base 找不到共同祖先、diff 为空、git 不可用）都返回 ``None`` ——
-    属于「比不出来」，由调用方把它退化成 ``head:<sha>`` 组键（§0 D5），**不抛异常**。
+    **返回值只用于展示/日志**：分组键是 ``<head>^{tree}``（见 :func:`build_groups`），
+    调用方不许拿它判「同内容」——它剥空白，``X = 2`` 与 `` X = 2`` 会算出同一个值。
+
+    两类结果要分清：
+
+    - ``base`` 自己解析不出来（写错 / 没 fetch）→ ``VerifyBatchError``，**点名 base**，
+      整条命令失败。旧行为是返回 ``None``，于是全体 unit 静默降级成 solo/head 组、rc0
+      放行 —— 配置写错却看起来「跑通了」（pm 复审 P2）。
+    - base 能解析但比不出来（``merge-base`` 找不到共同祖先、diff 为空）→ ``None``，
+      属于「这条改动算不出补丁」，由调用方按 D5 处理，不抛异常。
     """
 
-    merge_base = _git(repo, "merge-base", base, head_sha)
+    base_sha = _resolve_commit(repo, base, "base")
+    merge_base = _git(repo, "merge-base", base_sha, head_sha)
     if merge_base.returncode != 0:
         return None
     ancestor = merge_base.stdout.strip()
     if not ancestor:
         return None
 
-    diff = _git_raw(
-        repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", ancestor, head_sha
-    )
+    diff = _git_raw(repo, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, ancestor, head_sha)
     if diff.returncode != 0 or not diff.stdout.strip():
         return None
 
@@ -458,28 +530,38 @@ def _unit_order(unit: Unit) -> tuple[str, int]:
 def build_groups(repo: str | os.PathLike[str], plan: Plan) -> tuple[Group, ...]:
     """按 §3 把 plan 的 unit 分组，组与组内顺序都是确定的（§0 D6）。
 
+    组键是 ``tree:<head 的 tree sha>``（pm 在返工卡 ``t_600d3378`` 定的判据）：
+    plan 里所有 unit 共用同一个 ``base``，所以「同 tree」⇔「改动逐字相同」；
+    ``patch-id`` 会剥空白，同 patch-id 但 tree 不同的两个 head（``X = 2`` / `` X = 2``）
+    必须分成两组，否则组级检查只跑在组首 unit 的 head 上，语法坏的那个白拿 PASS。
+    ``Group.patch_id`` 仍然填（组首 unit 的 patch-id），**只作展示/日志**。
+
     顺序：
 
-    1. 每个 unit ``resolve_head``（失败 → ``VerifyBatchError``，整条命令失败）；
-    2. ``patch_id`` 有值 → 组键 ``patch:<pid>``；无值 → ``head:<sha>``；
-    3. 组内 unit 按 ``(card, pr)`` 升序；组首 unit 的 head_sha 就是组级检查的落点（§3.6）；
-    4. 组内 unit 数 <2 → ``kind="solo"``，否则 ``patch``（按 patch 聚）/ ``head``（同 head 聚）；
+    1. ``base`` 先解析一次（失败 → ``VerifyBatchError`` 点名 base，整条命令失败）；
+    2. 每个 unit ``resolve_head`` + 取 tree + 算 patch-id（head 失败 → 整条命令失败）；
+    3. 按 ``tree:<tree>`` 分桶；组内 unit 按 ``(card, pr)`` 升序，组首 unit 的 head_sha
+       就是组级检查的落点（§3.6）；
+    4. 组内 unit 数 <2 → ``kind="solo"``；≥2 且 head_sha 全同 → ``kind="head"``；
+       ≥2 且 head 不全同（同内容、不同提交）→ ``kind="patch"``；
     5. 组按 ``(kind, key)`` 升序返回。
     """
 
-    resolved: list[tuple[Unit, str, str | None]] = []
     # base 在这里再校验一次：``Plan`` 是公开 dataclass，调用方可以绕开 ``load_plan``
     # 手搓一个（pm 的复审探针就是这么构造的）。不校验就会把 ``--help`` / NUL 送进 git。
     _as_base(plan.base, "base")
+    # 解析不出来就整条命令失败：旧行为是「静默全体 solo + rc0」，配置写错却看起来跑通了。
+    _resolve_commit(repo, plan.base, "base")
+
+    resolved: list[tuple[Unit, str, str, str | None]] = []
     for unit in plan.units:
         head_sha = resolve_head(repo, unit.head)
-        resolved.append((unit, head_sha, patch_id(repo, plan.base, head_sha)))
+        tree = _head_tree(repo, head_sha)
+        resolved.append((unit, head_sha, tree, patch_id(repo, plan.base, head_sha)))
 
-    buckets: dict[str, list[tuple[Unit, str, str | None]]] = {}
+    buckets: dict[str, list[tuple[Unit, str, str, str | None]]] = {}
     for item in resolved:
-        pid = item[2]
-        key = f"patch:{pid}" if pid else f"head:{item[1]}"
-        buckets.setdefault(key, []).append(item)
+        buckets.setdefault(f"tree:{item[2]}", []).append(item)
 
     groups: list[Group] = []
     for key, items in buckets.items():
@@ -487,16 +569,16 @@ def build_groups(repo: str | os.PathLike[str], plan: Plan) -> tuple[Group, ...]:
         units = tuple(item[0] for item in ordered)
         if len(units) < 2:
             kind = KIND_SOLO
-        elif key.startswith("patch:"):
-            kind = KIND_PATCH
-        else:
+        elif len({item[1] for item in ordered}) == 1:
             kind = KIND_HEAD
+        else:
+            kind = KIND_PATCH
         groups.append(
             Group(
                 batch_id=batch_id_for([item[1] for item in ordered]),
                 kind=kind,
                 key=key,
-                patch_id=ordered[0][2],
+                patch_id=ordered[0][3],
                 head_sha=ordered[0][1],
                 units=units,
             )

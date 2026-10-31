@@ -9,12 +9,17 @@
   （pr=0 / 负数 / 13 位毫秒 / 天文数字 / 空串 / ``"53"`` / ``True`` / card 形态 /
   units 空 / 字符串形态的 checks …），一条一个 id，打回时能精确指到哪条漏了；
 - :class:`TestBatchId` —— 与书写顺序无关、sha 集合变一个字符就变、形态恒 ``b-[0-9a-f]{8}``；
+- :class:`TestGitEnvHardening` —— 返工 t_600d3378 P2：``GIT_CONFIG_*`` 注入被清洗、``git diff``
+  钉死 ``-c color.ui=false -c diff.renames=true ... --no-color --no-ext-diff --no-textconv``；
+- :class:`TestGroupKeyFromTree` —— 返工 t_600d3378 P1：组键是 ``<head>^{tree}``，
+  同 patch-id 不同 tree（只差空白）必须分两组，同 tree 不同 head 仍并组；
 - :class:`TestDataclasses` —— 契约 §2 的字段名与 frozen 语义（下游 E2–E4 靠字段名取数）。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -377,6 +382,179 @@ class TestGitCallHardening:
         text = vb._echo(10**5000)
         assert "位数过多" in text
         assert len(text) <= vb.ECHO_LIMIT
+
+
+class TestGitEnvHardening:
+    """返工 t_600d3378 第 2 条（P2）：git 配置注入不许渗进来。
+
+    ``GIT_CONFIG_COUNT`` + ``GIT_CONFIG_KEY_<n>`` / ``GIT_CONFIG_VALUE_<n>`` 是不落地文件也能
+    改 git 配置的入口：宿主里一个 ``color.ui=always`` 就让 ``git diff`` 吐 ANSI 转义、
+    ``patch-id`` 没有输出，分组静默降级。这里三条各钉一处：环境清洗、diff 配置、diff 开关。
+    """
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            pytest.param("GIT_CONFIG_COUNT", id="GIT_CONFIG_COUNT"),
+            pytest.param("GIT_CONFIG_KEY_0", id="GIT_CONFIG_KEY_0"),
+            pytest.param("GIT_CONFIG_VALUE_0", id="GIT_CONFIG_VALUE_0"),
+            pytest.param("GIT_CONFIG_KEY_17", id="GIT_CONFIG_KEY_17"),
+            pytest.param("GIT_CONFIG_VALUE_17", id="GIT_CONFIG_VALUE_17"),
+            pytest.param("GIT_CONFIG_PARAMETERS", id="GIT_CONFIG_PARAMETERS"),
+            pytest.param("GIT_DIR", id="GIT_DIR"),
+        ],
+    )
+    def test_git_config_injection_env_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        monkeypatch.setenv(key, "color.ui=always")
+        env = vb._git_env()
+        assert key not in env
+        assert "PATH" in env  # 剔变量不等于清空环境
+
+    def test_git_config_global_is_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``GIT_CONFIG_GLOBAL`` 是「读哪个配置文件」，用例靠它屏蔽宿主配置，不许被清洗。"""
+
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        assert vb._git_env().get("GIT_CONFIG_GLOBAL") == os.devnull
+
+    def test_diff_call_pins_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """真正要钉的是**调用形态**：``-c color.ui=false -c diff.renames=true`` 必须在 ``diff``
+        之前，``--no-color --no-ext-diff --no-textconv --binary`` 必须跟在 ``diff`` 之后。"""
+
+        calls: list[tuple[str, ...]] = []
+
+        class _Proc:
+            def __init__(self, stdout: str | bytes = b"") -> None:
+                self.returncode = 0
+                self.stdout = stdout
+                self.stderr = b""
+
+        def fake_git(repo: str, *args: str) -> _Proc:
+            calls.append(args)
+            return _Proc("0" * 40 + "\n")
+
+        def fake_raw(
+            repo: str, *args: str, stdin_bytes: bytes | None = None
+        ) -> _Proc:
+            calls.append(args)
+            if "patch-id" in args:
+                return _Proc(b"cafe1234" + b" " + b"0" * 40 + b"\n")
+            return _Proc(b"diff --git a/f.py b/f.py\n")
+
+        monkeypatch.setattr(vb, "_git", fake_git)
+        monkeypatch.setattr(vb, "_git_raw", fake_raw)
+        monkeypatch.setattr(vb, "_resolve_commit", lambda repo, rev, what: "0" * 40)
+
+        assert vb.patch_id(".", "origin/main", "a" * 40) == "cafe1234"
+        diff_args = calls[1]
+        assert diff_args[:4] == ("-c", "color.ui=false", "-c", "diff.renames=true")
+        assert diff_args[4] == "diff"
+        for flag in ("--no-color", "--no-ext-diff", "--no-textconv", "--binary"):
+            assert flag in diff_args
+
+
+class TestGroupKeyFromTree:
+    """返工 t_600d3378 第 1 条（P1）：组键是 ``<head>^{tree}``，不是会剥空白的 ``patch-id``。
+
+    这两组用例把四个 git 入口整体打桩，断言的是 ``build_groups`` 的**分桶逻辑本身**；
+    真 git 版本在 ``tests/integration/test_verifybatch_grouping.py::TestWhitespaceVariants``。
+    """
+
+    @staticmethod
+    def _stub(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        heads: dict[str, str],
+        trees: dict[str, str],
+        pids: dict[str, str | None],
+    ) -> None:
+        monkeypatch.setattr(vb, "_resolve_commit", lambda repo, rev, what: "0" * 40)
+        monkeypatch.setattr(vb, "resolve_head", lambda repo, rev: heads[rev])
+        monkeypatch.setattr(vb, "_head_tree", lambda repo, sha: trees[sha])
+        monkeypatch.setattr(vb, "patch_id", lambda repo, base, sha: pids[sha])
+
+    @staticmethod
+    def _groups(*heads: tuple[str, str, int]) -> tuple[vb.Group, ...]:
+        return vb.build_groups(
+            ".",
+            Plan(
+                base="origin/main",
+                group_checks=(),
+                units=tuple(Unit(card=card, pr=pr, head=head) for head, card, pr in heads),
+            ),
+        )
+
+    def test_whitespace_variant_same_patch_id_different_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pm 实测的原始缺陷：``X = 2`` 与 `` X = 2`` patch-id 相同、tree 不同。
+
+        旧实现两组并成一组（组级检查只跑首 unit → 语法坏的那个白拿 PASS）。
+        """
+
+        good, bad = "a" * 40, "b" * 40
+        same_pid = "d9d75d3a" + "0" * 32
+        tree_good, tree_bad = "c96aa15" + "0" * 33, "8f92048" + "0" * 33
+        self._stub(
+            monkeypatch,
+            heads={"good": good, "bad": bad},
+            trees={good: tree_good, bad: tree_bad},
+            pids={good: same_pid, bad: same_pid},
+        )
+
+        groups = self._groups(("good", CARD_A, 53), ("bad", CARD_B, 57))
+
+        assert len(groups) == 2
+        assert [g.kind for g in groups] == ["solo", "solo"]
+        assert {g.head_sha for g in groups} == {good, bad}
+        assert {g.key for g in groups} == {f"tree:{tree_good}", f"tree:{tree_bad}"}
+        # patch-id 只留展示：两组都记着（恰好相同的）patch-id
+        assert {g.patch_id for g in groups} == {same_pid}
+
+    def test_same_tree_different_head_is_patch_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同 tree、不同提交（cherry-pick 双胞胎）仍要并成 ``kind="patch"`` 一组。"""
+
+        first, twin = "b" * 40, "c" * 40
+        tree = "1" * 40
+        self._stub(
+            monkeypatch,
+            heads={"first": first, "twin": twin},
+            trees={first: tree, twin: tree},
+            pids={first: "p" * 40, twin: "p" * 40},
+        )
+
+        groups = self._groups(("twin", CARD_B, 57), ("first", CARD_A, 53))
+
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.kind == vb.KIND_PATCH
+        assert group.key == f"tree:{tree}"
+        assert [u.card for u in group.units] == [CARD_A, CARD_B]
+        assert group.head_sha == first  # 排序后首 unit
+
+    def test_same_tree_same_head_is_head_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """同 head 的 ≥2 个 unit → ``kind="head"``（契约 §3.3 的 kind 语义不许丢）。"""
+
+        head = "d" * 40
+        tree = "2" * 40
+        self._stub(
+            monkeypatch,
+            heads={"only": head},
+            trees={head: tree},
+            pids={head: None},
+        )
+
+        groups = self._groups(("only", CARD_A, 53), ("only", CARD_B, 57))
+
+        assert len(groups) == 1
+        assert groups[0].kind == vb.KIND_HEAD
+        assert groups[0].key == f"tree:{tree}"
+        assert groups[0].patch_id is None
 
 
 class TestDataclasses:

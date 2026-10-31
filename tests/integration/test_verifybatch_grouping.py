@@ -10,7 +10,12 @@
 3. :class:`TestDegenerate` —— unit 数 1 → ``kind="solo"``；``patch_id`` 为 ``None`` 的
    同 head 两个 unit → 独占 ``kind="head"`` 组（§3.3、§0 D5）；
 4. :class:`TestOrdering` —— 组按 ``(kind, key)`` 升序（``head`` < ``patch`` < ``solo``）；
-5. :class:`TestErrors` —— head 解析不出来 → ``VerifyBatchError``（§3.1 整条命令失败）。
+5. :class:`TestErrors` —— head 解析不出来 → ``VerifyBatchError``（§3.1 整条命令失败）；
+6. :class:`TestWhitespaceVariants` —— 只差空白的两个 head（同 patch-id、不同 tree）**不许并组**
+   （返工 t_600d3378 P1：组键从 patch-id 改成 ``<head>^{tree}``）；
+7. :class:`TestGitConfigInjection` —— 宿主 ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_*`` /
+   ``GIT_CONFIG_VALUE_*`` 注入 ``color.ui=always`` 等配置不许改变 patch-id 与分组（P2）；
+8. :class:`TestBaseFailClosed` —— ``base`` 解析不出来 → 整条命令失败并**点名 base**（P2）。
 
 仓里每次用例都用 ``tmp_path`` 新建的仓，不碰本仓；``GIT_CONFIG_GLOBAL=os.devnull`` 挡住
 宿主全局配置（``commit.gpgsign`` / ``core.hooksPath`` 都不许渗进来），身份用环境变量给。
@@ -81,6 +86,13 @@ def must_git(cwd: Path, *args: str, extra_env: dict[str, str] | None = None) -> 
     proc = git(cwd, *args, extra_env=extra_env)
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+def tree_of(repo: Repo | Path, rev: str) -> str:
+    """``<rev>^{tree}`` 的 40 位 sha —— 组键就是它（``build_groups`` 用精确内容分桶）。"""
+
+    path = repo.path if isinstance(repo, Repo) else repo
+    return must_git(path, "rev-parse", f"{rev}^{{tree}}").strip()
 
 
 def commit_file(repo: Path, name: str, body: str, message: str) -> str:
@@ -182,8 +194,18 @@ class TestPatchId:
     def test_no_merge_base_is_none(self, repo: Repo) -> None:
         assert vb.patch_id(repo.path, repo.base, repo.orphan) is None
 
-    def test_unknown_base_is_none(self, repo: Repo) -> None:
-        assert vb.patch_id(repo.path, "no-such-rev", repo.first) is None
+    def test_unknown_base_fails_closed(self, repo: Repo) -> None:
+        """base 解析不出来 → ``VerifyBatchError`` 点名 base（返工 t_600d3378 第 3 条）。
+
+        旧行为是返回 ``None``：所有 unit 静默降级成 solo/head 组、整条命令 rc0，
+        base 写错（或忘了 fetch）却看起来「跑通了」。
+        """
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.patch_id(repo.path, "no-such-rev", repo.first)
+        message = str(excinfo.value)
+        assert "base" in message
+        assert "no-such-rev" in message
 
     def test_external_diff_env_does_not_hijack(
         self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -228,7 +250,8 @@ class TestSamePatchDifferentHead:
         assert len(groups) == 1
         group = groups[0]
         assert group.kind == "patch"
-        assert group.key == f"patch:{pid_first}"
+        # 组键是精确内容（tree），不再是 patch-id：返工 t_600d3378 的 P1
+        assert group.key == f"tree:{tree_of(repo, repo.first)}"
         assert group.patch_id == pid_first
         assert [u.card for u in group.units] == [CARD_A, CARD_B]
         # §3.6：组级检查跑在排序后首 unit 的 head_sha 上
@@ -301,8 +324,9 @@ class TestDegenerate:
         group = groups[0]
         assert group.kind == "solo"
         assert len(group.units) == 1
-        # 组键仍是 patch:<pid>（比得出来就是 patch 键），只是 unit 不够凑批
-        assert group.key == f"patch:{group.patch_id}"
+        # 组键恒是 tree（比得出 patch-id 也只是展示用）
+        assert group.key == f"tree:{tree_of(repo, repo.first)}"
+        assert group.patch_id is not None
         assert group.head_sha == repo.first
 
     def test_lone_unpatchable_unit_is_solo(self, repo: Repo) -> None:
@@ -312,10 +336,10 @@ class TestDegenerate:
         assert len(groups) == 1
         assert groups[0].kind == "solo"
         assert groups[0].patch_id is None
-        assert groups[0].key == f"head:{repo.orphan}"
+        assert groups[0].key == f"tree:{tree_of(repo, repo.orphan)}"
 
     def test_same_head_two_units_is_head_group(self, repo: Repo) -> None:
-        """``patch_id`` 为 None + 同 head 两个 unit → 独占一组 ``kind="head"``。"""
+        """同 head 两个 unit → 独占一组 ``kind="head"``（组键仍是 tree）。"""
 
         # base 取 head 自己 → diff 为空 → patch_id 为 None
         groups = vb.build_groups(
@@ -326,7 +350,7 @@ class TestDegenerate:
         group = groups[0]
         assert group.kind == "head"
         assert group.patch_id is None
-        assert group.key == f"head:{repo.first}"
+        assert group.key == f"tree:{tree_of(repo, repo.first)}"
         assert len(group.units) == 2
         assert group.head_sha == repo.first
         assert group.batch_id == vb.batch_id_for([repo.first, repo.first])
@@ -385,3 +409,125 @@ class TestErrors:
 
         with pytest.raises(VerifyBatchError):
             vb.resolve_head(tmp_path / "not-a-repo", "HEAD")
+
+
+class TestWhitespaceVariants:
+    """返工 t_600d3378 第 1 条（P1）：只差空白的两个 head **不许**并成一组。
+
+    旧实现拿 ``patch-id`` 当组键，而 ``patch-id`` 剥空白 —— ``X = 2`` 与 `` X = 2``
+    算出同一个 patch-id，于是语法坏掉的那个 unit 被并入正常 unit 的组，组级检查只跑在
+    组首 unit 的 head 上，坏 unit 白拿 PASS。组键改成 ``<head>^{tree}`` 后必须分两组。
+    """
+
+    def test_same_patch_id_different_tree_stays_separate(self, repo: Repo) -> None:
+        must_git(repo.path, "checkout", "-q", "-b", "ws-good", repo.base)
+        good = commit_file(repo.path, "m.py", "X = 2\n", "ws-good")
+        must_git(repo.path, "checkout", "-q", repo.base)
+        must_git(repo.path, "checkout", "-q", "-b", "ws-bad")
+        bad = commit_file(repo.path, "m.py", " X = 2\n", "ws-bad")
+        must_git(repo.path, "checkout", "-q", "main")
+
+        # 前提（缺一个这条用例就没意义）：head 不同、patch-id 相同、tree 不同
+        assert good != bad
+        pid_good = vb.patch_id(repo.path, repo.base, good)
+        pid_bad = vb.patch_id(repo.path, repo.base, bad)
+        assert pid_good is not None
+        assert pid_good == pid_bad, "patch-id 应当剥空白后相同"
+        assert tree_of(repo, good) != tree_of(repo, bad)
+
+        groups = vb.build_groups(
+            repo.path, plan(repo.base, (unit(CARD_A, 53, good), unit(CARD_B, 57, bad)))
+        )
+        assert len(groups) == 2
+        assert [g.kind for g in groups] == ["solo", "solo"]
+        assert {g.head_sha for g in groups} == {good, bad}
+        assert {g.key for g in groups} == {
+            f"tree:{tree_of(repo, good)}",
+            f"tree:{tree_of(repo, bad)}",
+        }
+        # patch-id 只作展示：两组各自记下（恰好相同的）patch-id
+        assert {g.patch_id for g in groups} == {pid_good}
+
+    def test_identical_content_still_batches(self, repo: Repo, tmp_path: Path) -> None:
+        """反向：改动用 tree 判也照样把「同内容、不同提交」并成一组（不许因加固失去压缩率）。"""
+
+        twin = repo.twin(tmp_path)
+        assert tree_of(repo, twin) == tree_of(repo, repo.first)
+        groups = vb.build_groups(
+            repo.path, plan(repo.base, (unit(CARD_A, 53, repo.first), unit(CARD_B, 57, twin)))
+        )
+        assert [g.kind for g in groups] == ["patch"]
+        assert len(groups[0].units) == 2
+
+
+class TestGitConfigInjection:
+    """返工 t_600d3378 第 2 条（P2）：宿主用 ``GIT_CONFIG_*`` 注入配置不许改变结果。
+
+    实测（本卡）：``GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=always``
+    会让 ``git diff`` 吐 ANSI 转义，``git patch-id`` 于是**没有输出**，所有 unit 静默降级。
+    加固后必须既清洗这三个环境变量，又在 diff 调用上钉 ``-c color.ui=false --no-color``。
+    """
+
+    @pytest.mark.parametrize(
+        "knob",
+        [
+            pytest.param(("color.ui", "always"), id="color.ui=always"),
+            pytest.param(("color.diff", "always"), id="color.diff=always"),
+            pytest.param(("diff.renames", "false"), id="diff.renames=false"),
+            pytest.param(("diff.noprefix", "true"), id="diff.noprefix=true"),
+        ],
+    )
+    def test_host_config_does_not_change_patch_id(
+        self, repo: Repo, monkeypatch: pytest.MonkeyPatch, knob: tuple[str, str]
+    ) -> None:
+        expected = vb.patch_id(repo.path, repo.base, repo.first)
+        assert expected is not None
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", knob[0])
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", knob[1])
+        assert vb.patch_id(repo.path, repo.base, repo.first) == expected
+
+    def test_host_config_does_not_change_grouping(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        twin = repo.twin(tmp_path)
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "color.ui")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
+        monkeypatch.setenv("GIT_CONFIG_KEY_1", "diff.renames")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_1", "false")
+        groups = vb.build_groups(
+            repo.path, plan(repo.base, (unit(CARD_A, 53, repo.first), unit(CARD_B, 57, twin)))
+        )
+        assert [g.kind for g in groups] == ["patch"]
+        assert groups[0].patch_id == vb.patch_id(repo.path, repo.base, repo.first)
+
+
+class TestBaseFailClosed:
+    """返工 t_600d3378 第 3 条（P2）：base 解析不出来 → 整条命令失败并点名 base。"""
+
+    def test_patch_id_names_base(self, repo: Repo) -> None:
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.patch_id(repo.path, "origin/nope", repo.first)
+        assert "base" in str(excinfo.value)
+        assert "origin/nope" in str(excinfo.value)
+
+    def test_build_groups_fails_closed(self, repo: Repo) -> None:
+        """旧行为：静默全体 solo + rc0。现在必须抛，且消息里能看见是 base 的错。"""
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.build_groups(
+                repo.path,
+                plan("origin/nope", (unit(CARD_A, 53, repo.first), unit(CARD_B, 57, repo.second))),
+            )
+        assert "base" in str(excinfo.value)
+        assert "origin/nope" in str(excinfo.value)
+
+    def test_base_reported_before_bad_head(self, repo: Repo) -> None:
+        """base 与 head 同时写错时先报 base：这是配置错误，不该被「head 解析失败」盖住。"""
+
+        with pytest.raises(VerifyBatchError) as excinfo:
+            vb.build_groups(repo.path, plan("origin/nope", (unit(CARD_A, 53, "no-such-head"),)))
+        message = str(excinfo.value)
+        assert "base" in message
+        assert "no-such-head" not in message
