@@ -7,6 +7,8 @@
 #                           否则 <kanban_home>/templates/card-template.md
 #   kanban_home() = $HERMES_KANBAN_HOME.strip() 否则 get_default_hermes_root()
 # 已知缺口：$HERMES_CARD_TEMPLATE 覆盖读取路径时，本脚本不会自动跟随（另卡处理）。
+# 注：早期约定落点曾多一层 /kanban；按本机内核实测（kanban_db.py:640 / 4302）与 #62 文档，
+# 本脚本对齐内核 fallback（无 /kanban）。
 #
 # 用法：
 #     bash scripts/install-card-template.sh [--check] [--dest <路径>]

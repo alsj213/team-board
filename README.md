@@ -1020,6 +1020,8 @@ $ echo $?
 
 装到内核模板目录与漂移检查：`bash scripts/install-card-template.sh [--check]`（默认 `${HERMES_KANBAN_HOME:-${HERMES_HOME:-$HOME/.hermes}}/templates/card-template.md`，`--dest` 覆盖；`--check` 只比 sha256、rc1 = 漂移或缺目标）。
 
+补：内核 `_card_template_path()` 优先 `$HERMES_CARD_TEMPLATE`（该文件存在时）；`--check` 目标是符号链接或非普通文件 → rc2；写入走 temp+rename，不毁旧文件。
+
 ## 闸门日志（gate）
 
 检查器（`pytest` / `ruff` / `mypy` / 各 `*-audit`）的输出**整份落盘**，stdout 只回一段
