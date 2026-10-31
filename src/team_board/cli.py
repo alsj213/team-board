@@ -103,6 +103,21 @@
 ``--subject=<值>`` 形式：``shlex.quote('-h')`` 原样返回，``--subject -h`` 会被
 argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=value`` 形式的
 值不参与选项解析。其余取值仍打 ``--subject <值>``（改动只落在这一行，不换命令形态）。
+
+``evidence`` 子命令（evidence 事件的写入口；``audit`` 归 E3，本命令只有 ``emit``）：
+- ``evidence emit --kind <kind> --payload '<json>' [--card t_xxxxxxxx] [--db PATH]``
+- 0：成功追加**一条** ``task_events``（stdout 恰一行 ``evidence emit: kind=… card=…
+  run=… profile=… event=… payload=…``）
+- 1：判定不通过 —— 角色不符 / 该卡没有进行中的 run / 当前 run 不是 running / 当前
+  run 没有 profile / ``--card`` 与调用者卡号不一致 / payload 违约 / 卡正文缺
+  ``## 验收标准`` 段 / kind 不可 emit（含 ``merged``）；stderr 恰一行、**库里一行都
+  不多**（角色校验失败时没有任何 INSERT）
+- 2：参数或环境错误（``evidence_store.EvidenceStoreError`` → stderr 恰一行
+  ``错误: …``、stdout 空、不冒 traceback；含 ``--payload`` 不是合法 JSON、``--card``
+  形态非法、无法确定调用者卡号、看板库里没有这张卡、``--db`` 不存在 / 不是合法
+  SQLite / 缺 ``tasks`` / ``task_runs`` / ``task_events`` 表、stdout 编码表示不了中文）
+- 身份只从库取：``tasks.current_run_id`` → ``task_runs.profile``（且 status 必须
+  ``running``）；``HERMES_PROFILE`` 不读，环境变量只用于定位卡号
 """
 
 from __future__ import annotations
@@ -124,6 +139,7 @@ from . import (
     commands,
     commits,
     db,
+    evidence_store,
     gatelog,
     merges,
     outputaudit,
@@ -209,7 +225,7 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十三个**子命令。
+    """建 CLI 前端：prog=team-board，共**十六个**子命令。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -610,6 +626,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SHA",
         help="要绑定的 head sha（40 或 64 位小写十六进制；41-63 位一律 rc2）",
+    )
+
+    evidence_cmd = subparsers.add_parser(
+        "evidence",
+        help="evidence 事件的写入口（只有 emit；audit 归 E3）",
+    )
+    evidence_verbs = evidence_cmd.add_subparsers(dest="evidence_action", required=True)
+    emit_cmd = evidence_verbs.add_parser(
+        "emit",
+        help="追加一条 evidence 事件（身份取自看板库：tasks.current_run_id → task_runs.profile）",
+    )
+    emit_cmd.add_argument(
+        "--kind",
+        required=True,
+        metavar="KIND",
+        help=(
+            "事件类型（可 emit 的是 evidence.EMITTABLE_KINDS 里的六个；"
+            "merged 由 merge_audit trailer 承载，emit 一律 rc1）"
+        ),
+    )
+    emit_cmd.add_argument(
+        "--payload",
+        required=True,
+        metavar="JSON",
+        help="payload 的唯一入口（JSON 对象字符串；落到库里存 evidence.normalize 结果）",
+    )
+    emit_cmd.add_argument(
+        "--card",
+        default=None,
+        metavar="t_xxxxxxxx",
+        help="调用者卡号（缺省取 HERMES_KANBAN_TASK，其次 HERMES_KANBAN_WORKSPACE 的 basename）",
+    )
+    emit_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径（默认 {DEFAULT_DB}）",
     )
 
     serve = subparsers.add_parser(
@@ -1477,6 +1530,45 @@ def _run_pr_claim_audit(args: argparse.Namespace) -> int:
     return prclaim.exit_code(report)
 
 
+def _run_evidence(args: argparse.Namespace) -> int:
+    """``evidence`` 子命令：本轮只有 ``emit``（``audit`` 归 E3）。
+
+    三个码的分工（契约 E2 段）：0 追加成功 / 1 判定不通过 / 2 参数或环境错误。
+
+    - ``EvidenceReject``（``EvidenceStoreError`` 的子类）= rc1，文案**逐字**打到
+      stderr 恰一行（不加 ``错误: `` 前缀：契约 C / F 的引句本身就是完整一句），
+      stdout 空、库里一行都不多；
+    - ``EvidenceStoreError`` = rc2，stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；
+    - 成功时 stdout 恰一行摘要，payload 打的是**落库文本**（``evidence.normalize``
+      的结果），不是 ``--payload`` 原文 —— 两者在键序/空白上可能不同，摘要只认前者。
+
+    身份解析与写库全在 :mod:`team_board.evidence_store`，这里不重写任何判据。
+    """
+
+    action = getattr(args, "evidence_action", None)
+    if action != "emit":  # pragma: no cover - argparse 的 required=True 已拦截
+        _write_stderr_error(f"未知的 evidence 动词: {action}")
+        return 2
+
+    try:
+        result = evidence_store.emit(
+            args.kind,
+            args.payload,
+            card=args.card,
+            db_path=args.db,
+        )
+    except evidence_store.EvidenceReject as exc:
+        _write_stderr_line(str(exc))
+        return 1
+    except (evidence_store.EvidenceStoreError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    if not _write_stdout(result.render() + "\n"):
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1507,6 +1599,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pr-claim-audit":
         return _run_pr_claim_audit(args)
+
+    if args.command == "evidence":
+        return _run_evidence(args)
 
     if args.command == "serve":
         return _run_serve(args)
