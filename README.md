@@ -701,24 +701,25 @@ stdout 失败」，`141` 是 SIGPIPE）。
 输出每步一行：`<步骤> | <PASS|FAIL> | <命令原文> | rc=<n> | <关键输出一行>`，末行固定
 `结论：` 前缀。
 
-步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `双问绑定` → `rebase` → `合并` → `分支删除`。
+步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `证据状态机` → `双问绑定` → `rebase` → `合并` → `分支删除`。
 
 这段顺序由 `tests/integration/test_merge_guard_cli.py` 的
 `test_evidence_step_order_matches_constants` / `test_docs_declare_same_step_order` /
 `test_docs_sample_block_matches_step_order` 对着实跑钉住 —— 把下面这个样例改回旧样板
-（少了 `认领唯一性` / `双问绑定` 两行）会直接红。下面是 2026-10-30 返工卡（`t_c52b9b86`）
-真 git + 假 gh 跑出来的端到端样例（`#20` / `t_deadbeef` 是合法假号；真仓库只有路径与 sha
-那段不同，预检与合并两条命令都带 `-R alsj213/team-board`，脚本与完整日志是返工卡
-`t_c52b9b86` 的附件 `t_c52b9b86-e2e-sample.log`）：
+（少了 `认领唯一性` / `证据状态机` / `双问绑定` 三行）会直接红。下面是 2026-10-31 证据状态机
+闸门卡（`t_1429d01c`）真 git + 假 gh 跑出来的端到端样例（`#20` / `t_deadbeef` 是合法假号；
+真仓库只有路径与 sha 那段不同，预检与合并两条命令都带 `-R alsj213/team-board`，脚本与完整
+日志是该卡的附件 `t_1429d01c-e2e-sample.log`）：
 
 ```
-分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421	refs/heads/wt/t_deadbeef
+分支存在 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=0 | 2e130b963160aca12e3548f2a1341b3ca23fb87c	refs/heads/wt/t_deadbeef
 预检 | PASS | gh pr view 20 -R alsj213/team-board --json number,state,headRefName,baseRefName,headRefOid | rc=0 | state=OPEN, headRefName=wt/t_deadbeef, baseRefName=main
-head sha | PASS | 6b1d25e8f6bdbfc29ba32b37935618b9a0162421
+head sha | PASS | 2e130b963160aca12e3548f2a1341b3ca23fb87c
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
-双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 6b1d25e8f6bd 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
-rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 393c846 是 head 6b1d25e 的祖先（已 rebase 到 main）
-合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 6b1d25e8f6bdbfc29ba32b37935618b9a0162421 --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
+证据状态机 | PASS | evidence.audit(card=t_deadbeef, head=2e130b963160aca12e3548f2a1341b3ca23fb87c) | rc=0 | tier=B, qa_pass=*** review=defect+regression
+双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 2e130b963160 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
+rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 70ce884 是 head 2e130b9 的祖先（已 rebase 到 main）
+合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 2e130b963160aca12e3548f2a1341b3ca23fb87c --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
 分支删除 | PASS | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_deadbeef | rc=2 | 分支已不在远端
 结论：合并完成，源分支 wt/t_deadbeef 已从 origin 删除
 ```

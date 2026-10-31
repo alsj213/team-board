@@ -79,9 +79,9 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
   ``--no-verify``。``--verify-only`` 路径也不加这一步（它一次 gh 都不调，不宣称合并前
   状态）。
 
-合并前先过两道证据闸门（R17⑤ / R18④）
---------------------------------------
-rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdout 0 字节、**一个 gh 写操作
+合并前先过三道证据闸门（R17⑤ / 证据状态机 / R18④）
+--------------------------------------------------
+rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdout 0 字节、**一个 gh 写操作
 都不发**）：
 
 1. **认领唯一性**（R17⑤）：读看板库（``--db``，只读 ``mode=ro``）的未结卡，判「恰好一张
@@ -90,10 +90,24 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
    正则、不另写一份 —— 与 ``team-board pr-claim-audit`` 共用同一份实现。三种拒绝文案
    一眼可分：``无未结卡认领该 PR`` / ``重复认领`` / ``认领卡 ≠ --card``。这一步一次 gh
    都不调（只读本地库）。
-2. **双问绑定内容指纹**（R18④）：先与 rebase 闸门共用一次 :func:`ensure_pr_refs`
+2. **证据状态机**（四槽绑当前 head）：从 ``--branch`` 取实现卡号（``wt/t_<8 位十六进制>``
+   ，其它形态 rc2「无法定位实现卡」），读该卡的 evidence 事件，判 **tier / qa_pass /
+   review:defect / review:regression** 四槽齐、各自 id 最大的那条 ``head_sha`` 逐字等于
+   预检读到的 ``headRefOid``、写入者 profile 在角色矩阵里；``tier=C`` 另需 ``boss_approve``。
+   判定**全调** :mod:`team_board.evidence` 的 ``collect`` + ``judge``（与 ``evidence audit``
+   同一份实现），本模块不重写、也不写第二条 SQL。拒绝文案是「证据闸门拦下 PR #<n>（实现
+   卡 <卡>）：<verdict>；<detail>」，verdict 只用 ``evidence`` 的七个字面量。一次 gh 都不调。
+3. **双问绑定 head sha**（R18④）：用 ``--pr`` 与预检读到的 ``headRefOid`` 调
+   :func:`team_board.reviewhead.fetch_bodies` / ``analyze``，要求该 sha 上 ``defect`` +
+   ``regression`` 各 ≥1 条结构化标记（``REVIEW-HEAD`` / ``REVIEW-KIND``）。只发两条
+   ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，``--paginate``），
+   取数失败 / 证据不齐一律 rc2。三种拒绝文案：``双问缺证``（一条标记都没有） /
+   ``双问陈旧``（有标记但都不是当前 head，即 head 变了没重跑双问） / ``双问缺类``
+   （当前 head 上缺某一类）。
+3. **双问绑定内容指纹**（R18④）：先与 rebase 闸门共用一次 :func:`ensure_pr_refs`
    （``git fetch`` 到 ``refs/merge-guard/<pr>/{base,head}``）、核对该 head ref 逐字等于预检
    读到的 ``headRefOid``，再用 :func:`team_board.reviewhead.fingerprint` 算这一轮的内容指纹
-   （``git diff -U0 <mb> <head> | git patch-id --stable``），最后用
+   （``git diff -U0 <mb> <head>`` 的内容行 sha256 前 40 位），最后用
    :func:`team_board.reviewhead.fetch_bodies` / ``analyze`` 要求该指纹上 ``defect`` +
    ``regression`` 各 ≥1 条结构化标记（``REVIEW-PATCH`` / ``REVIEW-KIND``；旧 ``REVIEW-HEAD``
    按内容复用）。只发两条 ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，
@@ -109,8 +123,9 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
    （或不是 GitHub 形态 / 读不到 remote）→ rc2 拒绝。跨仓时它原本会去读**另一个仓库**
    同号 PR 的评审 —— 判的是别人的证据。
 
-两道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-review-head``），也都不在
-``--verify-only`` 路径上跑（那条路径不合并，不该要求认领与双问）。
+三道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-evidence`` /
+``--skip-review-head``，也没有 ``--allow-stale`` / ``--force``），且都不在
+``--verify-only`` 路径上跑（那条路径不合并，不该要求认领、证据与双问）。
 
 合并方式只认一种
 ----------------
@@ -182,7 +197,9 @@ rebase 闸门之前还有两道**只读**闸门，顺序固定（拒绝时 stdou
   带 ``refs/`` 前缀）、``--branch`` 是 ``main`` / ``master``
   或等于该 PR 的 ``baseRefName``、``--branch`` 与 PR 的 ``headRefName`` 不一致、
   **合并前认领闸门拒绝**（读不到看板库 / PR 无未结卡认领 / 重复认领 / 认领卡 ≠
-  ``--card``）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
+  ``--card``）、**合并前证据状态机闸门拒绝**（``--branch`` 不是 ``wt/t_xxxxxxxx`` 形态；
+  读不到看板库 / 读 evidence 事件失败；四槽缺项 / 绑的是旧 head / 双问阻塞 / 缺老板点头 /
+  证据串卡 / 角色不符）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
   双问缺类 / ``--repo`` 的 remote 读不到或不是 GitHub 形态 / 该仓库 ≠
   ``alsj213/team-board``）、
   **合并前 rebase 闸门拒绝**（``gh pr view`` 的 ``baseRefName`` 形态非法；``git fetch``
@@ -231,7 +248,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from team_board import db, prclaim, reviewhead
+from team_board import db, evidence, prclaim, reviewhead
 from team_board.merges import MERGE_BY_RE, MERGE_CARD_RE, check_message
 from team_board.model import DEFAULT_DB
 
@@ -278,6 +295,9 @@ STEP_REBASE = "rebase"
 STEP_CLAIM = "认领唯一性"
 #: 合并前「双问绑定 head sha」闸门的步骤标签（R18④；判据 = ``reviewhead.analyze``）
 STEP_REVIEW_HEAD = "双问绑定"
+#: 合并前「证据状态机」闸门的步骤标签（四槽 tier / qa_pass / review×2 绑当前 head；
+#: 判据 = ``evidence.collect`` + ``evidence.judge``，本模块不重写判定）
+STEP_EVIDENCE = "证据状态机"
 
 #: 私有 ref 命名空间前缀：本工具把远端 base / head 抓到这里再判祖先关系。
 #: 它**不在** ``refs/heads`` / ``refs/remotes`` 下 —— :mod:`team_board.branches`
@@ -1268,7 +1288,7 @@ def parse_pr_view(proc: CommandResult, pr: int) -> Preflight:
     )
 
 
-# ---------------------------------------------------- 合并前的两道证据闸门
+# ---------------------------------------------------- 合并前的三道证据闸门
 
 def _claim_row_ids(rows: tuple[prclaim.ClaimRow, ...]) -> str:
     """认领卡的卡号清单（拒绝文案里用；0 张时是 ``(无)``）。"""
@@ -1498,6 +1518,90 @@ def _remote_head_sha(opts: Options) -> str:
         timeout=opts.command_timeout,
     )
     return rev.stdout.strip() if rev.returncode == 0 else key_line(rev)
+
+def evidence_slots_summary(judgment: evidence.Judgment) -> str:
+    """四槽摘要（``证据状态机 | PASS`` 行的最后一格）：``tier=B, qa_pass=*** review=...``。
+
+    只报**槽位名与档位**，不报 run_id / 事件 id —— 那两样在 ``evidence audit`` 的报告里，
+    证据行本身只需要一眼看出「哪四槽齐了」。``qa_pass`` 刻意写成 ``***``（契约示例口径）：
+    这一行会进卡片与 CI 日志，没必要把执行 run 的身份抄第二遍。
+    """
+
+    by_name = {slot.name: slot for slot in judgment.slots}
+    tier_slot = by_name.get("tier")
+    tier = "?"
+    if tier_slot is not None and tier_slot.event is not None:
+        value = tier_slot.event.payload.get("tier")
+        tier = value if isinstance(value, str) else "?"
+    reviews = [
+        slot.name.split(":", 1)[1]
+        for slot in judgment.slots
+        if slot.name.startswith("review:") and slot.ok
+    ]
+    return f"tier={tier}, qa_pass=*** review={'+'.join(reviews) or '-'}"
+
+
+def evidence_gate(opts: Options, info: Preflight) -> str:
+    """**合并前证据状态机闸门**：四槽齐、且全绑预检读到的 ``headRefOid``，否则 rc2。
+
+    判据**全部**来自 :mod:`team_board.evidence`（``collect`` 取数、``judge`` 判定），本模块
+    不复制判定逻辑、也不另写一份 SQL：``evidence audit`` 与服务端别处用的是同一份实现，
+    两份口径迟早会分叉，而分叉的那一侧会让「稽核说齐、合并闸门说不齐」同时成立。
+
+    实现卡号从 ``--branch`` 取（:func:`team_board.evidence.card_from_branch`，整串
+    ``wt/t_<8 位小写十六进制>``）：不是这个形态就**没有实现卡可查**，rc2 拒绝 —— 不许
+    「查不到就当齐」，也不新增 ``--impl-card`` 参数让调用方自己指。
+
+    拒绝文案（一行 ``错误: …``、stdout 0 字节、零 gh 写调用）：
+
+    - ``--branch`` 不是 ``wt/t_xxxxxxxx`` → 「无法定位实现卡」；
+    - 库不可用 / 读事件失败 → 文案点名 ``--db`` 与该路径（与 :func:`claim_gate` 同口径，
+      「读不到库」不许被读成「没有证据」）；
+    - 判定不过 → ``证据闸门拦下 PR #<n>（实现卡 <卡>）：<verdict>；<detail>``，verdict 是
+      :mod:`team_board.evidence` 的七个字面量之一（``缺证据`` / ``证据对新 head 无效`` /
+      ``双问阻塞`` / ``缺老板点头`` / ``证据串卡`` / ``角色不符``），本模块不造新词。
+
+    这一步只读库（``mode=ro``），不改状态、不写事件。``--verify-only`` 路径**不跑**它：
+    那条路径不合并，也就没有「合并前状态」可宣称。
+    """
+
+    impl_card = evidence.card_from_branch(opts.branch)
+    if impl_card is None:
+        raise MergeGuardError(
+            f"--branch {opts.branch} 不是 wt/t_xxxxxxxx 形态，无法定位实现卡；拒绝合并"
+        )
+    head = info.head_oid
+    try:
+        conn = db.connect(opts.db_path)
+    except (db.BoardError, OSError) as exc:
+        raise MergeGuardError(
+            f"读看板库失败（--db {opts.db_path}），无法判定 PR #{opts.pr} 的验收证据状态"
+            f"（实现卡 {impl_card}）：{exc}；拒绝合并"
+            f"（证据闸门只读 --db 指向的库，缺省 {DEFAULT_DB}）"
+        ) from exc
+    try:
+        events = evidence.collect(conn, impl_card)
+        judgment = evidence.judge(events, head, opts.pr)
+    except evidence.EvidenceReadError as exc:
+        raise MergeGuardError(
+            f"读取实现卡 {impl_card} 的 evidence 事件失败（--db {opts.db_path}）：{exc}；"
+            f"无法判定 PR #{opts.pr} 的验收证据状态，拒绝合并"
+        ) from exc
+    finally:
+        conn.close()
+    if not judgment.ok:
+        raise MergeGuardError(
+            f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：{judgment.verdict}；"
+            f"{judgment.detail}；拒绝合并（证据必须绑当前 head，R 状态机化）"
+        )
+    return format_step(
+        STEP_EVIDENCE,
+        ok=True,
+        # 这一步同样没有外部命令：判据是本地只读库 + evidence 的纯函数判定
+        command=f"evidence.audit(card={impl_card}, head={head})",
+        rc=0,
+        key=evidence_slots_summary(judgment),
+    )
 
 
 def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
@@ -2172,11 +2276,13 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
             f"--branch {opts.branch} 等于 PR {opts.pr} 的 baseRefName，"
             "拒绝合并（合并后删除会毁掉主分支）"
         )
-    # 合并**前**的两道证据闸门（顺序固定，见模块 docstring）：
+    # 合并**前**的三道证据闸门（顺序固定，见模块 docstring）：
     #   ① 认领唯一性（R17⑤）——只读看板库，一次 gh 都不调；
-    #   ② 双问绑定内容指纹（R18④）——共用一次 fetch + 两条 gh api GET，判据是内容指纹。
-    # 两者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
+    #   ② 证据状态机（四槽绑当前 head）——只读看板库，调 evidence.collect + judge；
+    #   ③ 双问绑定内容指纹（R18④）——共用一次 fetch + 两条 gh api GET，判据是内容指纹。
+    # 三者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
     claim_line = claim_gate(opts, info)
+    evidence_line = evidence_gate(opts, info)
     review_line = review_head_gate(opts, info, repo_slug)
     # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。
     # 排在这里（而不是 lines 攒完之后）是刻意的：拒绝时 stdout 必须 0 字节，
@@ -2204,6 +2310,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         # 预检钉到**提交**：这条 sha 就是合并时交给 --match-head-commit 的那个值。
         f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
         claim_line,
+        evidence_line,
         review_line,
         rebase_line,
     ]

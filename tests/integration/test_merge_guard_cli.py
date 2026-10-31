@@ -121,6 +121,19 @@ def review_line(stub: Stub) -> str:
     )
 
 
+def evidence_line(stub: Stub) -> str:
+    """证据状态机闸门通过时的那一行证据（默认 fixture：四槽齐、全绑 ``HEAD_OID``）。
+
+    判据是本地只读库 + ``evidence.collect`` / ``judge`` 纯函数，没有外部命令；命令格写
+    数据来源与实现卡，最后一格是四槽摘要（``qa_pass`` 按契约示例打码成 ``***``）。
+    """
+
+    return (
+        f"证据状态机 | PASS | evidence.audit(card={MERGE_CARD}, head={HEAD_OID}) | rc=0 | "
+        "tier=B, qa_pass=*** review=defect+regression"
+    )
+
+
 GH_STUB = """#!/bin/sh
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$1" = "api" ]; then
@@ -310,22 +323,78 @@ def patch_body(pid: str, kind: str) -> str:
 
     return f"REVIEW-PATCH: {pid}\nREVIEW-KIND: {kind}\n"
 
+def default_evidence_rows(head: str = HEAD_OID) -> list[tuple[str, str, int]]:
+    """证据状态机闸门要的默认四槽（tier / qa_pass / review:defect / review:regression）。
 
-def make_board_db(path: Path, cards: list[tuple[str, str, str]]) -> Path:
-    """造一个最小看板库（``tasks`` 只有认领闸门要的四列）。
+    四条全绑 ``head``（= 预检的 ``headRefOid``），写入 run 的 profile 落在角色矩阵里
+    （``tier`` pm / ``qa_pass`` qa / ``review`` pm+qa）。缺省行就是「四槽齐、head 一致」，
+    各用例按需用 :meth:`Stub.set_evidence` 换成「缺一槽 / 绑旧 head / tier=C」等红样。
+    """
+
+    return [
+        (
+            "tier",
+            json.dumps({"tier": "B", "reason": "文档 + 单测", "head_sha": head}, ensure_ascii=False),
+            1,
+        ),
+        ("qa_pass", json.dumps({"head_sha": head, "run_id": 2}), 2),
+        (
+            "review",
+            json.dumps({"kind": "defect", "head_sha": head, "verdict": "pass"}),
+            2,
+        ),
+        (
+            "review",
+            json.dumps({"kind": "regression", "head_sha": head, "verdict": "pass"}),
+            1,
+        ),
+    ]
+
+
+def make_board_db(
+    path: Path,
+    cards: list[tuple[str, str, str]],
+    *,
+    evidence_card: str | None = None,
+    evidence: list[tuple[str, str, int | None]] | None = None,
+) -> Path:
+    """造一个最小看板库（``tasks`` 四列 + evidence 事件的两张表）。
 
     ``cards`` 是 ``(卡号, status, body)``；``assignee`` 一律写 ``engineer``（认领闸门不
     看它）。表结构照真库的子集：``db.iter_claim_rows`` 只读
-    ``id, status, assignee, body`` + ``status NOT IN ('done','archived')``。
+    ``id, status, assignee, body`` + ``status NOT IN ('done','archived')``；
+    ``evidence.collect`` 读 ``task_events(id,task_id,kind,payload,run_id,created_at)``
+    并 ``LEFT JOIN task_runs`` 取 profile。
+
+    ``evidence_card`` 非空时把 ``evidence``（缺省 = :func:`default_evidence_rows` 四槽齐）
+    写进该卡的 evidence 事件 —— 证据状态机闸门按 ``--branch`` 取实现卡号，所以这里的
+    卡号必须是 ``wt/t_<卡号>`` 的那个实现卡。
     """
 
     conn = sqlite3.connect(str(path))
     try:
         conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, body TEXT)")
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, profile TEXT)")
+        conn.execute(
+            "CREATE TABLE task_events ("
+            "id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
+            "run_id INTEGER, created_at INTEGER)"
+        )
         conn.executemany(
             "INSERT INTO tasks (id, status, assignee, body) VALUES (?, ?, ?, ?)",
             [(card, status, "engineer", body) for card, status, body in cards],
         )
+        conn.executemany(
+            "INSERT INTO task_runs (id, profile) VALUES (?, ?)",
+            [(1, "pm"), (2, "qa"), (3, "paimeng")],
+        )
+        if evidence_card is not None:
+            rows = default_evidence_rows() if evidence is None else evidence
+            conn.executemany(
+                "INSERT INTO task_events (task_id, kind, payload, run_id, created_at) "
+                "VALUES (?, ?, ?, ?, 0)",
+                [(evidence_card, kind, payload, run_id) for kind, payload, run_id in rows],
+            )
         conn.commit()
     finally:
         conn.close()
@@ -374,11 +443,17 @@ class Stub:
         self.setenv("FAKE_COMMENTS_JSON", json.dumps([{"body": b} for b in comments]))
 
     def set_claims(self, cards: list[tuple[str, str]]) -> None:
-        """重写 fixture 看板库里的未结卡（``(卡号, 正文)``，status 一律 ``running``）。"""
+        """重写 fixture 看板库里的未结卡（``(卡号, 正文)``，status 一律 ``running``）。
+
+        重建库时把默认四槽证据一起写回实现卡（``--branch`` 对应的卡号）：认领类用例
+        未必走到证据闸门，但走到时不该因为 fixture 少了 ``task_events`` 而假红。
+        """
 
         self.board_db.unlink(missing_ok=True)
         make_board_db(
-            self.board_db, [(card, "running", body) for card, body in cards]
+            self.board_db,
+            [(card, "running", body) for card, body in cards],
+            evidence_card=MERGE_CARD,
         )
 
     def add_content(self, files: dict[str, bytes]) -> str:
@@ -429,6 +504,31 @@ class Stub:
         assert value is not None, "fixture 的 head ref 应能算出 patch 指纹"
         return value
 
+    def set_evidence(
+        self,
+        rows: list[tuple[str, str, int | None]] | None = None,
+        *,
+        card: str = MERGE_CARD,
+    ) -> None:
+        """重写 fixture 库里的 evidence 事件（``None`` = 恢复默认四槽齐、绑 ``HEAD_OID``）。
+
+        证据状态机闸门按 ``--branch``（``wt/t_<卡号>``）取实现卡号，``card`` 默认就是
+        ``MERGE_CARD``（= 本 fixture 的 ``--card`` 与 ``CARD_BRANCH`` 的卡号）。
+        """
+
+        conn = sqlite3.connect(str(self.board_db))
+        try:
+            with conn:
+                conn.execute("DELETE FROM task_events")
+                events = default_evidence_rows() if rows is None else rows
+                conn.executemany(
+                    "INSERT INTO task_events (task_id, kind, payload, run_id, created_at) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    [(card, kind, payload, run_id) for kind, payload, run_id in events],
+                )
+        finally:
+            conn.close()
+
     def git_calls(self) -> list[str]:
         return [call for call in self.calls() if call.startswith("git ")]
 
@@ -471,7 +571,9 @@ def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     body_file.write_text(BODY_TEXT, encoding="utf-8")
     # 认领闸门的 fixture 库：恰好一张未结卡认领 PR #9，且卡号就是 --card
     board_db = make_board_db(
-        tmp_path / "board.db", [(MERGE_CARD, "running", "PR-CLAIM: #9\n")]
+        tmp_path / "board.db",
+        [(MERGE_CARD, "running", "PR-CLAIM: #9\n")],
+        evidence_card=MERGE_CARD,
     )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_LOG", str(log))
@@ -742,13 +844,14 @@ def test_merge_ok_and_branch_deleted_rc0(
     assert lines[1].startswith(f"预检 | PASS | {VIEW_CALL} | rc=0 | ")
     # 预检钉到提交：新增一行 head sha 证据（值是假 gh 报的 headRefOid）
     assert lines[2] == f"head sha | PASS | {HEAD_OID}"
-    # 预检之后、rebase 之前：两道证据闸门（认领唯一性 → 双问绑定 head sha）
+    # 预检之后、rebase 之前：三道证据闸门（认领唯一性 → 证据状态机 → 双问绑定 head sha）
     assert lines[3] == claim_line(stub)
-    assert lines[4] == review_line(stub)
+    assert lines[4] == evidence_line(stub)
+    assert lines[5] == review_line(stub)
     # 然后才是 rebase 闸门（base 必须是 head 的祖先）
-    assert lines[5] == rebase_line(stub)
-    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
-    assert lines[7].startswith(
+    assert lines[6] == rebase_line(stub)
+    assert lines[7].startswith(f"合并 | PASS | {merge_call(stub)} | rc=0 | ")
+    assert lines[8].startswith(
         f"分支删除 | PASS | git -C {stub.repo} ls-remote --exit-code --refs "
         f"origin refs/heads/{CARD_BRANCH} | rc=2 | "
     )
@@ -1360,9 +1463,12 @@ def test_missing_gh_rc2(
     repo.mkdir()
     body_file = tmp_path / "merge-body.txt"
     body_file.write_text(BODY_TEXT, encoding="utf-8")
-    # 认领闸门先过（只读本地库，不需要 gh），才会走到「取评审正文时 gh 不见了」
+    # 认领闸门与证据状态机闸门都先过（都只读本地库，不需要 gh），才会走到「取评审正文时
+    # gh 不见了」
     board_db = make_board_db(
-        tmp_path / "board.db", [(MERGE_CARD, "running", "PR-CLAIM: #9\n")]
+        tmp_path / "board.db",
+        [(MERGE_CARD, "running", "PR-CLAIM: #9\n")],
+        evidence_card=MERGE_CARD,
     )
     stub = Stub(bindir, tmp_path / "calls.log", repo, body_file, monkeypatch.setenv, board_db)
 
@@ -1438,9 +1544,10 @@ def test_git_vanishes_after_merge_keeps_evidence(
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
     assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
-    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
-    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[4] == evidence_line(stub)  # 再是证据状态机闸门（四槽绑当前 head）
+    assert lines[5] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[6] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[7].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # stderr 只有一行
@@ -1462,9 +1569,10 @@ def test_merge_ok_but_undetermined_rc2(
     assert lines[0].startswith("分支存在 | PASS | ")  # 合并已发生 → 证据必须留下
     assert lines[1].startswith("预检 | PASS | ")
     assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
-    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
-    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)}")
+    assert lines[4] == evidence_line(stub)  # 再是证据状态机闸门（四槽绑当前 head）
+    assert lines[5] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[6] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[7].startswith(f"合并 | PASS | {merge_call(stub)}")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1
@@ -1640,9 +1748,10 @@ def test_unexpected_exception_after_merge_keeps_evidence(
     assert lines[0].startswith("分支存在 | PASS | ")
     assert lines[1].startswith("预检 | PASS | ")
     assert lines[3] == claim_line(stub)  # 预检之后：认领唯一性闸门
-    assert lines[4] == review_line(stub)  # 再是双问绑定闸门
-    assert lines[5] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
-    assert lines[6].startswith(f"合并 | PASS | {merge_call(stub)} | ")
+    assert lines[4] == evidence_line(stub)  # 再是证据状态机闸门（四槽绑当前 head）
+    assert lines[5] == review_line(stub)  # 再是双问绑定闸门
+    assert lines[6] == rebase_line(stub)  # 预检之后、合并之前：rebase 闸门
+    assert lines[7].startswith(f"合并 | PASS | {merge_call(stub)} | ")
     assert "Traceback" not in out + err
     assert err.startswith("错误: ")
     assert err.count("\n") == 1  # 一行，没有 traceback
@@ -2424,8 +2533,10 @@ def test_merge_guard_commit_passes_merge_audit_require(
     )
     # 判据①（merged-by 的 profile == 该卡 tasks.assignee）要读看板库：造一份最小库，
     # 探针卡 assignee=repo，与 merged-by: repo/run200 的 profile 严格一致。
-    # 同一份库也给 merge_guard 的认领闸门用：探针卡正文认领 PR #PROBE_PR。
+    # 同一份库也给 merge_guard 的认领闸门与证据状态机闸门用：探针卡正文认领 PR #PROBE_PR、
+    # 四槽证据全绑探针分支当前的 head（= 假 gh 预检会报出来的那个 headRefOid）。
     board = tmp_path / "board.db"
+    head = _git("rev-parse", f"origin/{PROBE_BRANCH}", cwd=work).stdout.strip()
     with sqlite3.connect(board) as conn:
         conn.execute(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, assignee TEXT, status TEXT, body TEXT)"
@@ -2433,6 +2544,21 @@ def test_merge_guard_commit_passes_merge_audit_require(
         conn.execute(
             "INSERT INTO tasks (id, assignee, status, body) VALUES (?, ?, ?, ?)",
             (PROBE_CARD, "repo", "running", f"PR-CLAIM: #{PROBE_PR}\n"),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, profile TEXT)")
+        conn.execute(
+            "CREATE TABLE task_events ("
+            "id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
+            "run_id INTEGER, created_at INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO task_runs (id, profile) VALUES (?, ?)",
+            [(1, "pm"), (2, "qa"), (3, "paimeng")],
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload, run_id, created_at) "
+            "VALUES (?, ?, ?, ?, 0)",
+            [(PROBE_CARD, kind, payload, run_id) for kind, payload, run_id in default_evidence_rows(head)],
         )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_REAL_GIT", REAL_GIT)
@@ -3060,11 +3186,12 @@ def test_gates_pass_keeps_merge_argv_verbatim(
         f"gh pr merge 9 -R {REPO_SLUG} --merge --delete-branch --match-head-commit {HEAD_OID}"
         f" --subject {MERGE_SUBJECT} --body-file {stub.body_file}"
     ]
-    # 两道闸门的证据行都在，顺序 = 认领 → 双问 → rebase
+    # 三道闸门的证据行都在，顺序 = 认领 → 证据状态机 → 双问 → rebase
     lines = out.splitlines()
     assert lines[3] == claim_line(stub)
-    assert lines[4] == review_line(stub)
-    assert lines[5] == rebase_line(stub)
+    assert lines[4] == evidence_line(stub)
+    assert lines[5] == review_line(stub)
+    assert lines[6] == rebase_line(stub)
 
 
 def test_verify_only_never_runs_gates(stub: Stub, capsys: pytest.CaptureFixture[str]) -> None:
@@ -3238,6 +3365,7 @@ STEP_ORDER = (
     mg.STEP_PREFLIGHT,
     mg.STEP_HEAD_SHA,
     mg.STEP_CLAIM,
+    mg.STEP_EVIDENCE,
     mg.STEP_REVIEW_HEAD,
     mg.STEP_REBASE,
     mg.STEP_MERGE,
@@ -3306,7 +3434,7 @@ def test_docs_declare_same_step_order(name: str) -> None:
     ("name", "marker"),
     [
         ("README.md", "跑出来的端到端样例（"),
-        ("docs/merge-rebase-gate.md", "现行 8 行样例（2026-10-30"),
+        ("docs/merge-rebase-gate.md", "现行 9 行样例（2026-10-31"),
     ],
 )
 def test_docs_sample_block_matches_step_order(name: str, marker: str) -> None:
