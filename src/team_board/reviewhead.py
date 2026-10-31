@@ -34,6 +34,7 @@ import re
 import subprocess  # nosec B404
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 #: 唯一仓库（``gh api`` 的路径前缀）
 REPO = "alsj213/team-board"
@@ -255,3 +256,251 @@ def fetch_bodies(pr: int) -> tuple[str, ...]:
             body = item.get("body")
             bodies.append(body if isinstance(body, str) else "")
     return tuple(bodies)
+
+
+# ------------------------------------------------- 分支内容指纹（patch-id -U0，唯一算法处）
+#
+# 这一层只回答一个问题：「两个 rev 之间的**内容改动**是不是同一份」。判据是
+# ``git patch-id --stable`` 对 **-U0** diff 的哈希：
+#
+# - ``-U0`` 必须显式写。``git patch-id`` 会把 ±3 行上下文一起哈希，于是纯 rebase
+#   （main 在同文件别处改动、行号位移）会换 id —— 那是误杀，不是内容变了。
+# - 换文件 / 真改内容仍然换 id：这正是要被判出来的两件事。
+# - 二进制**判不了**：patch-id 只哈希 ``Binary files a/x and b/x differ`` 这一行，
+#   两个不同的 blob 得到同一个 id。所以见到二进制就返回 ``kind="binary"`` 让上层
+#   拒绝复用证据，不许当成「内容没变」。
+
+#: 指纹算法标识（报告行必须引用它；换算法 = 换这个字符串）
+FINGERPRINT_ALGO = "patch-id-U0-v1"
+
+#: 单次 git 调用的硬超时（秒）：一次卡住的 git 不许把整张卡拖到 worker 超时
+GIT_TIMEOUT_SECONDS = 120
+
+#: patch-id 的形态：40 位小写十六进制
+PATCH_ID_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+
+#: 二进制文件在 ``git diff --numstat`` 里的行首（``-\t-\t<path>``）
+NUMSTAT_BINARY_PREFIX = "-\t-\t"
+
+#: ``--numstat`` 的一行：``<added|->\t<deleted|->\t<path>``。
+#: 注意 ``git diff --numstat -U0``（git 2.34.1 实测）会把 numstat 行**接着**打一份完整
+#: patch 出来（``-U<n>`` 本身隐含 -p），所以只能从混排流里先切出 numstat 段，
+#: 不能整段当路径用，也不能只按行筛（见 :func:`_numstat_rows`）。
+NUMSTAT_ROW_RE = re.compile(r"(?:[0-9]+|-)\t(?:[0-9]+|-)\t.*", re.ASCII)
+
+#: 混排输出里 patch 段的起始行前缀（``--numstat`` 之后紧跟的整份 patch）。
+PATCH_SECTION_PREFIXES = ("diff --git ", "diff --cc ", "diff --combined ")
+
+
+class PatchIdError(Exception):
+    """git 侧失败（缺 git / 超时 / 非 UTF-8 / 非 0 退出）：CLI 层映射 rc2。"""
+
+
+class GitMissingError(PatchIdError):
+    """PATH 里没有 git（环境故障：不许被当成「对象取不到」吞掉）。"""
+
+
+@dataclass(frozen=True)
+class Fingerprint:
+    """一段分支内容的指纹。
+
+    ``kind`` ∈ ``{"patch", "binary", "empty"}``；``value`` 只在 ``kind=="patch"``
+    时有值（40 hex），其余为 ``None``；``merge_base`` 是 ``merge-base`` 的 40 hex
+    （报告行要打印它做复核）；``paths`` 是 numstat 里出现过的路径（二进制时点名用）。
+    """
+
+    kind: str
+    value: str | None
+    merge_base: str
+    paths: tuple[str, ...]
+
+
+def _run_git(
+    repo: str | Path,
+    argv: Sequence[str],
+    *,
+    input_bytes: bytes | None = None,
+    what: str = "",
+) -> subprocess.CompletedProcess[bytes]:
+    """跑一次 ``git -C repo <argv>``（argv 列表、shell=False、硬超时）。
+
+    只在**执行不成立**时抛 :class:`PatchIdError`（缺 git / 超时 / 其它 OSError）；
+    rc 由调用方判 —— 有的调用（``merge-base`` / ``cat-file``）本来就允许非 0。
+    """
+
+    label = what or " ".join(argv)
+    cmd = ["git", "-C", str(repo), *argv]
+    try:
+        # bandit B603/B607 假阳性：可执行文件名写死（"git"，走 PATH），参数以 argv
+        # 列表传入、shell=False；repo 与 rev 都是调用方给的实参，不经 shell。
+        return subprocess.run(  # nosec B603 B607
+            cmd,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+            shell=False,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PatchIdError(f"{label} 超时：{GIT_TIMEOUT_SECONDS} 秒内没有返回") from exc
+    except FileNotFoundError as exc:
+        raise GitMissingError("找不到 git 可执行文件（PATH 里没有 git）") from exc
+    except OSError as exc:
+        raise PatchIdError(f"无法执行 git（{label}）: {exc}") from exc
+
+
+def _stdout_text(proc: subprocess.CompletedProcess[bytes], label: str) -> str:
+    """按 UTF-8 严格解码 stdout；不是 UTF-8 → :class:`PatchIdError`。"""
+
+    try:
+        return proc.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise PatchIdError(
+            f"{label} 输出不是 UTF-8（第 {exc.start} 字节起解码失败）"
+        ) from exc
+
+
+def _stderr_first(proc: subprocess.CompletedProcess[bytes]) -> str:
+    """stderr 首行（截 200 字符，只用于报错正文）。"""
+
+    text = proc.stderr.decode("utf-8", errors="replace")
+    return (text.strip().splitlines() or [""])[0][:200]
+
+
+def _expect_ok(proc: subprocess.CompletedProcess[bytes], label: str) -> None:
+    """rc≠0 → :class:`PatchIdError`（附 stderr 首行）。"""
+
+    if proc.returncode != 0:
+        raise PatchIdError(f"{label} 失败 rc={proc.returncode}: {_stderr_first(proc)}")
+
+
+def _expect_and_get(
+    repo: str | Path, argv: Sequence[str], label: str
+) -> subprocess.CompletedProcess[bytes]:
+    """跑一次 git 并要求 rc=0，返回完整结果（stdout 是 bytes，给 patch-id 吃）。"""
+
+    proc = _run_git(repo, argv, what=label)
+    _expect_ok(proc, label)
+    return proc
+
+
+def _numstat_rows(raw: str, label: str) -> list[str]:
+    """从 ``diff --numstat -U0`` 的混排输出里只取 numstat 段。
+
+    git 2.34.1 实测：``git diff --numstat -U0`` 的 stdout = numstat 行 + 空行 + 一整份
+    patch（``-U<n>`` 本身隐含 ``-p``；``--numstat -U0 --no-patch`` 会把 numstat 一起关掉，
+    不可用）。patch 正文的删除行本身就长成 ``-\\t5\\tghost`` / ``-\\t-\\tpayload``，逐行按
+    :data:`NUMSTAT_ROW_RE` 筛会把它当成 numstat 行 —— 后果是纯文本 diff 被报成
+    ``kind="binary"``、``paths`` 混进正文碎片。所以先按第一个 ``diff --git`` 行切段，
+    再在 numstat 段内逐行校验：段里出现解析不了的行 = 格式不认识，fail-closed 抛
+    :class:`PatchIdError`，不猜。
+    """
+
+    lines = raw.splitlines()
+    boundary = len(lines)
+    for index, line in enumerate(lines):
+        if line.startswith(PATCH_SECTION_PREFIXES):
+            boundary = index
+            break
+    rows = [line for line in lines[:boundary] if line.strip()]
+    if not rows:
+        raise PatchIdError(
+            f"{label} 有输出但解析不出 numstat 行（按取不到明细处理，不猜）"
+        )
+    for line in rows:
+        if NUMSTAT_ROW_RE.fullmatch(line) is None:
+            raise PatchIdError(
+                f"{label} 的 numstat 段有解析不了的行（不猜）: {line[:120]!r}"
+            )
+    return rows
+
+
+def fingerprint(repo: str | Path, base_ref: str, head_rev: str) -> Fingerprint:
+    """``base_ref`` 与 ``head_rev`` 之间内容改动的指纹（``FINGERPRINT_ALGO``）。
+
+    1. ``merge-base`` 取分叉点，rc≠0（不是共同祖先 / 未知 rev）→ :class:`PatchIdError`；
+    2. ``diff --numstat -U0 mb head``：空输出 → ``kind="empty"``；任一行以
+       ``-\\t-\\t`` 开头 → ``kind="binary"``（paths 收全）；
+    3. 否则 ``diff -U0 --no-color mb head | patch-id --stable`` 的第一列 40 hex →
+       ``kind="patch"``。
+    """
+
+    mb_proc = _run_git(
+        repo,
+        ("merge-base", base_ref, head_rev),
+        what=f"git merge-base {base_ref} {head_rev}",
+    )
+    _expect_ok(mb_proc, f"git merge-base {base_ref} {head_rev}")
+    merge_base = _stdout_text(mb_proc, "git merge-base").strip()
+    if not merge_base:
+        raise PatchIdError(f"git merge-base {base_ref} {head_rev} 无输出（空 merge base）")
+
+    numstat_label = "git diff --numstat -U0"
+    numstat_raw = _stdout_text(
+        _expect_and_get(repo, ("diff", "--numstat", "-U0", merge_base, head_rev), numstat_label),
+        numstat_label,
+    )
+    if not numstat_raw.strip():
+        return Fingerprint(kind="empty", value=None, merge_base=merge_base, paths=())
+    # 同一条命令的 stdout 里 numstat 段后面还跟着一整份 patch，先切段再逐行校验
+    lines = _numstat_rows(numstat_raw, numstat_label)
+    paths = tuple(line.split("\t")[-1] for line in lines)
+    if any(line.startswith(NUMSTAT_BINARY_PREFIX) for line in lines):
+        return Fingerprint(
+            kind="binary", value=None, merge_base=merge_base, paths=paths
+        )
+
+    diff_label = "git diff -U0 --no-color"
+    diff_proc = _expect_and_get(
+        repo, ("diff", "-U0", "--no-color", merge_base, head_rev), diff_label
+    )
+    pid_label = "git patch-id --stable"
+    pid_proc = _run_git(
+        repo, ("patch-id", "--stable"), input_bytes=diff_proc.stdout, what=pid_label
+    )
+    _expect_ok(pid_proc, pid_label)
+    for line in _stdout_text(pid_proc, pid_label).splitlines():
+        columns = line.split()
+        if columns and PATCH_ID_RE.fullmatch(columns[0]) is not None:
+            return Fingerprint(
+                kind="patch",
+                value=columns[0],
+                merge_base=merge_base,
+                paths=paths,
+            )
+    raise PatchIdError(f"{pid_label} 没有输出 40 hex 的 patch-id（diff 非空却无哈希）")
+
+
+def _has_commit(repo: str | Path, rev: str) -> bool:
+    """本地是否已有该 commit 对象（``cat-file -e <rev>^{commit}``，rc≠0 即没有）。"""
+
+    proc = _run_git(
+        repo, ("cat-file", "-e", f"{rev}^{{commit}}"), what=f"git cat-file -e {rev}"
+    )
+    return proc.returncode == 0
+
+
+def fingerprint_of_commit(
+    repo: str | Path, base_ref: str, sha: str, remote: str = "origin"
+) -> Fingerprint | None:
+    """按「某条历史 head sha」算指纹：本地没有对象就先按 sha fetch 一次。
+
+    取不到对象不是异常（调用方按「不可验证」处理）：fetch 失败（含超时 / rc≠0 /
+    没有这个 remote）→ 返回 ``None``。真·环境故障（缺 git、diff 失败、非 UTF-8）
+    仍然是 :class:`PatchIdError`。
+    """
+
+    if not _has_commit(repo, sha):
+        fetch_label = f"git fetch --no-tags --quiet {remote} {sha}"
+        try:
+            _run_git(
+                repo,
+                ("fetch", "--no-tags", "--quiet", remote, sha),
+                what=fetch_label,
+            )
+        except PatchIdError:
+            # 缺 git 之外的失败（网络 / 超时 / 没这个 remote / rc≠0）都归「对象取不到」
+            return None
+        if not _has_commit(repo, sha):
+            return None
+    return fingerprint(repo, base_ref, sha)
