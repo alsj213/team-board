@@ -26,6 +26,7 @@ from team_board.reviewhead import (
     PatchIdError,
     fingerprint,
     fingerprint_of_commit,
+    patch_id_supports_verbatim,
 )
 
 _GIT_ENV = {
@@ -78,7 +79,13 @@ def make_repo(tmp_path: Path) -> Path:
 
 
 def patch_id(repo: Path, base: str, head: str, *diff_args: str) -> str:
-    """不经被测模块直接算 ``patch-id``（只用于对照 ``-U0`` / ``-U3`` 的差别）。"""
+    """不经被测模块直接算 ``patch-id``（只用于对照 ``-U0`` / ``-U3`` 的差别）。
+
+    档位旗标必须与被测模块一致（:func:`patch_id_supports_verbatim`）：新 git 上
+    ``fingerprint()`` 走 ``--verbatim``（空白敏感），这里再用 ``--stable`` 对比就是拿两套
+    归一化比大小（CI 实测两者哈希不同）。``--verbatim`` 隐含 ``--stable``，但两者不能同时
+    显式给（rc=129），所以是二选一。
+    """
 
     diff = subprocess.run(
         ["git", "-C", str(repo), "diff", *(diff_args or ("-U0",)), "--no-color", base, head],
@@ -86,8 +93,9 @@ def patch_id(repo: Path, base: str, head: str, *diff_args: str) -> str:
         env=_GIT_ENV,
         check=True,
     ).stdout
+    mode = ("--verbatim",) if patch_id_supports_verbatim(repo) else ("--stable",)
     out = subprocess.run(
-        ["git", "-C", str(repo), "patch-id", "--stable"],
+        ["git", "-C", str(repo), "patch-id", *mode],
         input=diff,
         capture_output=True,
         env=_GIT_ENV,
