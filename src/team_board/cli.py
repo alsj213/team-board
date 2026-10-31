@@ -478,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
         "gate",
         help=(
             "包一层检查器命令：全量输出落 <log-dir>/<gate>-<卡号>.log、stdout 只回摘要"
-            "（rc 透传子命令 / 2 = 参数或环境错误）"
+            "（rc 透传子命令；2 = gate 自身参数/环境错误，或子命令自己返回 2）"
         ),
     )
     gate_cmd.add_argument(

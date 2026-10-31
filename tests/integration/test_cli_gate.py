@@ -100,6 +100,43 @@ def test_rc1_is_transparent_and_log_still_written(
     assert "FAILED tests/x.py::t" in path.read_text(encoding="utf-8")
 
 
+def test_child_exit_2_is_transparent_like_any_other_rc(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """子命令自己 ``sys.exit(2)``：rc2 透传，但走的是正常路径 —— 日志与摘要照写、stderr 空。
+
+    与 ``test_rc2_when_child_cannot_start`` 的 rc2 区分：那是 (a) gate 自身错误
+    （stderr 恰一行 ``错误: …``、stdout 空、不写日志）；这里是 (b) 子命令的退出码
+    （stdout 有摘要、日志照写、stderr 空）。
+    """
+    log_dir = tmp_path / "g"
+    code, out, err = run(
+        capsys,
+        "gate",
+        "--gate",
+        "pytest",
+        "--card",
+        CARD,
+        "--log-dir",
+        str(log_dir),
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; print('ERROR boom'); sys.exit(2)",
+    )
+
+    assert err == ""
+    assert code == 2
+    lines = out.splitlines()
+    assert lines[0] == "gate: pytest"
+    assert lines[2] == "exit: 2"
+    assert "  ERROR boom" in lines
+
+    path = log_of(out)
+    assert path == log_dir / f"pytest-{CARD}.log"
+    assert path.read_text(encoding="utf-8") == "ERROR boom\n"
+
+
 def test_child_stderr_is_merged_into_the_log(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
