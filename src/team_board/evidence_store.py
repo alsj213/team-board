@@ -31,6 +31,19 @@
   缺任何一张 → rc2（库不可用）；
 - ``spec_sign`` 的「验收标准段」判据只看**顶格行首** ``## 验收标准``：段界（下一个
   ``## `` 或文末）在本卡没有可读内容，等 E5 需要段内文本时再落地。
+
+两条编码边界是 qa run 549 打回来的硬要求（都在本模块收口，CLI 不重写判据）：
+
+- **``--payload`` 必须是 UTF-8 文本**：非 UTF-8 字节经 argv 进来时是孤立代理字符
+  （``\\udc80-\\udcff``，如 ``LC_ALL=C`` / GBK 文件喂参），落库时才炸会变成
+  ``UnicodeEncodeError`` → 未捕获 → **rc1 + traceback**，被自动化读成「证据不通过」。
+  所以在 :func:`parse_payload`（参数文本）与 :func:`emit`（``normalize`` 后的落库文本，
+  覆盖 ``"\\ud800"`` 这类 JSON 转义）两处各判一次 UTF-8 可编码性 → rc2、零写入；
+  :func:`insert_event` 另兜一层 ``UnicodeError`` 当保险，绝不冒 traceback；
+- **摘要先写得出、再提交**：stdout 编码表示不了摘要（``PYTHONIOENCODING=ascii``）时
+  旧版在 ``INSERT`` 之后才发现 → 返回 rc2 却已落库，调用方按「rc2 = 没写」重试即重复。
+  现在 :func:`emit` 在事务里先交给 ``before_commit`` 回调写摘要、再 ``commit``：
+  回调抛异常就 ``rollback`` → rc2 时**一行都不多**。
 """
 
 from __future__ import annotations
@@ -40,7 +53,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,11 +107,21 @@ class EmitResult:
     payload: str
 
     def render(self) -> str:
-        return (
-            f"evidence emit: kind={self.kind} card={self.identity.card} "
-            f"run={self.identity.run_id} profile={self.identity.profile} "
-            f"event={self.event_id} payload={self.payload}"
-        )
+        return render_summary(self.identity, self.kind, self.event_id, self.payload)
+
+
+def render_summary(identity: Identity, kind: str, event_id: int, payload_text: str) -> str:
+    """摘要行的唯一拼法（``emit`` 的 ``before_commit`` 与 :meth:`EmitResult.render` 同一份）。
+
+    ``payload`` 打的是**落库文本**（``evidence.normalize`` 的结果），不是 ``--payload``
+    原文 —— 两者在键序 / 空白上可能不同，摘要只认前者。
+    """
+
+    return (
+        f"evidence emit: kind={kind} card={identity.card} "
+        f"run={identity.run_id} profile={identity.profile} "
+        f"event={event_id} payload={payload_text}"
+    )
 
 
 # ---------------------------------------------------------------- 身份解析
@@ -193,9 +216,33 @@ def check_kind(kind: str) -> None:
     )
 
 
-def parse_payload(text: str) -> object:
-    """``--payload`` 的唯一解析入口：不是合法 JSON → rc2（一条都不落库）。"""
+def ensure_utf8(text: str, *, where: str) -> None:
+    """``text`` 必须能用 UTF-8 编码，否则 rc2（**在任何 INSERT 之前**）。
 
+    ``--payload`` 绕过 shell 时可能是 GBK 字节：``LC_ALL=C`` 下 argv 解码用
+    ``surrogateescape``，非 UTF-8 字节变成孤立代理字符（``\\udc80-\\udcff``）；
+    JSON 转义 ``"\\ud800"`` 则是另一条路径。两条都到不了 UTF-8 列里，
+    早期判掉比让 sqlite3 抛 ``UnicodeEncodeError``（未捕获 = rc1 + traceback）稳。
+    """
+
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise EvidenceStoreError(
+            f"--payload 不是合法 UTF-8：{where}第 {exc.start} 个字符起是孤立代理字符"
+            "（\\ud800-\\udfff），编码不成 UTF-8；请以 UTF-8 文本传 --payload"
+        ) from exc
+
+
+def parse_payload(text: str) -> object:
+    """``--payload`` 的唯一解析入口：不是合法 JSON → rc2（一条都不落库）。
+
+    UTF-8 可编码性先判（见 :func:`ensure_utf8`）：非 UTF-8 字节经 argv 进来时
+    ``json.loads`` 可能照样成功，落库时才炸 —— 那就从「参数形态错」掉成
+    「rc1 + traceback」了。
+    """
+
+    ensure_utf8(text, where="参数文本")
     try:
         return json.loads(text)
     except ValueError as exc:
@@ -292,27 +339,26 @@ def insert_event(
     conn: sqlite3.Connection,
     identity: Identity,
     kind: str,
-    payload: Mapping[str, object],
+    payload_text: str,
     *,
     now: int | None = None,
-) -> tuple[int, str]:
-    """追加一行 ``task_events``，返回 ``(event_id, 落库的 payload 文本)``。
+) -> int:
+    """追加一行 ``task_events``（**不 commit**：事务归 :func:`emit` 收），返回 event id。
 
-    落库文本一律是 ``evidence.normalize(...)`` 的结果（sort_keys + 紧凑分隔符），
-    与 ``evidence.audit`` 的比较口径同一份，不许在 CLI 里另写一种序列化。
+    入参是 :func:`team_board.evidence.normalize` 的结果 —— 序列化口径只有那一处，
+    不许在 CLI 里另写一种。``UnicodeError`` 兜在这里当保险：真出现编码不了的文本
+    （旧版就在这一行冒 traceback、被读成 rc1）→ rc2，且事务回滚后库里一行都不多。
     """
 
-    text = evidence.normalize(payload)
     stamp = int(time.time()) if now is None else int(now)
     try:
         cursor = conn.execute(
-            INSERT_SQL, (identity.card, identity.run_id, kind, text, stamp)
+            INSERT_SQL, (identity.card, identity.run_id, kind, payload_text, stamp)
         )
-        conn.commit()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, UnicodeError) as exc:
         conn.rollback()
         raise EvidenceStoreError(f"写 task_events 失败：{exc}") from exc
-    return int(cursor.lastrowid or 0), text
+    return int(cursor.lastrowid or 0)
 
 
 def emit(
@@ -324,22 +370,31 @@ def emit(
     env: Mapping[str, str] | None = None,
     now: int | None = None,
     run_id: int | None = None,
+    before_commit: Callable[[str], None] | None = None,
 ) -> EmitResult:
     """``evidence emit`` 的全部流程：参数 → 身份 → 校验 → 只追加一行。
 
     顺序是刻意的：先判 kind（``merged`` 之类的「根本不许 emit」不碰库），再判
-    payload JSON 形态（rc2），再校验 payload 取值（rc1），然后才解析身份与角色 ——
-    角色不符时库里一行都不会多。任何一步失败都不提交事务。
+    payload 形态与取值（rc2 / rc1），然后才解析身份与角色 —— 角色不符时库里一行
+    都不会多。任何一步失败都不提交事务。
 
     ``run_id`` 是调用方**声称**的自己的 run 号（看板卡的 ``--run-id``）：本函数不拿它
     当身份（身份永远取自库里），只做一致性核对 —— 与 ``tasks.current_run_id`` 解析
     出来的 run 不等 → :class:`EvidenceReject`（rc1，卡面「run 不属于本卡」那一档）。
     ``None`` = 调用方没声称，不核对。
+
+    ``before_commit`` 是「rc2 与落库不并存」的机制：``INSERT`` 之后、``commit``
+    之前把它叫起来，传入**已经渲染好**的摘要行（见 :func:`render_summary`）；回调
+    抛任何异常就 ``rollback`` 再上抛 —— CLI 的 stdout 写不出去（``PYTHONIOENCODING=ascii``
+    表示不了中文、``ENOSPC`` 一类）因此不会留下「说没写、其实写了」的行。
+    唯一的残差是回调成功而 ``commit`` 自己失败（摘要已打给人看、库里没有行）。
     """
 
     check_kind(kind)
     raw = parse_payload(payload_json)
     payload = check_payload(kind, raw)
+    text = evidence.normalize(payload)
+    ensure_utf8(text, where="落库文本")
 
     conn = open_rw(db_path)
     try:
@@ -348,10 +403,22 @@ def emit(
         check_role(kind, identity)
         if kind == "spec_sign":
             check_spec_section(load_body(conn, identity.card))
-        event_id, text = insert_event(conn, identity, kind, payload, now=now)
+        event_id = insert_event(conn, identity, kind, text, now=now)
+        result = EmitResult(identity=identity, kind=kind, event_id=event_id, payload=text)
+        if before_commit is not None:
+            try:
+                before_commit(result.render() + "\n")
+            except BaseException:
+                conn.rollback()
+                raise
+        try:
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.rollback()
+            raise EvidenceStoreError(f"提交 task_events 失败：{exc}") from exc
     finally:
         conn.close()
-    return EmitResult(identity=identity, kind=kind, event_id=event_id, payload=text)
+    return result
 
 
 # ---------------------------------------------------------------- 内部

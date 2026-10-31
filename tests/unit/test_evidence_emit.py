@@ -12,13 +12,19 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess  # nosec B404 - 编码边界用例必须起真子进程（in-process 改不了 stdout 编码）
+import sys
 from pathlib import Path
 
 import pytest
 
 from team_board import cli, evidence, evidence_store
 from team_board.model import DEFAULT_DB
+
+#: 仓库根（``tests/unit/xxx.py`` 往上两级）；子进程用例靠它拼 ``PYTHONPATH=src``
+ROOT = Path(__file__).resolve().parents[2]
 
 CARD = "t_deadbeef"
 OTHER_CARD = "t_00000000"
@@ -691,6 +697,120 @@ def test_two_emits_append_two_rows_and_leave_tasks_untouched(
         "review",
     }
     conn.close()
+
+
+# ---------------------------------------------------------------- 编码边界（qa run 549 返工）
+
+
+def gbk_payload_for_tier(*, ascii_escape: bool = False) -> str:
+    """造一份「中文走错编码」的 ``tier`` payload 文本（两条路径各有用例）。
+
+    - ``ascii_escape=False``：模拟 ``--payload "$(cat gbk.json)"`` —— 参数文本里是
+      **孤立代理字符**（``LC_ALL=C`` 下 argv 解码用 ``surrogateescape``，GBK 字节
+      ``\\xd6\\xd0`` 变 ``\\udcd6\\udcd0``）；
+    - ``ascii_escape=True``：参数文本纯 ASCII，JSON 转义 ``"\\ud800"`` 解出来才是
+      孤立代理字符 —— ``json.loads`` 成功、落库文本非法。
+    """
+
+    if ascii_escape:
+        # 参数文本纯 ASCII：JSON 转义 ``\ud800`` 要等 ``json.loads`` 才变成孤立代理字符，
+        # 于是「参数文本合法 UTF-8、落库文本非法」这条路径被单独覆盖
+        return '{"tier": "B", "reason": "GBK\\ud800文本", "head_sha": "' + HEAD + '"}'
+    reason = b"\xd6\xd0\xce\xc4".decode("utf-8", "surrogateescape")
+    return json.dumps({"tier": "B", "reason": reason, "head_sha": HEAD}, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("ascii_escape", [False, True])
+def test_non_utf8_payload_rc2_one_line_and_no_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], ascii_escape: bool
+) -> None:
+    """``--payload`` 含非 UTF-8 文本 → rc2 一行 stderr、**零落库**、零 traceback。
+
+    旧版：``json.loads`` 照过，死在 ``INSERT``（sqlite3 编不成 UTF-8）→
+    ``UnicodeEncodeError`` 未捕获 → **rc1 + traceback**，自动化把「跑不起来」
+    读成「证据不通过」（qa ISSUE-1）。
+    """
+
+    db = make_board(tmp_path, profile="pm")  # tier 只允许 pm
+    before = event_count(db)
+    text = gbk_payload_for_tier(ascii_escape=ascii_escape)
+    if ascii_escape:
+        assert r"\ud800" in text  # 参数文本纯 ASCII，代理字符要等 json.loads 才出来
+    else:
+        assert any(0xDC80 <= ord(ch) <= 0xDCFF for ch in text)  # surrogateescape 产物
+
+    rc, out, err = run_cli(emit_argv(db, "tier", text), capsys)
+
+    assert rc == 2, err
+    assert out == ""
+    assert err.count("\n") == 1
+    assert err.startswith("错误: --payload 不是合法 UTF-8")
+    assert "Traceback" not in err
+    assert event_count(db) == before == 0
+    assert event_count(db, kind="tier") == 0
+
+
+def test_non_utf8_payload_leaves_db_untouched(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """同一条卡上先失败一次、再成功一次：失败那次不留行（count 只是 +1 不是 +2）。"""
+
+    db = make_board(tmp_path, profile="pm")
+    bad = gbk_payload_for_tier()
+
+    rc_bad, _o, e_bad = run_cli(emit_argv(db, "tier", bad), capsys)
+    rc_ok, _o2, e_ok = run_cli(
+        emit_argv(db, "tier", {"tier": "B", "reason": "正常原因", "head_sha": HEAD}), capsys
+    )
+
+    assert (rc_bad, rc_ok) == (2, 0), (e_bad, e_ok)
+    assert event_count(db, kind="tier") == 1
+
+
+def test_stdout_encoding_cannot_render_summary_rc2_and_no_write(tmp_path: Path) -> None:
+    """stdout 编码表示不了摘要（``PYTHONIOENCODING=ascii``）→ rc2 且**零落库**。
+
+    旧版先 ``INSERT`` 再写摘要：rc2 时库里已有 1 行，调用方按「rc2 = 没写」重试
+    就会重复（qa ISSUE-2）。in-process 改不了 stdout 编码，所以这条起真子进程。
+    """
+
+    db = make_board(tmp_path, profile="pm")
+    payload = json.dumps({"tier": "B", "reason": "中文原因", "head_sha": HEAD})
+
+    proc = subprocess.run(  # nosec B603 - 参数是常量列表，没有 shell
+        [
+            sys.executable,
+            "-m",
+            "team_board.cli",
+            "evidence",
+            "emit",
+            "--kind",
+            "tier",
+            "--payload",
+            payload,
+            "--db",
+            str(db),
+        ],
+        capture_output=True,
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "PYTHONIOENCODING": "ascii",
+            "HERMES_KANBAN_TASK": CARD,
+        },
+        check=False,
+        timeout=120,
+    )
+
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+    assert proc.stdout == b""
+    err = proc.stderr.decode("utf-8", "replace")
+    assert err.startswith("错误: 当前 stdout 编码 ")
+    assert err.count("\n") == 1
+    assert "Traceback" not in err
+    assert event_count(db) == 0
+    assert event_count(db, kind="tier") == 0
 
 
 # ---------------------------------------------------------------- CLI 面
