@@ -2,8 +2,8 @@
 
 **口径（写死）**：`tasks.body` 的 **UTF-8 字节数 ≤ 2048** 才算合规。超限的卡**建不出来**
 （`hermes kanban create` / `kanban_create` 工具都拒，rc=2，不截断、没有开关）；存量卡用
-`PYTHONPATH=src python3 -m team_board.cli body-audit` 查超限清单。细则见
-[`docs/card-limit.md`](card-limit.md)。
+`PYTHONPATH=src python3 -m team_board.cli body-audit` 查超限清单、固定段落红清单与
+warn 清单（红即 rc1，warn 只报不改 rc）。细则见 [`docs/card-limit.md`](card-limit.md)。
 
 **用法一句话**：模板是基线，**卡正文只写与本卡不同的部分**。长背景、日志、证据一律写进
 卡评论（`kanban_comment`）或附件（`kanban_attach`），正文只留一句指针。下面六块一段不缺、

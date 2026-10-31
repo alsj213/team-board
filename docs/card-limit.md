@@ -5,8 +5,9 @@
 > `ops/workspace/playbook.md` 的 R16 待 ops 同步 —— **本文件不是条文第二源**，两份冲突时
 > 以章程条文为准，本文件只负责「口径 + 实测 + 边界」。
 >
-> 两条腿的实现卡：建卡拦截 `t_1564c165`、全板扫描 `t_d3625ec7`（`body-audit` 子命令）；
-> 渲染本文件的卡是 `t_2f0b87d2`。模板见 [`docs/card-template.md`](card-template.md)。
+> 两条腿的实现卡：建卡拦截 `t_1564c165`、全板扫描 `t_d3625ec7`（`body-audit` 子命令），
+> 固定段落红 / 1200B warn / 存量切点由 `t_7c17f775`（`cardtemplate.py`）与 `t_339b3d36`
+> （`body-audit` 扩容）落地；渲染本文件的卡是 `t_2f0b87d2`。模板见 [`docs/card-template.md`](card-template.md)。
 
 ## 一、口径
 
@@ -60,21 +61,35 @@ kanban: body 超过硬上限：3000 字节（UTF-8），上限 2048 字节；长
 ```
 $ PYTHONPATH=src python3 -m team_board.cli body-audit        # 未结卡（status ∉ {done, archived}）
 $ PYTHONPATH=src python3 -m team_board.cli body-audit --all  # 含已结卡（仍不含 archived）
+$ PYTHONPATH=src python3 -m team_board.cli body-audit --cutoff 0  # 全部视作新卡（造红例）
 ```
 
 退出码：
 
 | rc | 含义 | 实测命令 |
 | --- | --- | --- |
-| 0 | 无超限 | `body-audit --db <干净库>` → `合计：2 张；超限：0 张；NULL：0 张` |
-| 1 | **发现**超限卡 | `body-audit`（真板）→ `合计：17 张；超限：8 张；NULL：0 张` |
-| 2 | 数据源或参数错误 | `body-audit --db /nonexistent/x.db` → stderr `错误: 数据源不存在: /nonexistent/x.db` |
+| 0 | 无超限、无固定段落红卡（**只有 warn 仍是 0**） | `body-audit --db <干净库>` → `合计：2 张；超限：0 张；NULL：0 张` |
+| 1 | **发现**超限卡，或有固定段落红卡 | `body-audit --db <含红卡库> --cutoff 0` → `固定段落红清单（2 张）：` |
+| 2 | 数据源或参数错误 | `body-audit --db /nonexistent/x.db` → stderr `错误: 数据源不存在: /nonexistent/x.db`；`--cutoff -1` → stderr `错误: --cutoff 不许为负：-1（0 = 全部视作新卡）` |
 
 注意 rc=2 这一条与基础子命令**不同**：`list` / `summary` 的数据源错误是 rc=1，
 `body-audit` 把「数据源打不开」也算成 2（「判不了」绝不和「发现问题」同码）。
 
 输出含逐卡明细（卡号 / 状态 / 负责人 / 字节 / 判定）、分桶、合计、`NULL` 计数与
 **超限清单**（卡号列表直接给出来，不用自己数）。
+
+卡 t_339b3d36 起末尾追加三段（前六段的行序一字未动，新段一律排在超限清单之后）：
+
+- **固定段落红清单**：不早于 `--cutoff` 的卡若正文顶格出现 `## 完成契约` / `## 验收三段式`
+  等固定段落标题，就进这个清单（逐卡附改写指引，指引里含 `TEMPLATE: card-template.md#v3`
+  的准确写法）；**有红即 rc1**。
+- **warn 清单**：正文 UTF-8 字节数 > `WARN_BYTES`（1200，目标 800）或缺 `TEMPLATE:` 引用行，
+  逐卡打印「卡号 / 字节 / 标记（`over-1200` / `no-template-ref`）」；**warn 不改 rc**。
+- **存量跳过**：`created_at` 早于切点的卡数量 —— 存量卡不判红（R16 ⑤ 不追溯），只计数。
+
+判据本体全部在 `src/team_board/cardtemplate.py`（`scan` / `rewrite_hint` /
+`FIXED_SECTION_EPOCH` / `WARN_BYTES`），`bodylimit.summarize` 只负责把它们汇总进
+`counts['red' | 'warn' | 'legacy']`，本文件不复制任何一条规则。
 
 ## 三、为什么
 

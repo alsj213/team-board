@@ -898,7 +898,9 @@ bash scripts/setup-bot-identity.sh <profile> <worktree>` 并 exit 1。钩子能�
 rc=2、stderr 恰一行、卡不落库（不截断、没有开关）。
 
 存量卡（已经写进库的超限正文，本上限**不追溯改写**它们）用 `body-audit` 查 ——
-逐卡打印卡号 / 状态 / 负责人 / 字节 / 判定，外加分桶、合计、`NULL` 计数与超限清单：
+逐卡打印卡号 / 状态 / 负责人 / 字节 / 判定，外加分桶、合计、`NULL` 计数与超限清单；
+卡 t_339b3d36 起末尾还有三段：**固定段落红清单**（逐卡附改写指引，命中即 rc1）、
+**warn 清单**（正文 >1200B 或缺 `TEMPLATE:` 行，只报、不改 rc）、**存量跳过**计数：
 
 ```
 $ PYTHONPATH=src python3 -m team_board.cli body-audit; echo rc=$?
@@ -938,7 +940,56 @@ rc=1
 
 （快照：2026-10-29 23:42 CST，`origin/main` 91052f4 的 worktree 上实跑，输出逐字照贴、
 未截断。看板数据随时变，字节数与合计会跟着变（本卡定稿时重跑已从 17 张变过一次），
-**命令与判定口径不变**；`--all` 把已结卡也算进来，仍不含 `archived`。）
+**命令与判定口径不变**；`--all` 把已结卡也算进来，仍不含 `archived`。上面那段是当时的
+快照，**不含**下面这三段。）
+
+新三段与 `--cutoff` 的实跑（2026-10-31，临时库四张卡：一张新卡含 `## 完成契约`、一张
+1300 字节无固定段落、一张早于切点的存量卡、一张带 `TEMPLATE:` 行的干净卡；输出逐字照贴）：
+
+```
+$ PYTHONPATH=src .venv/bin/python -m team_board.cli body-audit --db evidence/demo-t_339b3d36.db; echo rc=$?
+/home/liu/project/tb-wt/t_339b3d36/evidence/demo-t_339b3d36.db
+口径：body 为 UTF-8 字节数；NULL body 记 NULL；上限 2048 字节
+范围：未结卡（status ∉ {done, archived}）
+分桶：
+  0          0
+  1-512      3
+  513-1024   0
+  1025-2048  1
+  2049-4096  0
+  4097-      0
+  NULL       0
+合计：4 张；超限：0 张；NULL：0 张
+明细（字节数降序：卡号 / 状态 / 负责人 / 字节 / 判定）：
+  t_new_big  todo  engineer  1300  ok
+  t_ok       todo  pm          42  ok
+  t_new_red  todo  pm          31  ok
+  t_stock    todo  pm          15  ok
+超限清单（0 张）：—
+固定段落红清单（0 张）：—
+warn 清单（>1200B 或 缺 TEMPLATE 行，3 张）：
+  t_new_big  1300 字节  over-1200 no-template-ref
+  t_new_red  31 字节  no-template-ref
+  t_stock  15 字节  no-template-ref
+存量跳过（早于切点，不判红）：3 张
+rc=0
+```
+
+`--cutoff` 是存量切点（Unix 秒，默认 `cardtemplate.FIXED_SECTION_EPOCH` =
+2026-11-01 00:00 CST；`created_at` **早于**它的卡不判红、只计数）。`--cutoff 0`
+把全部卡按新卡判，用来造红例 —— 同一张库换成 `--cutoff 0` 的末尾三段：
+
+```
+固定段落红清单（2 张）：
+  t_new_red  「完成契约」属模板固定段落：删掉它，正文首行改为 TEMPLATE: card-template.md#v3（固定段落由 dispatcher 注入）。
+  t_stock  「完成契约」属模板固定段落：删掉它，正文首行改为 TEMPLATE: card-template.md#v3（固定段落由 dispatcher 注入）。
+warn 清单（>1200B 或 缺 TEMPLATE 行，3 张）：
+  ...
+存量跳过（早于切点，不判红）：0 张
+rc=1
+```
+
+`--cutoff` 非整数或负数 → rc2、stderr 恰一行（实测 `错误: --cutoff 不许为负：-1（0 = 全部视作新卡）`）。
 
 超限建卡被拦的实测（正文 3000 字节）：
 
@@ -1107,7 +1158,8 @@ GAP t_9f000002 [running] engineer 触发=合并卡 首行=目标：…
 **有认账问题**、`2` 表示参数或环境错误；详见上面「合并认账稽核」一节。
 `commit-audit` 同理：`1` 表示**有身份问题**、`2` 表示参数或环境错误；详见上面
 「提交身份稽核」一节。
-`body-audit` 另有一套：`0` 无超限 / `1` **发现**超限卡 / `2` 数据源或参数错误
+`body-audit` 另有一套：`0` 无超限且无固定段落红卡（只有 warn 仍是 0）/ `1` **发现**超限卡
+或有固定段落红卡 / `2` 数据源或参数错误（`--cutoff` 非整数或负数也算这一类）
 （注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
 `output-audit` 与 `body-audit` 同口径：`0` 无超限 / `1` **发现**超限的评论或 result /
 `2` 参数或环境错误；详见上面「输出上限稽核（output-audit）」一节。

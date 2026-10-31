@@ -2,6 +2,9 @@
 
 只建 ``tasks`` 一张表（列名与真实库一致的最小集合），不依赖 fixtures/make_board 的
 11 张固定卡 —— 这里的断言全是「这张卡在不在、算成几字节」。
+
+卡 t_339b3d36 起 ``body-audit`` 还判固定段落红（rc1）与 >1200B / 缺 TEMPLATE 行
+（warn，不改 rc），``tasks`` 表因此多一列 ``created_at``（存量切点要用它）。
 """
 
 from __future__ import annotations
@@ -11,21 +14,38 @@ from pathlib import Path
 
 import pytest
 
-from team_board import cli
+from team_board import cardtemplate, cli
 
 LIMIT = 2048
 
+#: 存量切点本身：``created_at`` 等于它的卡算新卡（``created_at < cutoff`` 才是存量）
+NEW_CARD = cardtemplate.FIXED_SECTION_EPOCH
 
-def make_db(path: Path, rows: list[tuple[str, str, str, str | None]]) -> Path:
-    """建一个只有 ``tasks`` 表的只读目标库（``rows`` 为 id/status/assignee/body）。"""
+
+def make_db(
+    path: Path,
+    rows: list[tuple[str, str, str, str | None]],
+    *,
+    created_at: int | None = NEW_CARD,
+) -> Path:
+    """建一个只有 ``tasks`` 表的只读目标库（``rows`` 为 id/status/assignee/body）。
+
+    ``created_at`` 默认取存量切点（= 新卡）；要造存量卡就传一个更小的值。
+    """
     conn = sqlite3.connect(path)
     try:
         conn.execute(
             "CREATE TABLE tasks ("
-            "id TEXT PRIMARY KEY, status TEXT, assignee TEXT, body TEXT)"
+            "id TEXT PRIMARY KEY, status TEXT, assignee TEXT, created_at INTEGER,"
+            " body TEXT)"
         )
         conn.executemany(
-            "INSERT INTO tasks (id, status, assignee, body) VALUES (?, ?, ?, ?)", rows
+            "INSERT INTO tasks (id, status, assignee, created_at, body)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [
+                (id_, status, assignee, created_at, body)
+                for id_, status, assignee, body in rows
+            ],
         )
         conn.commit()
     finally:
@@ -216,4 +236,95 @@ class TestHeaderAndShape:
         ]
         assert lines[11].startswith("合计：")
         assert lines[12] == "明细（字节数降序：卡号 / 状态 / 负责人 / 字节 / 判定）："
-        assert lines[-1].startswith("超限清单（1 张）：")
+        # 超限清单仍是明细之后的第一段；新增三段（红 / warn / 存量）追加在它之后
+        assert any(line.startswith("超限清单（1 张）：") for line in lines)
+        assert lines[-1] == "存量跳过（早于切点，不判红）：0 张"
+
+
+class TestFixedSectionAndCutoff:
+    """卡 t_339b3d36：固定段落红 → rc1；固定段落之外的 warn 不改 rc；存量切点。"""
+
+    def test_red_fixed_section_is_rc1_with_cutoff_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """红例：正文含 ``## 完成契约``；``--cutoff 0`` 让存量卡也按新卡判 —— rc1。"""
+        board = make_db(
+            tmp_path / "red.db",
+            [("t_red", "todo", "pm", "第一段\n## 完成契约\n后面")],
+            created_at=NEW_CARD - 86400,
+        )
+        code, out, err = run(capsys, "body-audit", "--db", str(board), "--cutoff", "0")
+        assert (code, err) == (1, "")
+        # rc1 来自红清单，不是超限：32 字节远没到 2048
+        assert "合计：1 张；超限：0 张；NULL：0 张" in out
+        lines = out.splitlines()
+        assert "固定段落红清单（1 张）：" in lines
+        red_block = lines[lines.index("固定段落红清单（1 张）：") + 1]
+        assert red_block.startswith("  t_red  ")
+        # 红项逐卡附 rewrite_hint，且给出模板引用行的准确写法
+        assert cardtemplate.template_ref_line() in red_block
+        assert "存量跳过（早于切点，不判红）：0 张" in out
+
+    def test_warn_over_1200_bytes_does_not_change_rc(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """warn 例：1300 字节、无固定段落 → 只有 warn，rc 仍是 0。"""
+        board = make_db(
+            tmp_path / "warn.db", [("t_warn", "todo", "pm", "a" * 1300)]
+        )
+        code, out, err = run(capsys, "body-audit", "--db", str(board))
+        assert (code, err) == (0, "")
+        assert "固定段落红清单（0 张）：—" in out
+        assert "warn 清单（>1200B 或 缺 TEMPLATE 行，1 张）：" in out
+        assert "  t_warn  1300 字节  over-1200 no-template-ref" in out
+
+    def test_stock_card_before_cutoff_is_exempt(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """存量豁免：早于切点的卡即使含固定段落也不判红（rc0），只进跳过计数。"""
+        board = make_db(
+            tmp_path / "stock.db",
+            [("t_stock", "todo", "pm", "## 完成契约")],
+            created_at=NEW_CARD - 1,
+        )
+        code, out, err = run(capsys, "body-audit", "--db", str(board))
+        assert (code, err) == (0, "")
+        assert "固定段落红清单（0 张）：—" in out
+        assert "存量跳过（早于切点，不判红）：1 张" in out
+
+    def test_old_2050_bytes_still_over_rc1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """老口径不破：2050 字节照旧判 OVER、rc1（切点把卡当新卡也不影响字节判据）。"""
+        board = make_db(
+            tmp_path / "over2.db", [("t_over", "todo", "pm", "a" * (LIMIT + 2))]
+        )
+        code, out, err = run(capsys, "body-audit", "--db", str(board))
+        assert (code, err) == (1, "")
+        assert "合计：1 张；超限：1 张；NULL：0 张" in out
+        assert "超限清单（1 张）：t_over" in out
+        assert str(LIMIT + 2) + "  OVER" in out
+
+    def test_negative_cutoff_is_rc2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``--cutoff -1`` → rc2、stdout 空、stderr 恰一行 ``错误:``。"""
+        board = make_db(tmp_path / "neg.db", [("t_a", "todo", "pm", "x")])
+        code, out, err = run(capsys, "body-audit", "--db", str(board), "--cutoff", "-1")
+        assert (code, out) == (2, "")
+        assert err.count("\n") == 1
+        assert err.startswith("错误: ")
+        assert "--cutoff" in err
+
+    def test_non_integer_cutoff_is_rc2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """非整数取值（``abc`` / ``1.5`` / 空串）同样 rc2，不落 argparse 的 usage。"""
+        board = make_db(tmp_path / "abc.db", [("t_a", "todo", "pm", "x")])
+        for raw in ("abc", "1.5", ""):
+            code, out, err = run(
+                capsys, "body-audit", "--db", str(board), "--cutoff", raw
+            )
+            assert (code, out) == (2, ""), raw
+            assert err.count("\n") == 1, raw
+            assert err.startswith("错误: "), raw
