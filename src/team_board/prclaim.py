@@ -351,9 +351,9 @@ def render_gaps(report: GapReport) -> str:
     **五列全部**经 :func:`visible` 转义控制字符后显示（判定不受影响）：
     ``hit`` 来自标题，标题里的换行（``合并\\nPR #5`` 会被 ``\\s*`` 吃掉）与
     ``status`` / ``assignee`` 里的控制字符同样不能让一条 GAP 变成两条物理行。
-    ``visible`` 连 NEL / U+2028 / U+2029 这三个 Unicode 行边界一起转义，转义后的
-    报告里不存在任何 ``str.splitlines()`` 边界，``render_gaps(...).splitlines()``
-    的行数恒为 ``2 + len(report.gaps)``。
+    ``visible`` 连 NEL / U+2028 / U+2029 这三个 Unicode 行边界一起转义，转义后
+    **每一列的值里**都不再有 ``str.splitlines()`` 边界（列间分隔用的 ``"\\n"`` 除外），
+    故 ``render_gaps(...).splitlines()`` 的行数恒为 ``2 + len(report.gaps)``。
     """
     lines = [f"未结卡 {report.pending} 张"]
     lines.extend(

@@ -317,8 +317,12 @@ class TestKernelDifferencePin:
         }
 
     def test_every_class_has_at_least_one_row(self) -> None:
-        """4 类都要有代表行：字符级变体是同一类的不同字符，不是新类。"""
-        for cls in {*self.DIFF_CLASSES.values()}:
+        """4 个规范类名各自至少一条代表行：字符级变体是同一类的不同字符，不是新类。
+
+        期望的 4 类写成字面量，**不从** ``DIFF_CLASSES.values()`` 反推 —— 否则
+        遍历自身、互补集恒空，断言恒真（没有任何保证）。
+        """
+        for cls in ("前导空白", "行尾空白", "CRLF", "其它换行符"):
             assert [n for n, c in self.DIFF_CLASSES.items() if c == cls], cls
 
     def test_kernel_never_accepts_what_audit_rejects_interchangeably(self) -> None:
@@ -402,7 +406,7 @@ def _load_kernel(path: Path) -> dict[str, Any]:
 
 @pytest.mark.skipif(
     _kernel_source_path() is None,
-    reason="本机没有 Hermes 内核源码（可用 HERMES_KERNEL_KANBAN_DB 指定 kanban_db.py）",
+    reason="未设 HERMES_KERNEL_KANBAN_DB（用它指向 kanban_db.py；不设默认路径以免全量测试依赖仓库外文件）",
 )
 class TestKernelLiveComparison:
     """用**真内核源码**复核 :class:`TestKernelDifferencePin` 那张表的「内核建卡」列。
