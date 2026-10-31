@@ -1,10 +1,10 @@
 """``cli pr-review-head-audit`` 的集成测试：**真 git 仓库** + 假 gh，验 0/1/2 三档与只读性。
 
-判据是内容指纹（``patch-id -U0``），假 sha 造不出来，所以：
+判据是内容指纹（``git diff -U0`` 内容行的 sha256 前 40 位），假 sha 造不出来，所以：
 
 - **真 git**：``tmp_path`` 里造仓库（``main`` + ``feature`` 两条提交），head sha 与
-  patch-id 全部由 git 现算（:func:`patch_id` 直接跑「git diff | git patch-id」管线，
-  不复用被测模块的实现）；
+  指纹全部由 git 现算（:func:`content_fingerprint` 自己跑「git diff -U0」再逐行算
+  sha256，不复用被测模块的实现）；
 - **假 gh**：只认本子命令要的两条 ``gh api repos/alsj213/team-board/... --paginate``，
   把 ``$FAKE_REVIEWS`` / ``$FAKE_COMMENTS`` 原样吐到 stdout（可多段数组模拟分页），
   按 ``$FAKE_*_RC`` / ``$FAKE_*_ERR`` 造失败，每次调用记进 ``$FAKE_LOG``。
@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -23,9 +24,11 @@ from typing import Any
 import pytest
 
 from team_board import cli
+from team_board import reviewhead as rh
 
 GIT = shutil.which("git")
 PR = 34
+ALGO = rh.FINGERPRINT_ALGO
 REVIEWS_PATH = f"repos/alsj213/team-board/pulls/{PR}/reviews"
 COMMENTS_PATH = f"repos/alsj213/team-board/issues/{PR}/comments"
 IDENT = ("-c", "user.name=engineer", "-c", "user.email=engineer@team-board.local")
@@ -70,24 +73,27 @@ def git(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def patch_id(cwd: Path, base: str, head: str) -> str:
-    """独立算一次内容指纹：``git diff -U0 <mb> <head> | git patch-id --stable``。"""
+def content_fingerprint(cwd: Path, base: str, head: str, *, context: str = "-U0") -> str:
+    """独立算一次内容指纹：``sha256(git diff <context> 的内容行)[:40]``。
+
+    与 ``reviewhead._content_digest`` 同一口径但**另写一遍**（不 import 被测实现）：
+    ``@@`` 头与 ``index`` 行不进哈希，其余逐字节进 —— 这样既扛纯 rebase 的行号位移，
+    又能对「只改缩进」换指纹。
+    """
 
     merge_base = git(cwd, "merge-base", base, head)
     diff = subprocess.run(  # nosec B603 B607
-        [_git_bin(), "-C", str(cwd), "diff", "-U0", "--no-color", merge_base, head],
+        [_git_bin(), "-C", str(cwd), "diff", context, "--no-color", merge_base, head],
         capture_output=True,
         check=False,
     )
     assert diff.returncode == 0, diff.stderr.decode("utf-8", "replace")
-    pid = subprocess.run(  # nosec B603 B607
-        [_git_bin(), "-C", str(cwd), "patch-id", "--stable"],
-        input=diff.stdout,
-        capture_output=True,
-        check=False,
-    )
-    assert pid.returncode == 0, pid.stderr.decode("utf-8", "replace")
-    return pid.stdout.decode("utf-8").split()[0]
+    lines = [
+        line
+        for line in diff.stdout.split(b"\n")
+        if not line.startswith(b"@@") and not line.startswith(b"index ")
+    ]
+    return hashlib.sha256(b"\n".join(lines)).hexdigest()[:40]
 
 
 @dataclass
@@ -113,7 +119,7 @@ def make_repo(path: Path) -> Repo:
     git(path, "add", "-A")
     git(path, "commit", "-q", "-m", "feature: 改 f")
     head = git(path, "rev-parse", "HEAD")
-    return Repo(path=path, base_sha=base_sha, head=head, pid=patch_id(path, "main", head))
+    return Repo(path=path, base_sha=base_sha, head=head, pid=content_fingerprint(path, "main", head))
 
 
 def rebase_onto_new_main(repo: Repo) -> str:
@@ -138,6 +144,39 @@ def amend_new_content(repo: Repo) -> str:
     git(repo.path, "add", "-A")
     git(repo.path, "commit", "-q", "--amend", "--no-edit")
     return git(repo.path, "rev-parse", "HEAD")
+
+
+def amend_indent_only(repo: Repo) -> str:
+    """只改缩进（``    return 2`` 的 4 空格 → 8 空格，别的字节一律不动）。
+
+    这一条是 pm / qa 打回的那条 P1 的回归夹具：``git patch-id`` 归一化空白 → 同一指纹，
+    于是「只改缩进」能复用旧证据（fail-open）。新指纹逐字节进哈希 → 必须换。
+    """
+
+    (repo.path / "src.py").write_text("def f():\n        return 2\n", encoding="utf-8")
+    git(repo.path, "add", "-A")
+    git(repo.path, "commit", "-q", "--amend", "--no-edit")
+    return git(repo.path, "rev-parse", "HEAD")
+
+
+def legacy_patch_id(cwd: Path, base: str, head: str) -> str:
+    """旧算法（``git diff -U0 | git patch-id --stable``），只用于证明它会漏判缩进。"""
+
+    merge_base = git(cwd, "merge-base", base, head)
+    diff = subprocess.run(  # nosec B603 B607
+        [_git_bin(), "-C", str(cwd), "diff", "-U0", "--no-color", merge_base, head],
+        capture_output=True,
+        check=False,
+    )
+    assert diff.returncode == 0, diff.stderr.decode("utf-8", "replace")
+    pid = subprocess.run(  # nosec B603 B607
+        [_git_bin(), "-C", str(cwd), "patch-id", "--stable"],
+        input=diff.stdout,
+        capture_output=True,
+        check=False,
+    )
+    assert pid.returncode == 0, pid.stderr.decode("utf-8", "replace")
+    return pid.stdout.decode("utf-8").split()[0]
 
 
 def orphan_commit(repo: Repo) -> str:
@@ -277,7 +316,7 @@ class TestRc0:
 
         rebased = rebase_onto_new_main(repo)
         assert rebased != repo.head
-        assert patch_id(repo.path, "main", rebased) == repo.pid  # 前提：内容确实等价
+        assert content_fingerprint(repo.path, "main", rebased) == repo.pid  # 前提：内容确实等价
 
         stub.reviews([patched(repo.pid, "defect")])
         stub.comments([patched(repo.pid, "regression")])
@@ -286,7 +325,7 @@ class TestRc0:
         assert err == ""
         lines = out.splitlines()
         assert lines[0].startswith(
-            f"algo=patch-id-U0-v1 current={repo.pid[:12]} base=main mb="
+            f"algo={ALGO} current={repo.pid[:12]} base=main mb="
         )
         assert lines[1] == "扫描正文 2 条；带标记行 2 条"
         assert f"  OK {repo.pid[:12]} defect" in lines
@@ -372,13 +411,42 @@ class TestRc0:
 
 
 class TestRc1:
+    def test_indent_only_change_makes_the_mark_stale(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """P1 回归：**只改缩进**也必须换指纹 → 旧 ``REVIEW-PATCH`` 失效 → rc1。
+
+        对照（同一夹具）：旧算法 ``git patch-id`` 给两个 head 同一个 id —— 那正是打回原因。
+        """
+
+        indented = amend_indent_only(repo)
+        assert indented != repo.head
+        new_pid = content_fingerprint(repo.path, "main", indented)
+        assert new_pid != repo.pid, "只改缩进必须换指纹"
+        # 旧算法在同一夹具上确实漏判（证明这条用例抓的就是那个缺陷，而不是碰巧过的）
+        assert legacy_patch_id(repo.path, "main", repo.head) == legacy_patch_id(
+            repo.path, "main", indented
+        )
+
+        stub.reviews([patched(repo.pid, "defect")])
+        stub.comments([patched(repo.pid, "regression")])
+        code, out, err = once(capsys, repo, indented)
+        assert code == 1
+        assert err == ""
+        assert f"  STALE {repo.pid[:12]} defect" in out
+        assert f"  STALE {repo.pid[:12]} regression" in out
+        assert out.splitlines()[0].startswith(f"algo={ALGO} current={new_pid[:12]} base=main mb=")
+        assert out.splitlines()[-1] == (
+            f"结论: 内容指纹 {new_pid[:12]} 缺 defect,regression → 内容变了要重跑双问"
+        )
+
     def test_content_changed_makes_marks_stale(
         self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """内容改过：旧 ``REVIEW-PATCH`` 全部 STALE → 缺两类 → rc1。"""
 
         changed = amend_new_content(repo)
-        changed_pid = patch_id(repo.path, "main", changed)
+        changed_pid = content_fingerprint(repo.path, "main", changed)
         assert changed_pid != repo.pid
         stub.reviews([patched(repo.pid, "defect")])
         stub.comments([patched(repo.pid, "regression")])
@@ -446,7 +514,7 @@ class TestRc1:
         assert code == 1
         assert err == ""
         lines = out.splitlines()
-        assert lines[0].startswith("algo=patch-id-U0-v1 current=- base=main mb=-")
+        assert lines[0].startswith(f"algo={ALGO} current=- base=main mb=-")
         assert lines[-1] == (
             f"结论: 取不到 {missing}，无法按内容绑定；"
             "先 git fetch 或在新 head 上重贴 REVIEW-PATCH"
@@ -490,7 +558,7 @@ class TestRemote:
             check=False,
         )
         assert probe.returncode != 0, "克隆里不该有这条新提交"
-        expected = patch_id(repo.path, "main", fresh)
+        expected = content_fingerprint(repo.path, "main", fresh)
 
         stub.reviews([patched(expected, "defect")])
         stub.comments([patched(expected, "regression")])
@@ -566,6 +634,53 @@ class TestRc2Params:
         assert "Traceback" not in err
         assert stub.calls() == []
 
+    @pytest.mark.parametrize("base", ["", " ", "\t", "   "])
+    def test_empty_base_is_rc2(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str], base: str
+    ) -> None:
+        """显式给了空串 / 空白的 ``--base`` → rc2（不许静默回退成 ``origin/main``）。"""
+
+        code, out, err = run(
+            capsys,
+            "--pr",
+            str(PR),
+            "--head",
+            repo.head,
+            "--repo",
+            str(repo.path),
+            "--base",
+            base,
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+        assert err.startswith("错误: --base 非法：")
+        assert "Traceback" not in err
+        assert stub.calls() == []
+
+    @pytest.mark.parametrize("remote", ["", " ", "-x", "ori gin"])
+    def test_empty_or_bad_remote_is_rc2(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str], remote: str
+    ) -> None:
+        """空串 / 空白 / 以 ``-`` 开头的 ``--remote`` → rc2（不许把空串塞进 git argv）。"""
+
+        code, out, err = run(
+            capsys,
+            "--pr",
+            str(PR),
+            "--head",
+            repo.head,
+            "--repo",
+            str(repo.path),
+            f"--remote={remote}",
+        )
+        assert code == 2
+        assert out == ""
+        assert err.count("\n") == 1
+        assert err.startswith("错误: --remote 非法：")
+        assert "Traceback" not in err
+        assert stub.calls() == []
+
     def test_repo_is_not_a_git_worktree(
         self, stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -607,20 +722,44 @@ class TestRc2Params:
 
 
 class TestRc2Environment:
-    def test_legacy_mark_with_unrelated_history_is_rc2(
+    def test_legacy_mark_with_unrelated_history_is_rc1(
         self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """旧 ``REVIEW-HEAD`` 指向无共同祖先的提交：解析期 git 失败 → rc2（不是 traceback）。"""
+        """P2 回归：旧 ``REVIEW-HEAD`` 指向无共同祖先的提交 → **rc1**（不是 rc2、不是 traceback）。
+
+        改判理由（pm 定）：PR 正文删不掉，一条孤儿标记不该让整条命令永久 rc2；它属于
+        「证据不可验证」= rc1，并逐条点名「取不到 <sha>」。
+        """
 
         orphan = orphan_commit(repo)
         stub.reviews([headed(orphan, "defect")])
         stub.comments([patched(repo.pid, "regression")])
         code, out, err = once(capsys, repo)
-        assert code == 2
-        assert out == ""
-        assert err.count("\n") == 1
-        assert err.startswith("错误: git merge-base")
-        assert "Traceback" not in err
+        assert code == 1
+        assert err == ""
+        assert f"  UNVERIFIABLE {orphan[:12]} defect" in out
+        assert f"  OK {repo.pid[:12]} regression" in out
+        assert f"取不到 {orphan} 的内容" in out
+        assert out.splitlines()[-1] == (
+            f"结论: 内容指纹 {repo.pid[:12]} 缺 defect → 内容变了要重跑双问"
+        )
+        assert "Traceback" not in out
+
+    def test_current_head_with_unrelated_history_is_rc1_and_named(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``--head`` 本身是孤儿提交（与 base 无共同祖先）→ rc1 + 结论行点名取不到该 sha。"""
+
+        orphan = orphan_commit(repo)
+        stub.reviews([patched(repo.pid, "defect")])
+        stub.comments([patched(repo.pid, "regression")])
+        code, out, err = once(capsys, repo, orphan)
+        assert code == 1
+        assert err == ""
+        assert out.splitlines()[-1] == (
+            f"结论: 取不到 {orphan}，无法按内容绑定；"
+            "先 git fetch 或在新 head 上重贴 REVIEW-PATCH"
+        )
 
     def test_git_missing_from_path(
         self,
