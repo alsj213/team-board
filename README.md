@@ -441,8 +441,8 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
 - `--card CARD` —— 只列这张卡的合并记录（**同时过滤判定段与历史段**）；形态不是
   `t_` + 8 位小写十六进制（空串、大写、多字符、缺前缀）→ rc2。它只过滤记录
   清单，**不隐藏已判出的问题**。给了它就**同时跑判据①**（见下）。
-- `--db PATH` —— 判据① 读 `tasks.assignee` 用的看板库，**只读**
-  （`mode=ro`，不建表、不写），默认
+- `--db PATH` —— 判据① 读 `tasks.assignee`、run 归属判定读 `task_runs` 用的看板库，
+  **只读**（`mode=ro`，不建表、不写），默认
   `/home/liu/.hermes/kanban/boards/devteam/kanban.db`。只在给了 `--card` 时用。
 - `--require` —— 要求 `--card` 指定的卡有认账合并，**必须与 `--card` 同用**
   （单给 → rc2）：区间内有该卡零问题的合并 → 通过；只有基线之前的合并命中 →
@@ -473,6 +473,18 @@ assignee 真是 pm，R15 身份判据也判红。
 没有 `merged-by` 值，**不参与**判据①，照样只回显 `by=无法判定`。库不存在 / 不是
 合法 SQLite / 没有 `tasks` 表 / 卡不存在 / 卡没有 assignee 一律 rc2（**不静默
 跳过判据**）。
+
+**run 归属判定（`merged-by` 的 run 必须属于本卡）**：同一条 `--card` 命令还会核
+`merged-by` 里的 run 号 —— 该 run 必须在看板库 `task_runs` 里**存在**、`task_id`
+**就是这张卡**、`profile` 与 trailer 一致、`status` 不在 `{blocked, reclaimed}`，
+否则一条 `merged-by 的 run 不属于本卡` → rc1。**历史不追溯**：只判
+`<repo>/.team-board/merge-run-audit-baseline` 那个 sha **之后**的合并；该文件不存在 →
+判定不生效并明写 `未生效（缺 .team-board/merge-run-audit-baseline…）`（不是「通过」），
+写坏了 / 不是被审 `--rev` 的祖先 → rc2。没给 `--card` 时整段不打印。输出行：
+
+```
+run 归属判定（merged-by 的 run 属于本卡）：卡 t_ad5e7ff6，窗口起点 52ac5c2，判 1 条 → PASS
+```
 
 **历史段口径**：基线及其更早（同一条 first-parent 链上）的合并只回显 PR 号 / 卡号 / sha，
 `merged-by` **无法判定**
@@ -514,6 +526,10 @@ assignee 真是 pm，R15 身份判据也判红。
   **前**校验一份 body 文件的三字段（可选 `--card/--by/--pr` 做一致性校验）；通过
   rc0（`通过：三字段齐（merged-by/merge-card/merge-pr）`），有问题 rc1（每处一行
   `问题: <kind>：<detail>`），文件/参数级错误 rc2。
+  预检还会核 **run 归属**：`merged-by` 的 run 必须在 `--db`（缺省
+  `/home/liu/.hermes/kanban/boards/devteam/kanban.db`）的 `task_runs` 里存在、属于
+  `merge-card` 那张卡、profile 一致、非 `blocked|reclaimed`；库读不到 / 没有
+  `task_runs` 表 → rc2（**不静默放过**）。`merge_guard --body-file` 的入口预检同判。
 
 三字段的分层口径（机器可判 / 卡面留痕 / 做不到）、合并操作五步与残余风险见
 [`docs/merge-accountability.md`](docs/merge-accountability.md)。

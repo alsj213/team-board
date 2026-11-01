@@ -155,6 +155,12 @@ rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdou
   与参数不一致都算不合格）；
 - ``--verify-only`` 与这四个参数**互斥**（verify-only 不合并，给了 body 说明调用方误判）。
 
+``--body-file`` 里 ``merged-by`` 的 run 还要在 :func:`run_owner_gate` 里过一遍
+（判据③：run 必须存在、``task_id`` 就是 ``--card``、profile 与 trailer 一致、
+``status`` 不是 ``blocked|reclaimed``；库读不到同样 rc2）。那一步要读看板库，所以
+排在 :func:`claim_gate` 之后、证据闸门之前 —— 「库根本打不开」先由认领闸门按更准确的
+文案报出来。
+
 四条校验全部在 :func:`validate` 里判完 —— 也就是 ``ensure_branch_present()`` 之前，
 零 ``gh`` 调用、零 ``git ls-remote``，任一不满足 → rc2、stdout 空、stderr 恰一行
 ``错误: …``。**任何「body 不合规」都不许落到 rc1**：rc1 是「未达成」专用码。
@@ -251,7 +257,14 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from team_board import db, evidence, prclaim, reviewhead
-from team_board.merges import MERGE_BY_PROFILE, MERGE_BY_RE, MERGE_CARD_RE, check_message
+from team_board.merges import (
+    MERGE_BY_PROFILE,
+    MERGE_BY_RE,
+    MERGE_CARD_RE,
+    MergeAuditError,
+    check_message,
+    check_run_ownership,
+)
 from team_board.model import DEFAULT_DB
 
 #: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
@@ -1483,6 +1496,45 @@ def claim_gate(opts: Options, info: Preflight) -> str:
     )
 
 
+def run_owner_gate(opts: Options) -> None:
+    """认账预检（判据③）：``merged-by`` 的 run 必须属于 ``--card`` 这张卡。
+
+    判据落在 :func:`team_board.merges.check_run_ownership`（**不在本模块复制一份**）：
+    run 不存在 / 属于别的卡 / profile 与 trailer 不符 / ``blocked|reclaimed`` 各一条
+    ``merged-by 的 run 不属于本卡``；库读不到（缺库、缺 ``task_runs`` 表）→ 同样是 rc2。
+
+    位置：排在 :func:`claim_gate` **之后**。两块读的是同一个库，但认领闸门的文案
+    （``读看板库失败（--db …）``）才是「库根本打不开」时最准确的那一条；run 闸门跟
+    在后面，专门回答「库能读、但这条 ``merged-by`` 对不上任何本卡 run」。
+
+    这一步**不产出 stdout 证据行**（与 claim / evidence 闸门不同）：它没有外部命令，
+    也没有可引用的键值对，而合并成功后 stdout 的行序是被 R6 / R12 契约引用的 ——
+    多一行会把下游按位置取行的读取口都撞一遍。拒绝时照旧 stdout 0 字节、stderr 一行。
+    """
+
+    accounting = opts.accounting
+    if accounting is None:  # pragma: no cover - 合并模式必填，validate 已拦
+        return
+    body = read_body_file(accounting.body_file)
+    try:
+        problems = check_run_ownership(
+            body, card=accounting.card, db_path=opts.db_path
+        )
+    except MergeAuditError as exc:
+        raise MergeGuardError(
+            f"读看板库失败（--db {opts.db_path}），无法核对 merged-by 的 run 是否属于"
+            f" {accounting.card}：{exc}；拒绝合并（run 归属闸门只读 --db 指向的库，"
+            f"缺省 {DEFAULT_DB}）"
+        ) from exc
+    if problems:
+        detail = "；".join(f"{problem.kind}：{problem.detail}" for problem in problems)
+        raise MergeGuardError(
+            f"run 归属闸门拦下 PR #{opts.pr}：{detail}；"
+            "merged-by 写的是 /run<N>，N 必须是本卡真实跑过、且没被 blocked / reclaimed 的 run"
+            "（先用 --db 指向的库里 task_runs 核对）；拒绝合并"
+        )
+
+
 def ensure_pr_refs(opts: Options, base: str) -> None:
     """一次 ``git fetch`` 把远端 ``base`` 与 ``--branch`` 抓进私有 ref（两道闸门共用）。
 
@@ -2356,6 +2408,8 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
     #   ③ 双问绑定内容指纹（R18④）——共用一次 fetch + 两条 gh api GET，判据是内容指纹。
     # 三者都在 rebase 闸门之前、gh pr merge 之前：拒绝时 stdout 0 字节、零 gh 写操作。
     claim_line = claim_gate(opts, info)
+    # 认账预检：merged-by 的 run 必须属于 --card 这张卡（只读看板库，无 stdout 证据行）。
+    run_owner_gate(opts)
     evidence_line = evidence_gate(opts, info)
     review_line = review_head_gate(opts, info, repo_slug)
     # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。

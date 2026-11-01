@@ -28,6 +28,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,41 @@ DEFAULT_TITLE = f"Merge PR #{PR}（{CARD}）"
 
 #: 仓库根（文档守卫要读 README.md / docs）
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _board_with_merge_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """把所有用例的**默认**看板库换成临时库（入口预检要核 run 归属）。
+
+    ``merge_guard --body-file`` 与 ``merge-record --check-file`` 现在都判
+    「``merged-by`` 的 run 属于本卡」，读的是 ``--db``（缺省 ``DEFAULT_DB``）指向的
+    ``task_runs``。这里给一份「``CARD`` + ``BY`` 对得上」的库并接管两处默认值：
+    用例既不读真板，也顺带证明合法 body 这条路是通的。
+    """
+
+    board = tmp_path / "board.db"
+    conn = sqlite3.connect(str(board))
+    try:
+        conn.executescript(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT,"
+            " status TEXT, created_at INTEGER, started_at INTEGER, completed_at INTEGER);"
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT,"
+            " profile TEXT, status TEXT);"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status) VALUES (?, ?, ?, ?)",
+            (CARD, CARD, "repo", "done"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+            (int(BY.partition("/run")[2]), CARD, "repo", "completed"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(cli, "DEFAULT_DB", str(board))
+    monkeypatch.setattr(mg, "DEFAULT_DB", str(board))
+    return board
 
 
 def run(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:

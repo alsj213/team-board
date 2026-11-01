@@ -87,6 +87,23 @@ trailer 块里不属于 ``TRAILER_KEYS``，于是被当成无关键忽略，三�
     最早一条 ``merged-by`` 为 ``repo`` 的合并是分界，它之前的不追溯、它及之后一律判；
     区间内没有任何 repo 合并时该判定整段不生效（过渡期，``render_report`` 明写）。
     切换点取**完整判定段**，不随 ``--card`` 漂移。
+13. **判据③（``merged-by`` 的 run 必须属于本卡）**：``merged-by: <profile>/run<N>`` 的
+    ``N`` 必须是 ``task_runs`` 里**真实存在**、``task_id`` 就是本卡、
+    ``profile`` 与 trailer 的 profile 逐字相同、且 ``status`` 不在
+    ``{blocked, reclaimed}`` 的那一行 —— 否则报 :data:`KIND_RUN_NOT_OF_CARD`
+    （四档各报一条，见 :func:`check_run_owner`）。取数走 :func:`read_runs`
+    （``mode=ro``、只读 ``task_runs``，一条 SQL 取多行），读不到库 / 没有
+    ``task_runs`` 表一律 :class:`MergeAuditError`（rc2，**不静默放过**）。
+    两个判定点与判据①② 同样分「候选 message」与「已落地提交」两路：
+    :func:`check_message`（``merge_guard`` / ``merge-record --check-file`` 入口预检，
+    由调用方传 ``db_path``，不传则该判定不生效）与 :func:`audit` 的判定段
+    （只在 ``only_card`` 给出时跑 —— 「run 属于哪张卡」没有卡号就无从判）。
+    **历史不追溯**：``.team-board/merge-run-audit-baseline`` 给出起点 sha，
+    只判该提交**之后**（不含它自身）的合并；文件不存在 = 本仓库尚未声明窗口，
+    该判定**不生效并在输出里明写**（读数失败仍是 rc2，不许把「文件缺失」伪装成
+    「通过」）；文件存在但内容非法 / 解析不了 / 不是被审 ``rev`` 的祖先 → rc2
+    （与 ``merge-audit-baseline`` 同口径）。判据①②、:data:`MERGE_BY_PROFILE`
+    一律不动，也不给这条判定留任何开关。
 """
 
 from __future__ import annotations
@@ -98,6 +115,7 @@ import sqlite3
 # bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git），
 # 调用形式为 argv 列表、shell=False，不拼 shell 字符串
 import subprocess  # nosec B404
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -145,6 +163,16 @@ KIND_MERGED_BY_MISMATCH = "merged-by 与卡 assignee 不符"
 #: 判据②（R15 合并权归 repo bot）：``merged-by`` 的 profile 部分不是 ``repo``
 KIND_ACTOR_NOT_REPO = "merged-by 的 profile 不是 repo"
 
+#: 判据③：``merged-by`` 里的 run 号不属于本卡（不存在 / 别的卡 / profile 不符 /
+#: blocked|reclaimed 四档共用这一个 kind，档位写在 ``detail`` 里）
+KIND_RUN_NOT_OF_CARD = "merged-by 的 run 不属于本卡"
+
+#: 判据③：不能用来认账的 run 状态（blocked = 卡等人 / reclaimed = run 被回收重排）
+RUN_BLOCKED_STATUSES = frozenset({"blocked", "reclaimed"})
+
+#: ``merged-by`` 里的 run 号：取 ``run`` 之后那段，见 :func:`run_id_of`
+_RUN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*/run([0-9]+)$")
+
 #: ``audit(require=True)`` 追加的两类「该卡没有可认账的合并」问题
 KIND_MISSING_HISTORY = "缺认账字段（历史，基线前）"
 KIND_NO_MERGE = "缺认账字段"
@@ -159,6 +187,10 @@ DETAIL_NO_MERGE = "历史与区间内都没有该卡的合并提交"
 
 #: 基线文件默认路径（相对仓库根）：``<repo>/.team-board/merge-audit-baseline``
 DEFAULT_BASELINE_FILE = Path(".team-board") / "merge-audit-baseline"
+
+#: 判据③ 的窗口起点文件（相对仓库根）：只判该 sha **之后**的合并；
+#: 文件不存在 = 本仓库没有声明窗口，判据③ 不生效（``render_report`` 明写）
+DEFAULT_RUN_BASELINE_FILE = Path(".team-board") / "merge-run-audit-baseline"
 
 #: 基线文件内容：7–40 位小写十六进制 sha（与 ``branches.SHA_RE`` 同口径）
 BASELINE_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -198,6 +230,16 @@ class MergeRecord:
 
 
 @dataclass(frozen=True)
+class RunOwner:
+    """``task_runs`` 的一行（判据③ 的对照值）：``run_id → task_id/profile/status``。"""
+
+    run_id: int
+    task_id: str
+    profile: str
+    status: str
+
+
+@dataclass(frozen=True)
 class Problem:
     """一处认账问题；``sha`` 为空串表示「候选 message，还没有提交」。"""
 
@@ -217,6 +259,11 @@ class MergeReport:
     ``actor_switch`` 是判据②（R15 合并权归 repo bot）的**切换点 sha**：判定段里最早
     一条 ``merged-by`` 为 ``repo`` 的合并。``None`` = 区间内尚无 repo 合并（过渡期，
     该判定整段不生效）。调用方不传也合法。
+
+    ``run_baseline`` 是判据③（``merged-by`` 的 run 属于本卡）的窗口起点 sha：
+    ``None`` = 本仓库没有声明窗口（``.team-board/merge-run-audit-baseline`` 不存在
+    或本次没给 ``--card``），该判定不生效。``run_checked`` 是本次真被判过的
+    trailer 记录条数（0 条也可能是「窗口里没有该卡的合并」，``render_report`` 分开写）。
     """
 
     repo: str
@@ -228,6 +275,8 @@ class MergeReport:
     card: str | None = None
     assignee: str | None = None
     actor_switch: str | None = None
+    run_baseline: str | None = None
+    run_checked: int = 0
 
     @property
     def ok(self) -> bool:
@@ -332,6 +381,20 @@ def actor_of(by: str) -> str:
     return by.partition("/")[0]
 
 
+def run_id_of(by: str) -> int:
+    """``merged-by`` 值里的 run 号：``"repo/run7" -> 7``（判据③ 的取值入口）。
+
+    只在 ``by`` 已过 :data:`MERGE_BY_RE` 时调用（``_fields`` / ``check_message`` 都
+    已判过格式）；这里仍然自己校验一遍 —— 拿一个格式非法的值来切会得到
+    ``ValueError``/截断，静默切错比报错更危险。
+    """
+
+    match = _RUN_ID_RE.fullmatch(by) if isinstance(by, str) else None
+    if match is None:
+        raise MergeAuditError(f"merged-by 值非法，取不出 run 号：{by!r}（应形如 repo/run137）")
+    return int(match.group(1))
+
+
 def parse_trailers(message: str) -> tuple[dict[str, str], tuple[Problem, ...]]:
     """切出 message 末尾 trailer 块里的三键原值（不做格式校验）。
 
@@ -412,12 +475,19 @@ def check_message(
     card: str | None = None,
     by: str | None = None,
     pr: int | None = None,
+    db_path: str | Path | None = None,
 ) -> tuple[Problem, ...]:
     """判一条**候选** message（判 1–3 与格式，不判 ``parents``）。
 
     传了 ``card`` / ``by`` / ``pr`` 且与 message 里的值不一致时追加
     ``字段与参数不一致``；传参自身的格式非法属参数错误，由调用方先判，这里不重复判。
     空元组 = 通过。
+
+    ``db_path`` 给出时**追加判据③**（``merged-by`` 的 run 属于本卡）：读
+    ``task_runs`` 判「run 不存在 / 属于别的卡 / profile 不符 / blocked|reclaimed」。
+    ``merge_guard`` / ``merge-record --check-file`` 两个入口都必须传真库路径——
+    不传则该判定不生效（纯函数用法：单测解析/格式口径时不碰库）。库读不到 →
+    :class:`MergeAuditError`（CLI 转 rc2），**不静默放过**。
     """
 
     scan = _scan_message(message)
@@ -436,6 +506,12 @@ def check_message(
                 f"merged-by={merged_by}；合并权归 repo bot（R15），正确写法 repo/run<N>",
             )
         )
+
+    # 判据③：run 必须真实存在、属于 merge-card 那张卡、profile 一致、非 blocked。
+    # 只对「形态已经合法」的两个值查库 —— 畸形值已被「格式非法 / 缺字段」报过，
+    # 再拿它去查库只会多报一条同义问题（库里不可能有畸形 run 号）。
+    if db_path is not None:
+        problems.extend(check_run_ownership(message, card=card, db_path=db_path))
 
     expected: dict[str, str] = {}
     if card is not None:
@@ -540,6 +616,150 @@ def check_actor(record: MergeRecord) -> tuple[Problem, ...]:
             f"merged-by={record.by}；合并权归 repo bot（R15），正确写法 repo/run<N>",
         ),
     )
+
+
+def check_run_owner(by: str, card: str, run: RunOwner | None) -> tuple[Problem, ...]:
+    """判据③：``merged-by`` 里的 run 必须存在、属于 ``card``、profile 一致、非 blocked。
+
+    四档各报**一条** :data:`KIND_RUN_NOT_OF_CARD`（``run=None`` 时只报「不存在」：
+
+    - ``run is None`` → 该 run 在 ``task_runs`` 里不存在；
+    - ``run.task_id != card`` → 属于别的卡（R14 案例 ``t_df640caa``：不按 ``assignee``
+      猜，只认 ``task_runs.task_id``）；
+    - ``run.profile != actor_of(by)`` → trailer 的 profile 与库里那一行的 profile 不符
+      （``repo/run745`` 解析到一条 ``pm`` run）；
+    - ``run.status in RUN_BLOCKED_STATUSES`` → blocked / reclaimed 的 run 不能认账。
+
+    同一件事不重复报：占位说明写进 ``detail``，由调用方一次性拼进问题段。
+    """
+
+    problems: list[Problem] = []
+    if run is None:
+        problems.append(
+            Problem(
+                KIND_RUN_NOT_OF_CARD,
+                "",
+                f"merged-by={by} 的 run {_run_label(by)} 在 task_runs 里不存在"
+                f"（卡 {card}）",
+            )
+        )
+        return tuple(problems)
+    if run.task_id != card:
+        problems.append(
+            Problem(
+                KIND_RUN_NOT_OF_CARD,
+                "",
+                f"merged-by={by} 的 run {run.run_id} 属于卡 {run.task_id}，"
+                f"不是本卡 {card}",
+            )
+        )
+    expected_profile = actor_of(by)
+    if run.profile != expected_profile:
+        problems.append(
+            Problem(
+                KIND_RUN_NOT_OF_CARD,
+                "",
+                f"merged-by={by} 的 run {run.run_id} profile={run.profile}，"
+                f"与 trailer 的 profile={expected_profile} 不符",
+            )
+        )
+    if run.status in RUN_BLOCKED_STATUSES:
+        problems.append(
+            Problem(
+                KIND_RUN_NOT_OF_CARD,
+                "",
+                f"merged-by={by} 的 run {run.run_id} status={run.status}"
+                "（blocked / reclaimed 的 run 不能认账）",
+            )
+        )
+    return tuple(problems)
+
+
+def _run_label(by: str) -> str:
+    """渲染用 run 号文本；取不出来就原样打 ``by``（不吞掉原值）。"""
+
+    try:
+        return str(run_id_of(by))
+    except MergeAuditError:
+        return by
+
+
+def read_runs(db_path: str | Path, run_ids: Iterable[int]) -> dict[int, RunOwner]:
+    """**只读**取 ``task_runs`` 的 ``id → task_id/profile/status``（判据③ 的对照值）。
+
+    一条 ``SELECT … WHERE id IN (…)`` 取多行，``mode=ro`` 打开、绝不建表 / 写库。
+    下面这些情形一律 :class:`MergeAuditError`（CLI 转 rc2，**不许当成「没有这条 run」
+    静默放过**）：库不存在 / 不是合法 SQLite / 没有 ``task_runs`` 表 / 列缺失 /
+    查询失败。查不到的 run 号**不报错**（那是判据本身要报的「run 不存在」），
+    只是不出现在返回的字典里。
+    """
+
+    ids = sorted({int(run_id) for run_id in run_ids})
+    if not ids:
+        return {}
+
+    try:
+        conn = _connect_board(db_path)
+    except BoardError as exc:
+        raise MergeAuditError(
+            f"看板库不可读，无法做 run 归属判定（merged-by 的 run 属于本卡）：{exc}"
+        ) from exc
+    try:
+        # 占位符个数由 ids 长度决定，值是参数化传入的（不是拼进 SQL 的字符串）
+        # → bandit B608 假阳性
+        placeholders = ", ".join("?" for _ in ids)
+        # 列名是模块内常量、占位符由 ids 长度生成，值全部参数化传入（同一口径见 db.py）
+        columns = "id, task_id, profile, status"
+        sql = f"SELECT {columns} FROM task_runs WHERE id IN ({placeholders})"  # nosec B608
+        rows = conn.execute(sql, ids).fetchall()
+    except sqlite3.Error as exc:
+        raise MergeAuditError(
+            f"读看板库 {db_path} 的 task_runs 表失败，无法做 run 归属判定"
+            f"（merged-by 的 run 属于本卡）：{exc}"
+        ) from exc
+    finally:
+        conn.close()
+
+    owners: dict[int, RunOwner] = {}
+    for row in rows:
+        run_id, task_id, profile, status = row
+        owners[int(run_id)] = RunOwner(
+            run_id=int(run_id),
+            task_id="" if task_id is None else str(task_id),
+            profile="" if profile is None else str(profile),
+            status="" if status is None else str(status),
+        )
+    return owners
+
+
+def check_run_ownership(
+    message: str, *, card: str | None = None, db_path: str | Path
+) -> tuple[Problem, ...]:
+    """只判判据③（``merged-by`` 的 run 属于本卡），空元组 = 通过或无可判之处。
+
+    :func:`check_message` 在 ``db_path`` 给出时调它；``merge_guard`` 也直接调它作为
+    **独立的入口闸门**（排在认领闸门之后：那块库坏掉时先报认领闸门那条更准确的文案）。
+
+    不判的两种情况（不是「通过」，是「这条判据没有对象」）：
+
+    - message 里没有 ``merged-by``，或它的形态不合法（已由 ``缺字段`` / ``格式非法``
+      报过，不重复报第二条）；
+    - 拿不到合法的卡号（``merge-card`` 缺失/非法，且调用方也没给 ``card``）。
+
+    库读不到 / 没有 ``task_runs`` 表 → :class:`MergeAuditError`（调用方转 rc2，
+    **不静默放过**）。
+    """
+
+    scan = _scan_message(message)
+    merged_by = scan.values.get("merged-by")
+    if merged_by is None or _FORMAT_BY_KEY["merged-by"].fullmatch(merged_by) is None:
+        return ()
+    run_card = scan.values.get("merge-card") or card
+    if not isinstance(run_card, str) or MERGE_CARD_RE.fullmatch(run_card) is None:
+        return ()
+    run_id = run_id_of(merged_by)
+    owners = read_runs(db_path, [run_id])
+    return check_run_owner(merged_by, run_card, owners.get(run_id))
 
 
 def build_message(*, card: str, by: str, pr: int, subject: str | None = None) -> str:
@@ -752,6 +972,21 @@ def _read_baseline_file(path: Path) -> str:
     return value
 
 
+def _read_run_baseline(root: Path) -> str | None:
+    """读判据③ 的窗口起点文件（``<repo>/.team-board/merge-run-audit-baseline``）。
+
+    **文件不存在 → ``None``**：本仓库没有声明窗口（这条判定不生效，``render_report``
+    明写「未生效」，不是「通过」）。文件存在但空 / 多行 / 非 UTF-8 / 格式非法 →
+    :class:`MergeAuditError`（rc2），与 ``merge-audit-baseline`` 同口径 —— 写坏了的
+    文件不许退化成「没有窗口」。
+    """
+
+    path = root / DEFAULT_RUN_BASELINE_FILE
+    if not path.exists():
+        return None
+    return _read_baseline_file(path)
+
+
 def _log_entries(text: str, fields: int, what: str) -> list[list[str]]:
     """把 ``git log --format`` 输出切成条目（``\\x1e`` 分条、``\\x1f`` 分字段）。"""
 
@@ -807,6 +1042,10 @@ def audit(
     读失败一律 rc2（**不因为没传 db 就静默跳过判据**）。判据① 出的问题在
     ``require`` 之前并入 ``problems``，于是「``merged-by`` 不符」的合并也不算
     「零问题的认账合并」。
+
+    判据③（``merged-by`` 的 run 属于本卡）同样只在给了 ``only_card`` 时跑，且只在
+    ``<repo>/.team-board/merge-run-audit-baseline`` 声明了窗口时才生效 —— 只判该
+    起点**之后**的合并（历史不追溯）。同上，读 ``task_runs`` 失败一律 rc2。
     """
 
     root = _resolve_repo(repo)
@@ -847,6 +1086,32 @@ def audit(
             "（区间必须是 <基线>..<rev> 且方向为正：基线在被审 rev 的上游。"
             "基线被前推、或 rev 给成基线之前的提交时，区间会变空并静默假绿，故一律报错）"
         )
+
+    # 判据③ 的窗口起点（历史不追溯）。只在给了 --card 时读：没有卡号就无从判
+    # 「run 属于哪张卡」，且 CI 的 merge-audit（不带 --card）不必为它多跑两次 git。
+    # 方向断言与主基线同口径：起点必须在被审 rev 的上游，否则窗口会退化成空集并假绿。
+    run_baseline_sha: str | None = None
+    run_window: frozenset[str] = frozenset()
+    if only_card is not None:
+        declared = _read_run_baseline(root)
+        if declared is not None:
+            run_baseline_sha = _resolve_commit(root, declared, "run 判定窗口起点")
+            inside = _git(root, "merge-base", "--is-ancestor", run_baseline_sha, rev_sha)
+            if inside.returncode != 0:
+                raise MergeAuditError(
+                    f"run 判定窗口起点不是被审 rev 的祖先：{run_baseline_sha} / {rev_sha}"
+                    f"（{DEFAULT_RUN_BASELINE_FILE} 写的是被审 rev 之后 / 另一条线上的提交，"
+                    "窗口会变空并静默假绿，故一律报错）"
+                )
+            run_window = frozenset(
+                _git_ok(
+                    root,
+                    "rev-list",
+                    "--first-parent",
+                    f"{run_baseline_sha}..{rev_sha}",
+                    what="无法读取 run 判定窗口内的提交",
+                ).split()
+            )
 
     judged: list[MergeRecord] = []
     problems: list[Problem] = []
@@ -916,6 +1181,35 @@ def audit(
         for record in judged:
             problems.extend(check_merged_by(record, assignee))
 
+    # 判据③：只判**本卡**（``judged`` 已按 merge-card 过滤）、落在窗口内（起点之后的
+    # 合并）、且 merged-by / merge-card 都合法的 trailer 记录。一条 SQL 取全部 run，
+    # 读不到库 → rc2（不静默放过）。必须放在 require 之前：run 对不上的合并同样不算
+    # 「零问题的认账合并」。
+    run_checked = 0
+    if only_card is not None and run_baseline_sha is not None:
+        in_window = [
+            record
+            for record in judged
+            if record.source == "trailer"
+            and record.by is not None
+            and record.card is not None
+            and record.sha in run_window
+        ]
+        if in_window:
+            board_db = DEFAULT_DB if db_path is None else db_path
+            # (record, merged-by 值)：record.by 的非 None 在这里收窄一次，下面直接用
+            owned = [(record, record.by) for record in in_window if record.by is not None]
+            owners = read_runs(board_db, [run_id_of(by) for _, by in owned])
+            for record, by in owned:
+                run_id = run_id_of(by)
+                problems.extend(
+                    replace(problem, sha=record.sha)
+                    for problem in check_run_owner(
+                        by, record.card or only_card, owners.get(run_id)
+                    )
+                )
+        run_checked = len(in_window)
+
     # 判据②（R15）：切换点及其之后的合并一律判 actor；切换点之前的不追溯。
     # 分界取**完整判定段**（``order`` 在 only_card 过滤之前生成）—— 切换点是仓库
     # 时间线上的事实，不随 ``--card`` 漂移，否则同一区间会得出两种口径。
@@ -967,6 +1261,8 @@ def audit(
         card=only_card,
         assignee=assignee,
         actor_switch=actor_switch,
+        run_baseline=run_baseline_sha,
+        run_checked=run_checked,
     )
 
 
@@ -1015,6 +1311,44 @@ def _judgement_one_lines(report: MergeReport) -> list[str]:
     return lines
 
 
+def _judgement_three_lines(report: MergeReport) -> list[str]:
+    """判据③ 的输出行（只在给了 ``--card`` 时打印）。
+
+    标题用「run 归属判定」而不是数字编号：``commit-audit`` 的「判据③」是 committer
+    身份（见 docs/merge-accountability.md），两条不是同一件事，同一套输出里复用编号
+    会让人以为在讲同一条判据。
+
+    三种形态分得很开，避免把「没判」读成「判过且通过」：
+
+    - 未声明窗口 → ``未生效``（文件缺失）；
+    - 声明了窗口但该卡没有窗口内的合并 → ``不适用``；
+    - 判了 N 条 → ``PASS`` / ``FAIL``。
+    """
+
+    card = report.card
+    if card is None:
+        return []
+    prefix = f"run 归属判定（merged-by 的 run 属于本卡）：卡 {card}，"
+    if report.run_baseline is None:
+        return [
+            f"{prefix}未生效（缺 {DEFAULT_RUN_BASELINE_FILE}："
+            "该判定只判窗口起点之后的合并）"
+        ]
+    if report.run_checked == 0:
+        return [
+            f"{prefix}窗口起点 {_short(report.run_baseline)}，"
+            "区间内无该卡窗口内的合并 → 不适用"
+        ]
+    failed = any(
+        problem.kind == KIND_RUN_NOT_OF_CARD for problem in report.problems
+    )
+    verdict = "FAIL（见问题段）" if failed else "PASS"
+    return [
+        f"{prefix}窗口起点 {_short(report.run_baseline)}，"
+        f"判 {report.run_checked} 条 → {verdict}"
+    ]
+
+
 def render_report(report: MergeReport) -> str:
     """把 ``MergeReport`` 渲染成人类可读文本（末行是结论，不打印退出码）。
 
@@ -1038,6 +1372,7 @@ def render_report(report: MergeReport) -> str:
         )
 
     lines.extend(_judgement_one_lines(report))
+    lines.extend(_judgement_three_lines(report))
 
     # 判据②（R15）的切换点：有分界就打出 sha，否则明写过渡期（不生效 ≠ 通过，
     # 让读的人一眼看出「这一段现在还没在判」）。

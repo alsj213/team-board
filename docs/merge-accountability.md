@@ -78,6 +78,35 @@ PYTHONPATH=src python -m team_board.cli merge-audit --repo . --baseline <基线>
   就 rc2（stdout 0 字节、stderr 恰一行、零 `gh` 调用），不会走到合并那一步；`--by` 的帮助文本
   也只教 `repo/runNNN`。
 
+## run 归属判定 · `merged-by` 的 run 必须属于本卡
+
+`merged-by: <profile>/run<N>` 里的 `N` 不只是一个装饰性的自述：它必须能在看板库
+`task_runs` 里对上，且四件事全成立 ——
+
+1. `N` 存在（`task_runs.id = N`）；
+2. 那一行的 `task_id` **就是** `merge-card` 那张卡；
+3. 那一行的 `profile` 与 trailer 的 profile 逐字相同；
+4. 那一行的 `status` 不在 `{blocked, reclaimed}`（卡在等人 / run 被回收重排的都不能认账）。
+
+四档各报一条 `merged-by 的 run 不属于本卡`（`merges.KIND_RUN_NOT_OF_CARD`）。判定点两处：
+
+- **候选 message（入口预检）**：`merge_guard --body-file` 与
+  `merge-record --check-file` 都判，读的是 `--db`（缺省 `DEFAULT_DB`）指向的
+  `task_runs`；库读不到 / 没有 `task_runs` 表 → **rc2**，不静默放过。
+- **已落地提交（事后回溯）**：`merge-audit --card <卡号>` 的判定段逐条判。输出里是
+  `run 归属判定（merged-by 的 run 属于本卡）：卡 <卡号>，窗口起点 <sha7>，判 N 条 → PASS|FAIL`；
+  run 对不上的合并不算「零问题的认账合并」，会被 `--require` 一并判红。
+
+**历史不追溯**：窗口起点写在 `.team-board/merge-run-audit-baseline`（一行 sha），只判该
+提交**之后**的合并。文件不存在 = 本仓库没有声明窗口 → 该判定不生效，输出里明写
+`未生效（缺 .team-board/merge-run-audit-baseline…）`（**不是「通过」**）；文件存在但
+空 / 多行 / 不是 7–40 位小写十六进制 / 不是被审 `--rev` 的祖先 → rc2（与
+`merge-audit-baseline` 同口径：写坏了不许退化成「没有窗口」）。
+
+**为什么必须机器核**：`merged-by` 是执行者自述的 run 标签（R8），只比 profile 的话
+`repo/run745` 这种「run 号属于别张卡」的写法全绿 —— 那样认账字段就连「谁在哪张卡上跑的」
+都对不上了。
+
 ## 判据② · author 白名单（取「建卡时 assignee」）
 
 ```

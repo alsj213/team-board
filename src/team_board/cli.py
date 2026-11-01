@@ -570,7 +570,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-file",
         default=None,
         metavar="PATH",
-        help="预检模式：校验该文件的认账三字段（不能与 --body-out 同给）",
+        help=(
+            "预检模式：校验该文件的认账三字段（不能与 --body-out 同给）；"
+            "同时判「merged-by 的 run 属于本卡」，要读 --db 指向的 task_runs"
+        ),
+    )
+    record_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=(
+            "看板 SQLite 路径，只读（--check-file 预检判 run 归属用；"
+            f"默认 {DEFAULT_DB}）"
+        ),
     )
 
     body_cmd = subparsers.add_parser(
@@ -1660,7 +1672,7 @@ def _run_merge_record(args: argparse.Namespace) -> int:
 
         if args.check_file is not None:
             problems = merges.check_message(
-                _read_body_file(args.check_file), card=card, by=by, pr=pr
+                _read_body_file(args.check_file), card=card, by=by, pr=pr, db_path=args.db
             )
             if problems:
                 text = "".join(

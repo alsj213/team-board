@@ -103,6 +103,10 @@ def board_db(
     列名照真库的子集：``iter_claim_rows`` 只读 ``tasks(id,status,assignee,body)``；
     ``evidence.collect`` 读 ``task_events(id,task_id,kind,payload,run_id,created_at)``
     并 ``LEFT JOIN task_runs`` 取 profile。
+
+    ``task_runs`` **无条件建**：认账预检（``merged-by`` 的 run 属于本卡）排在证据闸门
+    之前，它要读 ``task_runs.task_id/profile/status``；``with_event_tables`` 只控制
+    ``task_events`` —— 「库在、但没有事件表」才是本条要测的证据取数失败。
     """
 
     path = tmp_path / "kanban.db"
@@ -110,8 +114,11 @@ def board_db(
     try:
         with conn:
             conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, body TEXT)")
+            conn.execute(
+                "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT,"
+                " profile TEXT, status TEXT)"
+            )
             if with_event_tables:
-                conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, profile TEXT)")
                 conn.execute(
                     "CREATE TABLE task_events ("
                     "id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
@@ -126,11 +133,17 @@ def board_db(
                     (impl_card, "running", "engineer", "实现卡正文"),
                 ],
             )
+            conn.executemany(
+                "INSERT INTO task_runs VALUES (?,?,?,?)",
+                [
+                    (1, None, "pm", "done"),
+                    (2, None, "qa", "done"),
+                    (3, None, "paimeng", "done"),
+                    # 认账预检要的「本卡 + repo 身份」那一行（``MERGE_BY`` = repo/run200）
+                    (200, MERGE_CARD, "repo", "completed"),
+                ],
+            )
             if with_event_tables:
-                conn.executemany(
-                    "INSERT INTO task_runs VALUES (?,?)",
-                    [(1, "pm"), (2, "qa"), (3, "paimeng")],
-                )
                 conn.executemany(
                     "INSERT INTO task_events (task_id,kind,payload,run_id,created_at) "
                     "VALUES (?,?,?,?,0)",
@@ -517,13 +530,26 @@ def test_missing_db_rc2_names_flag_and_path(
 
 
 def test_evidence_gate_missing_db_message_is_evidence_specific(tmp_path: Path) -> None:
-    """闸门自身的库错误文案（绕过认领闸门直接调）也点名 ``--db`` 与该路径。
+    """闸门自身的库错误文案（绕过认领闸门与认账预检直接调）也点名 ``--db`` 与该路径。
 
-    ``main`` 路径上认领闸门排在前面，它的文案同样含 ``--db``；这里单独钉证据闸门那一份，
-    免得「验收 6 过了」其实只是认领闸门的文案过了。
+    ``main`` 路径上认领闸门 / 认账预检排在前面，它们的文案同样含 ``--db``；这里单独钉
+    证据闸门那一份，免得「验收 6 过了」其实只是前面某道闸门的文案过了。因为认账预检
+    现在也要读库（``merged-by`` 的 run 属于本卡），这条路径上直接构造 ``Options``，
+    不经过 ``validate``。
     """
 
-    opts = mg.validate(mg.build_parser().parse_args(cli_argv(tmp_path, db=tmp_path / "nope.db")))
+    opts = mg.Options(
+        pr=PR,
+        branch=BRANCH,
+        method="merge",
+        repo=".",
+        remote="origin",
+        db_path=str(tmp_path / "nope.db"),
+        timeout=60,
+        interval=2,
+        command_timeout=60,
+        verify_only=False,
+    )
     info = mg.Preflight(
         number=PR, state="OPEN", head_ref=BRANCH, base_ref="main", head_oid=HEAD_OID
     )
