@@ -361,7 +361,7 @@ class TestRender:
             fp(), [patched(PID, "defect"), patched(PID, "regression")], base="origin/main"
         )
         assert reviewhead.render(report).splitlines() == [
-            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]}"
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID}"
             f" base=origin/main mb={MB[:12]}",
             "扫描正文 2 条；带标记行 2 条",
             f"  OK {PID[:12]} defect",
@@ -374,7 +374,7 @@ class TestRender:
 
         report = reviewhead.analyze(fp(), [patched(PID, "defect")])
         assert reviewhead.render(report).splitlines()[0] == (
-            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]} base=- mb={MB[:12]}"
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID} base=- mb={MB[:12]}"
         )
 
     def test_four_states_in_one_report(self) -> None:
@@ -403,7 +403,7 @@ class TestRender:
         )
         lines = reviewhead.render(report).splitlines()
         assert lines[0] == (
-            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID[:12]}"
+            f"algo={reviewhead.FINGERPRINT_ALGO} current={PID}"
             f" base=main mb={MB[:12]}"
         )
         assert lines[1] == "扫描正文 4 条；带标记行 4 条"

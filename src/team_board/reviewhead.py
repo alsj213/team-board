@@ -486,7 +486,7 @@ def unfetchable(head_sha: str, bodies: Sequence[str], *, base: str = "") -> Repo
 def render(report: Report) -> str:
     """整块报告（指纹形态）。
 
-    首行 ``algo=<FINGERPRINT_ALGO> current=<前12> base=<base ref> mb=<前12>``，第二行
+    首行 ``algo=<FINGERPRINT_ALGO> current=<40 位> base=<base ref> mb=<前12>``，第二行
     扫描条数，然后每条 ``<state> <pid12|head12> <kind>``，最后一行结论。``report.current``
     为 ``None`` 时是兼容形态（按 sha 判），走旧渲染（旧调用点的输出保持逐字不变）。
     """
@@ -496,7 +496,7 @@ def render(report: Report) -> str:
 
     current = report.current
     lines = [
-        f"algo={FINGERPRINT_ALGO} current={current.value[:12] if current.value else '-'}"
+        f"algo={FINGERPRINT_ALGO} current={current.value or '-'}"
         f" base={report.base or '-'}"
         f" mb={current.merge_base[:12] if current.merge_base else '-'}",
         f"扫描正文 {report.bodies_scanned} 条；带标记行 {len(report.marks)} 条",
