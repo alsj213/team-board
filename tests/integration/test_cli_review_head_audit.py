@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess  # nosec B404
 from dataclasses import dataclass
@@ -325,7 +326,7 @@ class TestRc0:
         assert err == ""
         lines = out.splitlines()
         assert lines[0].startswith(
-            f"algo={ALGO} current={repo.pid[:12]} base=main mb="
+            f"algo={ALGO} current={repo.pid} base=main mb="
         )
         assert lines[1] == "扫描正文 2 条；带标记行 2 条"
         assert f"  OK {repo.pid[:12]} defect" in lines
@@ -333,6 +334,22 @@ class TestRc0:
         assert lines[-1] == (
             f"结论: 内容指纹 {repo.pid[:12]} 的 defect + regression 各 >=1 条 → 绑定成立"
         )
+
+    def test_first_line_current_is_the_full_40_hex_patch(
+        self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """首行 ``current=`` 打完整 40 位，且与独立现算的 ``git diff -U0`` 内容 sha256 同值。"""
+
+        stub.reviews([patched(repo.pid, "defect")])
+        stub.comments([patched(repo.pid, "regression")])
+        code, out, _ = once(capsys, repo)
+        assert code == 0
+        first = out.splitlines()[0]
+        match = re.fullmatch(
+            rf"algo={re.escape(ALGO)} current=([0-9a-f]{{40}}) base=main mb=[0-9a-f]{{12}}",
+            first,
+        )
+        assert match is not None and match.group(1) == repo.pid, first
 
     def test_legacy_review_head_mark_is_reused_by_content(
         self, stub: Stub, repo: Repo, capsys: pytest.CaptureFixture[str]
@@ -435,7 +452,7 @@ class TestRc1:
         assert err == ""
         assert f"  STALE {repo.pid[:12]} defect" in out
         assert f"  STALE {repo.pid[:12]} regression" in out
-        assert out.splitlines()[0].startswith(f"algo={ALGO} current={new_pid[:12]} base=main mb=")
+        assert out.splitlines()[0].startswith(f"algo={ALGO} current={new_pid} base=main mb=")
         assert out.splitlines()[-1] == (
             f"结论: 内容指纹 {new_pid[:12]} 缺 defect,regression → 内容变了要重跑双问"
         )
@@ -576,7 +593,7 @@ class TestRemote:
             "origin",
         )
         assert code == 0
-        assert f"current={expected[:12]}" in out.splitlines()[0]
+        assert f"current={expected}" in out.splitlines()[0]
         fetched = subprocess.run(  # nosec B603 B607
             [_git_bin(), "-C", str(clone), "cat-file", "-e", f"{fresh}^{{commit}}"],
             capture_output=True,
