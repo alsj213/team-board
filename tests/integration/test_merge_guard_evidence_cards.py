@@ -85,6 +85,18 @@ def run_guard(
     path = board_db(tmp_path, events=events)
     monkeypatch.setattr(mg, "_run", FakeRunner(head_ref=BRANCH))
     monkeypatch.setattr(reviewhead, "fetch_bodies", lambda pr: review_bodies())
+    # #73 起双问闸门按内容指纹判：本文件只测证据闸门 + E5 建卡接线，指纹层用固定值打桩
+    # （与 tests/unit/test_merge_guard_evidence_gate.py 的 run_main 同一口径）——
+    # 否则 PASS 用例会真的去 git merge-base 抓 refs，在临时库上必然 rc128。
+    fixed = reviewhead.Fingerprint(
+        kind="patch",
+        value="c" * 40,
+        merge_base="d" * 40,
+        paths=(),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
+    monkeypatch.setattr(reviewhead, "fingerprint", lambda *a, **k: fixed)
+    monkeypatch.setattr(reviewhead, "fingerprint_of_commit", lambda *a, **k: fixed)
     monkeypatch.setattr(evidence_cards, "_default_runner", fake_hermes)
     argv: list[str] = cli_argv(tmp_path, db=path, verify_only=verify_only)
     argv.extend(extra)
@@ -240,5 +252,6 @@ def test_pass_creates_no_card(
 
     rc, _out, _err, hermes = run_guard(tmp_path, monkeypatch, capsys, events=four_slots())
 
+    print("stderr：", _err.splitlines())
     assert rc == 0
     assert hermes.calls == []
