@@ -25,8 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from team_board import evidence_cards, reviewhead
 from team_board import merge_guard as mg
-from team_board import reviewhead
 
 #: 预检读到的 head（= 合并时 ``--match-head-commit`` 用的那条 sha）
 HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
@@ -290,6 +290,16 @@ def cli_argv(
     ]
 
 
+class _NoCards:
+    """建卡适配层的替身：不落子进程、不写任何文件（本文件只测闸门判定本身）。"""
+
+    def __init__(self, **_kwargs: object) -> None:
+        self.calls: list[object] = []
+
+    def ensure(self, *_args: object, **_kwargs: object) -> tuple[()]:
+        return ()
+
+
 def run_main(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,6 +338,9 @@ def run_main(
     )
     monkeypatch.setattr(reviewhead, "fingerprint", lambda *a, **k: fixed)
     monkeypatch.setattr(reviewhead, "fingerprint_of_commit", lambda *a, **k: fixed)
+    # E5（t_d929e012）：证据闸门拒绝后会按缺失槽位建卡。本文件只测闸门本身，
+    # 把建卡适配层换成「不发子进程」的替身 —— 否则测试会真的去建卡（且 stderr 不只一行）。
+    monkeypatch.setattr(evidence_cards, "CardCreator", _NoCards)
     rc = mg.main(cli_argv(tmp_path, db=path, branch=branch, verify_only=verify_only))
     captured = capsys.readouterr()
     return rc, captured.out, captured.err

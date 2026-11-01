@@ -251,12 +251,12 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from team_board import db, evidence, prclaim, reviewhead
+from team_board import db, evidence, evidence_cards, prclaim, reviewhead
 from team_board.merges import (
     MERGE_BY_PROFILE,
     MERGE_BY_RE,
@@ -1633,6 +1633,44 @@ def _current_patch(opts: Options, info: Preflight) -> str:
     return fp.value
 
 
+def _auto_create_cards(
+    opts: Options,
+    impl_card: str,
+    head: str,
+    judgment: evidence.Judgment,
+    events: Sequence[evidence.Event],
+) -> None:
+    """证据闸门拒绝后的善后：按缺失槽位自动建对应角色卡（**不阻断**拒绝本身）。
+
+    拒绝已经成立 —— 调用方紧接着照原样抛 :class:`MergeGuardError`（文案一个字不改）。
+    这里只把人从「block 等人搬」里解放出来：槽位 → 角色由
+    :data:`evidence_cards.SLOT_OWNER` 写死，``--no-create-card`` 只打印计划行不建卡。
+
+    子进程 rc 非 0 / 被作用域守卫拦下都只回显一行 stderr（守卫拦下时计划落
+    ``evidence/<卡号>-<head12>.cards.txt`` 并提示转 paimeng），**不重试、不换 env 绕过**
+    —— 善后失败不影响退出码，否则一次建卡失败会把 rc2 的语义改掉。
+
+    整个善后（含计划计算、临时文件、落盘）外面再兜一层 ``except Exception``：任何本地
+    异常冒出去都会被 CLI 统一翻译成「内部错误：<异常>」，把真正的拒绝原因盖掉
+    （qa 2026-11-01 P3 的复现：``TMPDIR`` 不可写 → ``PermissionError`` 外逃）。
+    """
+
+    try:
+        specs = evidence_cards.plan(
+            judgment, impl_card, opts.pr, head, events=tuple(events)
+        )
+        if not specs:
+            return
+        if opts.no_create_card:
+            for line in evidence_cards.render_plan(specs):
+                _write_stderr_text(f"{line}\n")
+            return
+        evidence_cards.CardCreator().ensure(specs, impl_card=impl_card, head=head)
+    except Exception as exc:  # 善后失败只许回一行，不许改写「为什么拒绝」
+        _write_stderr_text(f"自动建卡失败：{type(exc).__name__}: {exc}\n")
+
+
+
 def evidence_gate(opts: Options, info: Preflight) -> str:
     """**合并前证据状态机闸门**：四槽齐、且全绑预检读到的 ``headRefOid``，否则 rc2。
 
@@ -1659,6 +1697,10 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
 
     这一步只读库（``mode=ro``），不改状态、不写事件。``--verify-only`` 路径**不跑**它：
     那条路径不合并，也就没有「合并前状态」可宣称。
+
+    拒绝时先做善后、再抛本条异常：:func:`_auto_create_cards` 按缺失槽位建对应角色卡
+    （``--no-create-card`` 只打印计划行），异常文案与 rc 一个字不变 —— 善后失败不许改写
+    「为什么拒绝」。
     """
 
     impl_card = evidence.card_from_branch(opts.branch)
@@ -1707,6 +1749,7 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
             f"无法确认槽位的最新证据，拒绝合并（证据必须绑当前内容，R 状态机化）"
         )
     if not judgment.ok:
+        _auto_create_cards(opts, impl_card, head, judgment, events)
         raise MergeGuardError(
             f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：{judgment.verdict}；"
             f"{judgment.detail}；拒绝合并（证据必须绑当前内容，R 状态机化）"
@@ -1938,6 +1981,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="不合并，只验证远端分支是否已删（巡检 / 取红样例用）",
     )
     parser.add_argument(
+        "--no-create-card",
+        action="store_true",
+        help=(
+            "干跑：证据闸门拒绝时不建卡，只把「按缺失槽位该建哪些卡」的计划行打到 stderr"
+            "（默认会建；--verify-only 路径不看这个开关）"
+        ),
+    )
+    parser.add_argument(
         "--card",
         default=None,
         metavar="CARD",
@@ -1994,6 +2045,9 @@ class Options:
     verify_only: bool
     #: 认账四参数（仅合并模式有值；``--verify-only`` 恒为 ``None``）
     accounting: Accounting | None = None
+    #: 证据闸门拒绝后是否**不**建卡、只打印计划行（``--no-create-card``；``--verify-only``
+    #: 路径不跑证据闸门，故那里恒为 ``False``）
+    no_create_card: bool = False
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -2045,6 +2099,7 @@ def validate(args: argparse.Namespace) -> Options:
         command_timeout=command_timeout,
         verify_only=bool(args.verify_only),
         accounting=accounting,
+        no_create_card=bool(args.no_create_card),
     )
 
 
