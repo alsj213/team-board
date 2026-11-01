@@ -560,9 +560,9 @@ def build_message(*, card: str, by: str, pr: int, subject: str | None = None) ->
     if MERGE_CARD_RE.fullmatch(card) is None:
         raise MergeAuditError(f"卡号非法：{card!r}（应形如 t_1234abcd）")
     if not isinstance(by, str):
-        raise MergeAuditError(f"执行者标识非法：{by!r}（应为 str，形如 pm/run137）")
+        raise MergeAuditError(f"执行者标识非法：{by!r}（应为 str，形如 repo/run137）")
     if MERGE_BY_RE.fullmatch(by) is None:
-        raise MergeAuditError(f"执行者标识非法：{by!r}（应形如 pm/run137）")
+        raise MergeAuditError(f"执行者标识非法：{by!r}（应形如 repo/run137）")
     # 判据②（R15）：语法合法不等于有资格 —— 合并权只归 repo bot。
     if actor_of(by) != MERGE_BY_PROFILE:
         raise MergeAuditError(

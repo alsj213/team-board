@@ -836,6 +836,26 @@ def test_rc2_parameters(
     assert "Traceback" not in err
 
 
+@pytest.mark.parametrize("bad_by", ["Repo/run1", "repo/"])
+def test_by_shape_error_teaches_repo_not_pm(
+    bad_by: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R15-B：``--by`` 语法非法的报错**只教 repo 写法**（``应形如 repo/run137``）。
+
+    报错里教 ``pm/run137`` 时，照它写的值现在必被第二道身份判定拒 —— 一条文案能把人
+    带进死循环，所以这条按字符串锁死。
+    """
+
+    rc, out, err = run(["--card", CARD, "--by", bad_by, "--pr", PR], capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "执行者标识非法" in err
+    assert "repo/run137" in err, err
+    assert "pm/run137" not in err, err
+    assert err.count("\n") == 1, repr(err)
+
+
 @pytest.mark.parametrize(
     ("kind", "needle"),
     [

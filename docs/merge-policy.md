@@ -15,7 +15,7 @@
 `src/team_board/merge_guard.py`（并行组第 ⑤ 条 `t_40fa5375` 的实现文件），本条只钉它 `--method` 这一维：
 
 ```
-python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch --card <卡号> --by pm/run<NNN> --subject "Merge PR #<n>（<卡号>）" --body-file <body-file>
+python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch --card <卡号> --by repo/run<NNN> --subject "Merge PR #<n>（<卡号>）" --body-file <body-file>
 ```
 
 四种认账参数（`--card` / `--by` / `--subject` / `--body-file`）是**合并模式必填**：`gh pr merge`
@@ -26,6 +26,10 @@ python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --
 不同文件，gh 可能读不到、甚至静默合进另一份 body —— rc2 拦掉）。
 
 `--method` 只允许取 `merge`；`squash` / `rebase` 一律拒绝（该 CLI 落地时按本条写死默认值与合法值域）。
+
+**谁按合并**：合并权归 repo bot（判据见 `docs/merge-accountability.md` 判据②）；`--by` 的 profile
+部分只能是 `repo`，别的 profile 在 `merge_guard` 预检阶段直接 rc2（不发任何 `gh` 写操作）。
+
 **`merge_guard` 已强制**（合并入口只有 ② 与模板 ⑦ 那同一条命令，脚本是 `src/team_board/merge_guard.py`，PR #20 已落地）：
 下面的平台命令原文只作历史对照，**不许再用它合并**：
 
@@ -104,7 +108,7 @@ $ gh pr view <n> -R alsj213/team-board --json headRefName
    B 档另附 R9 夜间五条：CI rc=0 且非 no checks reported / 双问无 P1P2 / nfiles≤10 / 不碰凭据迁移删库且删除≤100 行 / R3 证据齐；夜间自合标 B·night
    C 档（或夜间撞「绝不做」四条）：不合并，标 [night-queue]，写「第 N 条不满足 + 实测输出」
 ⑦ 合并（R13 ②，唯一命令）：
-   merge_guard 已强制（见 PR #20）：python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch --card <卡号> --by pm/run<NNN> --subject "Merge PR #<n>（<卡号>）" --body-file <body-file>; echo rc=$?
+   merge_guard 已强制（见 PR #20）：python -m team_board.merge_guard --pr <n> --branch wt/<卡号> --method merge --delete-branch --card <卡号> --by repo/run<NNN> --subject "Merge PR #<n>（<卡号>）" --body-file <body-file>; echo rc=$?
    历史原文（已完成，勿用）：gh pr merge <n> -R alsj213/team-board --merge --delete-branch; echo rc=$?
 ⑧ 用的是哪一种（R13 ⑤，判本 PR 的合并提交）：
 $ sha=$(gh pr view <n> -R alsj213/team-board --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid'); echo "sha=$sha"

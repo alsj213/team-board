@@ -413,7 +413,7 @@ $ diff <(旧) <(新)     # stdout / stderr 均无差异
 接受，也不做大小写兼容别名）：
 
 ```
-merged-by: <profile>/run<NNN>       # 例 pm/run137
+merged-by: <profile>/run<NNN>       # 例 repo/run137（合并权归 repo bot：profile 必须是 repo）
 merge-card: t_[0-9a-f]{8}          # 例 t_ad5e7ff6
 merge-pr: #<正整数>                 # 例 #1
 ```
@@ -460,8 +460,14 @@ team-board merge-audit [--repo PATH] [--baseline REV] [--baseline-file PATH]
 → rc1，输出里多一行证据（格式固定）：
 
 ```
-判据①（merged-by == 卡 assignee）：卡 t_ad5e7ff6 assignee=pm，merged-by=pm/run137 → PASS
+判据①（merged-by == 卡 assignee）：卡 t_ad5e7ff6 assignee=repo，merged-by=repo/run137 → PASS
 ```
+
+R15-B 起合并类卡的 `assignee` 锁死为 `repo`，`merged-by` 的 profile 也必须是 `repo`
+（合并权归 repo bot，见 `docs/merge-accountability.md` 判据②），所以**能同时过判据① 与
+R15 身份判据的合法形态就是 `assignee=repo` + `merged-by=repo/runNNN`**；写成
+`assignee=pm` / `merged-by=pm/run137` 的例子现在过不了 —— 判据① 会 `FAIL`，且即使
+assignee 真是 pm，R15 身份判据也判红。
 
 不符时该行写 `→ FAIL`；没给 `--card` 时整段不打印。历史段（基线之前）的合并
 没有 `merged-by` 值，**不参与**判据①，照样只回显 `by=无法判定`。库不存在 / 不是
@@ -538,10 +544,12 @@ python3 -m team_board.merge_guard \
   直接 rc2，且**一个 gh 写操作都不发**，
   stderr 固定一行
   `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
-- **认账四参数（合并模式必填）**：`--card`（形如 `t_1234abcd`）、`--by`（形如 `pm/run200`）、
+- **认账四参数（合并模式必填）**：`--card`（形如 `t_1234abcd`）、`--by`（必须是 `repo/runNNN`；合并权归 repo bot，别的 profile 在这里就 rc2）、
   `--subject`（单行非空白合并提交标题）、`--body-file`（含 `merged-by` / `merge-card` /
   `merge-pr` 三行 trailer 的文件，由 `team-board merge-record --body-out` 生成）—— 四者
-  **原样转发**给 `gh pr merge`。缺任一项 / 形态非法 / `--subject` 含换行 / body 文件不存在、
+  **原样转发**给 `gh pr merge`。缺任一项 / 形态非法 / `--by` 的 profile 不是 `repo`
+  （错误文案：`--by 必须表明 repo 身份：合并权归 repo bot（R15），正确写法 repo/run<N>`）/
+  `--subject` 含换行 / body 文件不存在、
   不是普通文件、非严格 UTF-8、为空 / body 内容经 `merges.check_message` 判出问题
   （缺字段、重复、格式非法、与 `--card` / `--by` / `--pr` 不一致）→ **rc2、stdout 空、
   stderr 恰一行、零 `gh` 零 `git` 调用**（全部在 `ensure_branch_present()` 之前判完）。
