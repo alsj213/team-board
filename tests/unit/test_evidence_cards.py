@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -371,3 +372,83 @@ def test_guard_block_with_two_cards_keeps_both_in_plan_file(
     for spec in specs:
         assert spec.idempotency_key in text, spec.title
         assert spec.title in text, spec.title
+
+
+# ------------------------------------- qa P3：本地写失败只许降级成一行，不许冒异常出去
+#
+# 判据（qa 2026-11-01 request-changes）：建卡善后遇上「body 临时文件写不了」/「计划落不了
+# 盘」时，merge_guard 只剩 `内部错误：PermissionError`，把「缺证据：qa_pass」这个真因吃掉。
+# 修法是把这两处 OSError 归进 failed / None，异常一律不出口。下面的用例钉住这两条。
+
+
+def test_body_tmpfile_in_missing_dir_is_a_failed_line(tmp_path: Path) -> None:
+    """body 临时文件目录不存在（磁盘满 / TMPDIR 被删的同类）→ 一行 ``failed``，不抛。"""
+
+    specs = evidence_cards.plan(judged(slot_events(with_qa=False)), CARD, PR, HEAD)
+    runner = FakeRunner()
+    lines: list[str] = []
+    creator = evidence_cards.CardCreator(
+        runner=runner,
+        echo=lines.append,
+        scratch_dir=tmp_path / "gone",  # 不存在 → NamedTemporaryFile 抛 FileNotFoundError
+    )
+
+    outcomes = creator.ensure(specs, impl_card=CARD, head=HEAD)  # 不许抛出去
+
+    print("回显：", lines)
+    assert [o.status for o in outcomes] == ["failed"]
+    assert outcomes[0].rc == 127
+    assert "body 临时文件写不了" in outcomes[0].line
+    assert "FileNotFoundError" in outcomes[0].line
+    assert runner.calls == [], "body 都写不下去，不该起子进程"
+    assert lines == [outcomes[0].line]
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root 无视目录权限位，chmod 500 挡不住写入",
+)
+def test_body_tmpfile_permission_denied_is_a_failed_line(tmp_path: Path) -> None:
+    """TMPDIR 不可写（qa probe_f 的库内等价物）→ 一行点名 ``PermissionError``，不抛。"""
+
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        specs = evidence_cards.plan(judged(slot_events(with_qa=False)), CARD, PR, HEAD)
+        lines: list[str] = []
+        creator = evidence_cards.CardCreator(
+            runner=FakeRunner(), echo=lines.append, scratch_dir=ro
+        )
+        outcomes = creator.ensure(specs, impl_card=CARD, head=HEAD)
+    finally:
+        ro.chmod(0o700)
+
+    assert [o.status for o in outcomes] == ["failed"]
+    assert "PermissionError" in outcomes[0].line
+    assert len(lines) == 1
+
+
+def test_plan_file_unwritable_keeps_guard_line_and_returns_none(tmp_path: Path) -> None:
+    """``evidence/`` 落不了盘（qa probe_d D2）→ ``write_plan_file`` 返 ``None``、只回一行。"""
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("我不是目录", encoding="utf-8")
+    specs = evidence_cards.plan(judged(slot_events(with_qa=False)), CARD, PR, HEAD)
+    lines: list[str] = []
+    creator = evidence_cards.CardCreator(
+        runner=FakeRunner([FakeProc(rc=1, stderr="kanban: scoped to task t_deadbeef")]),
+        echo=lines.append,
+        scratch_dir=tmp_path,
+        plan_dir=blocker / "evidence",  # 父路径是普通文件 → mkdir 抛 NotADirectoryError
+    )
+
+    outcomes = creator.ensure(specs, impl_card=CARD, head=HEAD)
+
+    print("回显：", lines)
+    assert [o.status for o in outcomes] == ["guard-blocked"]
+    assert outcomes[0].line == "建卡被作用域守卫拦下，计划落盘失败，请转 paimeng"
+    assert lines[-1] == outcomes[0].line
+    assert all(line.startswith("计划落盘失败（") for line in lines[:-1])
+    assert "NotADirectoryError" in lines[0]
+    assert creator.write_plan_file(specs, impl_card=CARD, head=HEAD) is None

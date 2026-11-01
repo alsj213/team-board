@@ -1649,16 +1649,25 @@ def _auto_create_cards(
     子进程 rc 非 0 / 被作用域守卫拦下都只回显一行 stderr（守卫拦下时计划落
     ``evidence/<卡号>-<head12>.cards.txt`` 并提示转 paimeng），**不重试、不换 env 绕过**
     —— 善后失败不影响退出码，否则一次建卡失败会把 rc2 的语义改掉。
+
+    整个善后（含计划计算、临时文件、落盘）外面再兜一层 ``except Exception``：任何本地
+    异常冒出去都会被 CLI 统一翻译成「内部错误：<异常>」，把真正的拒绝原因盖掉
+    （qa 2026-11-01 P3 的复现：``TMPDIR`` 不可写 → ``PermissionError`` 外逃）。
     """
 
-    specs = evidence_cards.plan(judgment, impl_card, opts.pr, head, events=tuple(events))
-    if not specs:
-        return
-    if opts.no_create_card:
-        for line in evidence_cards.render_plan(specs):
-            _write_stderr_text(f"{line}\n")
-        return
-    evidence_cards.CardCreator().ensure(specs, impl_card=impl_card, head=head)
+    try:
+        specs = evidence_cards.plan(
+            judgment, impl_card, opts.pr, head, events=tuple(events)
+        )
+        if not specs:
+            return
+        if opts.no_create_card:
+            for line in evidence_cards.render_plan(specs):
+                _write_stderr_text(f"{line}\n")
+            return
+        evidence_cards.CardCreator().ensure(specs, impl_card=impl_card, head=head)
+    except Exception as exc:  # 善后失败只许回一行，不许改写「为什么拒绝」
+        _write_stderr_text(f"自动建卡失败：{type(exc).__name__}: {exc}\n")
 
 
 

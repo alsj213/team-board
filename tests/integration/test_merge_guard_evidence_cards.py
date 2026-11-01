@@ -255,3 +255,83 @@ def test_pass_creates_no_card(
     print("stderr：", _err.splitlines())
     assert rc == 0
     assert hermes.calls == []
+
+
+# ------------------------------------------- qa P3：善后本地写失败不许改写拒绝原因
+
+
+def test_body_write_permission_error_keeps_reject_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """body 临时文件写不了（qa probe_f：TMPDIR 不可写）→ rc2 且「缺证据：qa_pass」还在。
+
+    修复前这里只剩 ``错误: 内部错误：PermissionError``，真因被善后吃掉。判据三条：rc 仍 2、
+    stderr 里有证据闸门那句、没有「内部错误」；另加一条「善后只回一行」。
+    """
+
+    def denied(_self: object, _spec: object) -> Path:
+        raise PermissionError(13, "Permission denied", "/tmp/evidence-card-xxx.md")
+
+    monkeypatch.setattr(evidence_cards.CardCreator, "_write_body", denied)
+    rc, out, err, hermes = run_guard(
+        tmp_path, monkeypatch, capsys, events=with_impl_done(four_slots(with_qa=False))
+    )
+
+    print("stderr：", err.splitlines())
+    assert rc == 2
+    assert out == ""
+    assert f"错误: 证据闸门拦下 PR #{PR}（实现卡 {IMPL_CARD}）：缺证据；缺证据：qa_pass" in err
+    assert "内部错误" not in err
+    assert "自动建卡失败 rc=127：body 临时文件写不了（PermissionError: " in err
+    assert hermes.calls == []
+
+
+def test_plan_file_unwritable_keeps_reject_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """守卫拦下 + ``evidence/`` 落不了盘（qa probe_d D2）→ rc2 且拒绝原因不变。"""
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "evidence").write_text("我不是目录", encoding="utf-8")
+    hermes = HermesFake(rc=1, stderr="kanban: delegate_task child contexts cannot mutate")
+    rc, out, err, _hermes = run_guard(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=with_impl_done(four_slots(with_qa=False)),
+        hermes=hermes,
+    )
+
+    print("stderr：", err.splitlines())
+    assert rc == 2
+    assert out == ""
+    assert "计划落盘失败（FileExistsError" in err
+    assert "建卡被作用域守卫拦下，计划落盘失败，请转 paimeng" in err
+    assert "缺证据：qa_pass" in err
+    assert "内部错误" not in err
+
+
+def test_auto_create_cards_swallows_unexpected_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """善后里冒出任何别的异常（不是 OSError）也只回一行，绝不改写拒绝原因/rc。"""
+
+    class Boom:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def ensure(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(evidence_cards, "CardCreator", Boom)
+    rc, out, err, hermes = run_guard(
+        tmp_path, monkeypatch, capsys, events=with_impl_done(four_slots(with_qa=False))
+    )
+
+    print("stderr：", err.splitlines())
+    assert rc == 2
+    assert out == ""
+    assert "自动建卡失败：RuntimeError: kaboom" in err
+    assert "缺证据：qa_pass" in err
+    assert "内部错误" not in err
+    assert hermes.calls == []

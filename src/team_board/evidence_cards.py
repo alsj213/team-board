@@ -144,6 +144,26 @@ def _short(head: str) -> str:
     return head[:12]
 
 
+def _io_reason(exc: OSError) -> str:
+    """本地 IO 失败的简短原因（类型 + 首行）。
+
+    善后失败只许回一行 —— 整段 traceback 既盖不住，也会把「为什么拒绝合并」淹掉
+    （qa 2026-11-01 P3：建卡善后遇 PermissionError 外逃，拒绝文案被改写成内部错误）。
+    """
+
+    detail = str(exc).strip().splitlines()
+    head = detail[0].strip() if detail else ""
+    return f"{type(exc).__name__}: {head}" if head else type(exc).__name__
+
+
+def _guard_line(target: Path | None) -> str:
+    """守卫拦下的那一行（契约 C 的固定文案；计划落不了盘时点名落盘失败）。"""
+
+    if target is None:
+        return "建卡被作用域守卫拦下，计划落盘失败，请转 paimeng"
+    return f"建卡被作用域守卫拦下，计划已落 {target}，请转 paimeng"
+
+
 #: 「要做什么」一节在模板里的占位符（**不用** ``str.format``：payload 样例里就有 ``{}``，
 #: 用 format 会把 JSON 花括号当成字段名炸掉）
 DO_SLOT = "\x00action\x00"
@@ -475,7 +495,7 @@ class CardCreator:
                     spec,
                     "guard-blocked",
                     outcome.rc,
-                    f"建卡被作用域守卫拦下，计划已落 {target}，请转 paimeng",
+                    _guard_line(target),
                 )
             outcomes.append(outcome)
             if outcome.line:
@@ -499,7 +519,18 @@ class CardCreator:
         return Path(handle.name)
 
     def _create(self, spec: CardSpec, *, impl_card: str, head: str) -> CreateOutcome:
-        path = self._write_body(spec)
+        try:
+            path = self._write_body(spec)
+        except OSError as exc:
+            # body 都写不下去（磁盘满 / TMPDIR 不可写）：本地善后失败，绝不冒异常出去。
+            # 一冒出去调用方就只剩「内部错误：PermissionError」，把「为什么拒绝合并」吃掉
+            # （qa 2026-11-01 P3）。同族还有 write_plan_file 的 OSError，一并归 failed。
+            return CreateOutcome(
+                spec,
+                "failed",
+                127,
+                f"自动建卡失败 rc=127：body 临时文件写不了（{_io_reason(exc)}）",
+            )
         try:
             try:
                 proc = self._runner(create_argv(spec, path, board=self._board))
@@ -529,7 +560,7 @@ class CardCreator:
                 spec,
                 "guard-blocked",
                 rc,
-                f"建卡被作用域守卫拦下，计划已落 {target}，请转 paimeng",
+                _guard_line(target),
             )
         lines = [line for line in stderr.splitlines() if line.strip()]
         last = lines[-1].strip() if lines else "(无 stderr)"
@@ -542,11 +573,22 @@ class CardCreator:
         impl_card: str,
         head: str,
         reason: str = "自动建卡",
-    ) -> Path:
-        """计划落 ``evidence/<实现卡>-<head12>.cards.txt``（守卫兜底 / 人工接手用）。"""
+    ) -> Path | None:
+        """计划落 ``evidence/<实现卡>-<head12>.cards.txt``（守卫兜底 / 人工接手用）。
+
+        落不了盘（``evidence/`` 不可写 / 磁盘满）返回 ``None``，**不抛**：兜底文件的失败
+        也只能降级成一行提示，否则同样会把「为什么拒绝合并」改写成内部错误（qa P3 同族，
+        probe_d D2）。
+        """
 
         directory = Path(PLAN_DIR) if self._plan_dir is None else self._plan_dir
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / f"{impl_card}-{_short(head)}.cards.txt"
-        target.write_text("\n".join(plan_lines(specs, reason=reason)) + "\n", encoding="utf-8")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / f"{impl_card}-{_short(head)}.cards.txt"
+            target.write_text(
+                "\n".join(plan_lines(specs, reason=reason)) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self._echo(f"计划落盘失败（{_io_reason(exc)}）：{directory}")
+            return None
         return target
