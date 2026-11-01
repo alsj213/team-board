@@ -104,7 +104,7 @@ rc=1
 
 ## 四、判定：`evidence audit`
 
-取数只有一份 SQL（`evidence.EVENT_SQL`，`evidence.py:595`；`evidence audit` 与
+取数只有一份 SQL（`evidence.EVENT_SQL`，`evidence.py:594`；`evidence audit` 与
 `merge_guard` 的证据闸门都调 `collect()`）：
 
 ```sql
@@ -208,7 +208,7 @@ rc=2（stdout 0 字节）
 
 ## 五、`merge_guard` 的闸门顺序
 
-顺序写死在 `merge_guard.main()`（`merge_guard.py:2540-2550`），**全部在 `gh pr merge`
+顺序写死在 `merge_guard._run_merge()`（`merge_guard.py:2540-2550`），**全部在 `gh pr merge`
 之前**：
 
 ```
