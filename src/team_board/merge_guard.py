@@ -1542,12 +1542,95 @@ def evidence_slots_summary(judgment: evidence.Judgment) -> str:
     return f"tier={tier}, qa_pass=*** review={'+'.join(reviews) or '-'}"
 
 
+def _current_fingerprint(opts: Options, info: Preflight) -> reviewhead.Fingerprint:
+    """算当前 PR 的内容指纹，供证据四槽按内容复用（E5）。
+
+    ``ensure_pr_refs`` 把远端 base/head 抓进 ``refs/merge-guard/<pr>/{base,head}``，
+    ``reviewhead.fingerprint`` 的 ``diff-sha256-U0-v1`` 才算得出**这一轮远端**的内容
+    指纹（不看本地某次 fetch 留下的旧对象）；纯 rebase 不换值。
+
+    拒绝文案与 E4 的 ``双问不可复用`` 同口径（同一件事换个闸门就该是同一句话）：
+
+    - 二进制 → ``证据不可复用：分支含二进制文件 …（内容指纹对二进制内容盲）``；
+    - 空 diff → ``证据不可复用：分支相对 <base> 无差异（空 diff 没有可比内容）``；
+    - 算不出来（:class:`reviewhead.PatchIdError` / ``OSError``）→ ``无法计算 … 的内容指纹``
+      —— 环境 / 形态问题不许折成「内容没变」。
+    """
+
+    ensure_pr_refs(opts, info.base_ref)
+    try:
+        fp = reviewhead.fingerprint(
+            opts.repo, rebase_base_ref(opts.pr), rebase_head_ref(opts.pr)
+        )
+    except reviewhead.PatchIdError as exc:
+        raise MergeGuardError(
+            f"无法计算 PR #{opts.pr} 的内容指纹，不能判定证据能否复用：{exc}；拒绝合并"
+        ) from exc
+    except OSError as exc:
+        raise MergeGuardError(
+            f"计算 PR #{opts.pr} 的内容指纹失败（{exc}）；拒绝合并"
+        ) from exc
+    if fp.kind == "binary":
+        raise MergeGuardError(
+            "证据不可复用：分支含二进制文件 "
+            f"{','.join(fp.paths)}（内容指纹对二进制内容盲，换文件也换不了指纹）；拒绝合并"
+        )
+    if fp.kind == "empty":
+        raise MergeGuardError(
+            f"证据不可复用：分支相对 {info.base_ref} 无差异（空 diff 没有可比内容）；拒绝合并"
+        )
+    if fp.value is None:  # pragma: no cover - Fingerprint 契约：kind=patch 必有值
+        raise MergeGuardError(
+            f"证据不可复用：PR #{opts.pr} 的内容指纹为空（kind={fp.kind}），"
+            "head 变了必须重跑证据；拒绝合并"
+        )
+    return fp
+
+
+def _slot_matcher(opts: Options, info: Preflight) -> Callable[[object], bool]:
+    """四槽的内容比对器：事件那条 ``head_sha`` 经 :func:`evidence.slot_matches` 与当前内容比。
+
+    两份懒算都压在这里，是为了保住「正常合并不多跑一次 fetch / diff」：预检读到的 head
+    与事件 head 相同时 ``evidence.judge`` 直接判 True（``_content_matches`` 的短路），
+    本函数根本不会被调到；只有真出现「sha 变了」才去抓远端、算指纹。
+
+    同一条 sha 的结论按 sha 缓存（四槽可能都指向同一个旧 head），每次判都重算一遍 diff
+    没有意义。
+    """
+
+    current: reviewhead.Fingerprint | None = None
+    decided: dict[str, bool] = {}
+
+    def matches(head_sha: object) -> bool:
+        nonlocal current
+        key = head_sha if isinstance(head_sha, str) else repr(head_sha)
+        if key not in decided:
+            if current is None:
+                current = _current_fingerprint(opts, info)
+            decided[key] = evidence.slot_matches(
+                opts.repo,
+                rebase_base_ref(opts.pr),
+                head_sha,
+                current,
+                remote=opts.remote,
+            )
+        return decided[key]
+
+    return matches
+
+
 def evidence_gate(opts: Options, info: Preflight) -> str:
-    """**合并前证据状态机闸门**：四槽齐、且全绑预检读到的 ``headRefOid``，否则 rc2。
+    """**合并前证据状态机闸门**：四槽齐、且全绑当前**内容**，否则 rc2。
 
     判据**全部**来自 :mod:`team_board.evidence`（``collect`` 取数、``judge`` 判定），本模块
     不复制判定逻辑、也不另写一份 SQL：``evidence audit`` 与服务端别处用的是同一份实现，
     两份口径迟早会分叉，而分叉的那一侧会让「稽核说齐、合并闸门说不齐」同时成立。
+
+    **绑内容而不是绑 sha**（E5）：四槽原先逐字比 ``headRefOid``，纯 rebase 只换父提交就
+    把四槽全判失效 —— 判的不再是「这段改动被验收过没有」，而是「这条 sha 被验收过没有」。
+    现在事件 head 与当前 head 不同时，交 :func:`evidence.slot_matches` 把那条 sha 换算成
+    内容指纹再比（``diff-sha256-U0-v1``）：内容一个字节没改的复用成立，真改内容仍然拒绝；
+    **取不到那条提交也是拒绝**（不可验证 = 缺证据，不许当齐）。
 
     实现卡号从 ``--branch`` 取（:func:`team_board.evidence.card_from_branch`，整串
     ``wt/t_<8 位小写十六进制>``）：不是这个形态就**没有实现卡可查**，rc2 拒绝 —— 不许
@@ -1562,12 +1645,14 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
       id（与 ``evidence audit`` 的首行同口径）：
       坏 payload 的事件已被 ``collect`` 丢掉，某槽 id 最大的那条恰好坏掉时，
       「最新证据」根本不是最新的，不许拿剩下的旧事件判 PASS（P2-2 fail-open）；
+    - 当前内容指纹不可复用（二进制 / 空 diff）→ 「证据不可复用」，与 E4 的
+      ``双问不可复用`` 同口径（同一件事换个闸门就是同一句话）；
     - 判定不过 → ``证据闸门拦下 PR #<n>（实现卡 <卡>）：<verdict>；<detail>``，verdict 是
       :mod:`team_board.evidence` 的七个字面量之一（``缺证据`` / ``证据对新 head 无效`` /
       ``双问阻塞`` / ``缺老板点头`` / ``证据串卡`` / ``角色不符``），本模块不造新词。
 
-    这一步只读库（``mode=ro``），不改状态、不写事件。``--verify-only`` 路径**不跑**它：
-    那条路径不合并，也就没有「合并前状态」可宣称。
+    这一步只读库（``mode=ro``）与私有 ref，不改状态、不写事件。``--verify-only`` 路径
+    **不跑**它：那条路径不合并，也就没有「合并前状态」可宣称。
     """
 
     impl_card = evidence.card_from_branch(opts.branch)
@@ -1590,7 +1675,6 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         events = evidence.collect(conn, impl_card)
         parse_failures = events.parse_failures
         failure_ids = events.parse_failure_ids
-        judgment = evidence.judge(events, head, opts.pr)
     except evidence.EvidenceReadError as exc:
         raise MergeGuardError(
             f"读取实现卡 {impl_card} 的 evidence 事件失败（--db {opts.db_path}）：{exc}；"
@@ -1598,6 +1682,14 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         ) from exc
     finally:
         conn.close()
+    # 判定一律交 evidence.judge（第一轮纯比较，不读 git）。只有「绑的 head 不是预检读到
+    # 的那条」才进第二轮按内容指纹判 —— 正常合并（head 一致）一次 fetch / diff 都不多发；
+    # 内容等价的纯 rebase 在第二轮复活四槽（E5）。
+    judgment = evidence.judge(events, head, opts.pr)
+    reused_content = False
+    if not judgment.ok and judgment.verdict == evidence.VERDICT_HEAD_MISMATCH:
+        judgment = evidence.judge(events, head, opts.pr, matches=_slot_matcher(opts, info))
+        reused_content = judgment.ok
     if parse_failures:
         # 解析不了的事件已被 ``collect`` 丢掉；「丢掉」不等于「不存在」——某槽 id 最大的
         # 那条恰好是坏 payload 时，判出来的「最新证据」根本不是最新的（P2-2 fail-open）。
@@ -1627,7 +1719,12 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
             f"--db {shlex.quote(opts.db_path)}"
         ),
         rc=0,
-        key=evidence_slots_summary(judgment),
+        key=evidence_slots_summary(judgment)
+        + (
+            "；内容指纹复用（head 变了、内容没变；复跑 audit 按 head 判会报失效，属预期）"
+            if reused_content
+            else ""
+        ),
     )
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -260,6 +261,18 @@ def cli_argv(
     ]
 
 
+def content_fp(value: str) -> reviewhead.Fingerprint:
+    """一份内容指纹（``kind=patch``）：``value`` 就是「内容」的身份。"""
+
+    return reviewhead.Fingerprint(
+        kind="patch",
+        value=value,
+        merge_base="d" * 40,
+        paths=(),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
+
+
 def run_main(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -272,8 +285,16 @@ def run_main(
     verify_only: bool = False,
     with_event_tables: bool = True,
     bodies: list[str] | None = None,
+    current_fp: reviewhead.Fingerprint | None = None,
+    fp_of: Callable[..., reviewhead.Fingerprint | None] | None = None,
 ) -> tuple[int, str, str]:
-    """跑一次 ``merge_guard.main``：返回（rc, stdout, stderr）。"""
+    """跑一次 ``merge_guard.main``：返回（rc, stdout, stderr）。
+
+    ``current_fp`` 是**当前** PR 的内容指纹（缺省 = 预检 head 自己），``fp_of`` 给某个
+    ``head_sha`` 换算内容指纹（缺省 = 「sha 即内容」：``value`` 取该 sha 本身，于是换 sha
+    就等于换内容，与改动前「逐字比 head」的判据一致）。E5 的「内容等价」用例把 ``fp_of``
+    指回 ``current_fp`` 即可造出「sha 变了、内容没变」。
+    """
 
     path = db
     if path is None:
@@ -287,17 +308,19 @@ def run_main(
     monkeypatch.setattr(
         reviewhead, "fetch_bodies", lambda pr: review_bodies() if bodies is None else bodies
     )
-    # #73 起双问闸门按内容指纹判：本文件只测证据闸门，指纹层用固定值打桩，
-    # 旧 REVIEW-HEAD 标记经 fingerprint_of_commit 也解析成同一个值（LEGACY-OK）。
-    fixed = reviewhead.Fingerprint(
-        kind="patch",
-        value="c" * 40,
-        merge_base="d" * 40,
-        paths=(),
-        algo=reviewhead.FINGERPRINT_ALGO,
+    # #73 起双问闸门也按内容指纹判：本文件只测证据闸门，指纹层打桩。
+    current = content_fp(HEAD_OID) if current_fp is None else current_fp
+
+    def default_fp_of(*args: object, **kwargs: object) -> reviewhead.Fingerprint:
+        # 「sha 即内容」：不同 sha → 不同指纹（= 内容变了），同一 sha → 同一指纹。
+        # 签名同 ``reviewhead.fingerprint_of_commit(repo, base, sha, remote)``：sha 是第 3 个。
+        sha = args[2] if len(args) >= 3 else HEAD_OID
+        return content_fp(sha if isinstance(sha, str) else HEAD_OID)
+
+    monkeypatch.setattr(reviewhead, "fingerprint", lambda *a, **k: current)
+    monkeypatch.setattr(
+        reviewhead, "fingerprint_of_commit", default_fp_of if fp_of is None else fp_of
     )
-    monkeypatch.setattr(reviewhead, "fingerprint", lambda *a, **k: fixed)
-    monkeypatch.setattr(reviewhead, "fingerprint_of_commit", lambda *a, **k: fixed)
     rc = mg.main(cli_argv(tmp_path, db=path, branch=branch, verify_only=verify_only))
     captured = capsys.readouterr()
     return rc, captured.out, captured.err
@@ -380,11 +403,16 @@ def test_missing_qa_pass_rc2_zero_stdout_one_stderr_line(
 
 
 # ------------------------------------------- 验收 3：qa_pass 绑旧 head
+# E5（t_ba5546f4）起，「旧 head」本身不再等于失效：内容指纹相同就复用（见文件末尾
+# `-k slot_matches` 那组）。本条保留的是**旧 head 且内容也变了**那一半 —— 仍然 rc2。
 
 def test_qa_pass_bound_to_old_head_rc2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``qa_pass`` 绑旧 head → rc2、stdout 0 字节、stderr 含「证据对新 head 无效」。"""
+    """``qa_pass`` 绑旧 head、且旧 head 的内容与当前不同 → rc2、stdout 0、含「证据对新 head 无效」。
+
+    桩口径：「sha 即内容」（``run_main`` 的缺省 ``fp_of``），所以这里换 sha 就等于换内容。
+    """
 
     fake = FakeRunner()
     rc, out, err = run_main(
@@ -664,3 +692,225 @@ def four_events() -> list[mg.evidence.Event]:
             zip(four_slots(), ("pm", "qa", "pm", "qa"), strict=True)
         )
     ]
+
+
+# ================================================== E5：四槽改绑内容指纹（t_ba5546f4）
+#
+# 判据来自 t_ba5546f4 卡正文的验收标准（三条 `-k` 分组 + 全量不回归）：
+#   · `-k slot_matches`：内容等价 → 四槽放行（sha 变了不算失效）；
+#   · `-k stale`：内容变了 → 仍然拒绝（改绑内容不许变成「什么都放行」）；
+#   · `-k "binary or unverifiable"`：二进制 / 空 diff / 取不到对象 → 缺证据；
+#   · 全量 `pytest -q`：不回归（本文件的 21 条旧用例原样保留）。
+
+
+def test_slot_matches_true_when_content_equivalent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``slot_matches``：事件那条 sha 的内容指纹 == 当前内容指纹 → True（纯 rebase 复用）。"""
+
+    current = content_fp(OLD_OID)
+    monkeypatch.setattr(
+        reviewhead, "fingerprint_of_commit", lambda *a, **k: content_fp(OLD_OID)
+    )
+
+    assert mg.evidence.slot_matches("/repo", "refs/merge-guard/9/base", OLD_OID, current) is True
+
+
+def test_slot_matches_false_when_content_differs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``slot_matches``：内容指纹不同 → False（只比「是不是同一条 sha」不许漏成放行）。"""
+
+    monkeypatch.setattr(
+        reviewhead, "fingerprint_of_commit", lambda *a, **k: content_fp(OLD_OID)
+    )
+
+    assert (
+        mg.evidence.slot_matches(
+            "/repo", "refs/merge-guard/9/base", OLD_OID, content_fp(HEAD_OID)
+        )
+        is False
+    )
+
+
+def test_slot_matches_false_when_commit_unverifiable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取不到那条提交（``fingerprint_of_commit`` → ``None``）= 不可验证 = 缺证据，不许当齐。"""
+
+    monkeypatch.setattr(reviewhead, "fingerprint_of_commit", lambda *a, **k: None)
+
+    assert (
+        mg.evidence.slot_matches(
+            "/repo", "refs/merge-guard/9/base", OLD_OID, content_fp(OLD_OID)
+        )
+        is False
+    )
+
+
+def test_slot_matches_reraises_git_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PATH 里没有 git 是环境故障，不许被吞成「内容不同」（与 ``fingerprint_of_commit`` 同口径）。"""
+
+    def boom(*args: object, **kwargs: object) -> reviewhead.Fingerprint:
+        raise reviewhead.GitMissingError("PATH 里没有 git")
+
+    monkeypatch.setattr(reviewhead, "fingerprint_of_commit", boom)
+
+    with pytest.raises(reviewhead.GitMissingError):
+        mg.evidence.slot_matches("/repo", "refs/merge-guard/9/base", OLD_OID, content_fp(OLD_OID))
+
+
+def test_slot_matches_reuses_content_through_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """sha 变了、内容没变：证据闸门放行，摘要点名「内容指纹复用」，且同一条 sha 只算一次。
+
+    这是 E5 的正题：``qa_pass`` 绑的是 rebase 前的旧 head，内容一个字节没改 —— 旧口径判
+    「证据对新 head 无效」，新口径必须放行，否则同一个死锁换个形状重演。
+    """
+
+    calls: list[str] = []
+
+    def fp_of(
+        repo: str, base: str, sha: str, remote: str = "origin"
+    ) -> reviewhead.Fingerprint:
+        calls.append(sha)
+        return content_fp(HEAD_OID)  # 旧 head 与当前 head 内容等价
+
+    rc, out, err = run_main(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=four_slots(qa_head=OLD_OID),
+        fp_of=fp_of,
+    )
+
+    assert (rc, err) == (0, "")
+    line = next(line for line in out.splitlines() if line.startswith("证据状态机 | PASS |"))
+    assert "内容指纹复用" in line
+    assert calls.count(OLD_OID) == 1  # 四槽都指向 OLD_OID：按 sha 缓存，只算一次
+    assert set(calls) <= {OLD_OID, HEAD_OID}  # HEAD_OID 那次来自双问闸门解析旧标记
+
+
+def test_stale_content_still_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """内容真的变了（qa_pass 绑旧 head，且旧 head 的内容 != 当前内容）→ 仍然 rc2 拒绝。
+
+    「改绑内容指纹」不是「放宽」：同一组槽位的事件，只把内容换成另一份，闸门必须还拦得住。
+    """
+
+    fake = FakeRunner()
+    rc, out, err = run_main(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=four_slots(qa_head=OLD_OID),
+        runner=fake,
+        fp_of=lambda *a, **k: content_fp(OLD_OID),  # 旧 head 的内容 != 当前内容 HEAD_OID
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "证据对新 head 无效" in err
+    assert "qa_pass" in err
+    assert fake.write_calls() == []
+
+
+def test_stale_all_four_slots_reject(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """四槽全绑旧 head 且内容也变了 → 四条都判失效（不是只拦 qa_pass 那一条）。"""
+
+    fake = FakeRunner()
+    events = four_slots(head=OLD_OID)
+    rc, out, err = run_main(
+        tmp_path, monkeypatch, capsys, events=events, runner=fake,
+        fp_of=lambda *a, **k: content_fp("e" * 40),
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("证据对新 head 无效") == 5  # 1 次 verdict + 4 条槽位明细（四槽各一行）
+    for slot in ("tier", "qa_pass", "review:defect", "review:regression"):
+        assert slot in err
+    assert fake.write_calls() == []
+
+
+def test_binary_diff_is_unreusable_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """当前内容指纹不可复用（二进制）→ 新增文案「证据不可复用」并点名文件（与 E4 同口径）。"""
+
+    fake = FakeRunner()
+    binary = reviewhead.Fingerprint(
+        kind="binary",
+        value=None,
+        merge_base="d" * 40,
+        paths=("assets/logo.png",),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
+    rc, out, err = run_main(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=four_slots(qa_head=OLD_OID),
+        runner=fake,
+        current_fp=binary,
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "证据不可复用" in err
+    assert "assets/logo.png" in err
+    assert "双问不可复用" not in err  # 拦在证据闸门，不是双问闸门
+    assert fake.write_calls() == []
+
+
+def test_unverifiable_empty_diff_is_unreusable_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """空 diff（分支相对 base 无差异）→「证据不可复用」，且点名「空 diff」。"""
+
+    fake = FakeRunner()
+    empty = reviewhead.Fingerprint(
+        kind="empty",
+        value=None,
+        merge_base="d" * 40,
+        paths=(),
+        algo=reviewhead.FINGERPRINT_ALGO,
+    )
+    rc, out, err = run_main(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=four_slots(qa_head=OLD_OID),
+        runner=fake,
+        current_fp=empty,
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "证据不可复用" in err
+    assert "空 diff" in err
+    assert fake.write_calls() == []
+
+
+def test_unverifiable_old_commit_is_missing_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """取不到旧 head 的提交对象（``fingerprint_of_commit`` → None）→ 缺证据，不许当齐。"""
+
+    fake = FakeRunner()
+    rc, out, err = run_main(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        events=four_slots(qa_head=OLD_OID),
+        runner=fake,
+        fp_of=lambda *a, **k: None,
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "证据对新 head 无效" in err
+    assert "不可验证" in err
+    assert fake.write_calls() == []

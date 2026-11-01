@@ -33,9 +33,16 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+#: 内容指纹的唯一实现（``diff-sha256-U0-v1`` 在 :mod:`team_board.reviewhead`）。
+#: 本模块只在 :func:`slot_matches` 里碰它 —— 那一条要读 git 对象，是证据判定里唯一的 IO 入口；
+#: 模块导入本身仍然不连库、不读环境、不起子进程（``reviewhead`` 顶层只有 stdlib import）。
+#: ``reviewhead`` 不 import 本模块，因此不构成循环导入。
+from team_board import reviewhead
 
 #: 七种 evidence 事件的固定顺序（``merged`` 在末尾：保留字，不可 emit）
 KINDS: tuple[str, ...] = (
@@ -376,16 +383,102 @@ def _tier_is_legal(value: object) -> bool:
     return isinstance(value, str) and value in TIERS
 
 
+def slot_matches(
+    repo: str | Path,
+    base: str,
+    head_sha: object,
+    current: object,
+    *,
+    remote: str = "origin",
+) -> bool:
+    """槽位事件绑的那条 ``head_sha`` 的内容指纹 == 当前内容指纹 ``current.value``？
+
+    E5：四槽（``tier`` / ``qa_pass`` / ``review:defect`` / ``review:regression``）原先绑的是
+    head sha，纯 rebase 只换父提交就把四槽全判失效；改绑**内容指纹**之后，「内容一个字节
+    没改」的复用成立，「真改内容」仍然失效。
+
+    口径（都取保守一侧）：
+
+    1. ``head_sha`` 经 :func:`team_board.reviewhead.fingerprint_of_commit` 换算 —— 本地没有
+       那条提交时它会按 sha fetch 一次，算出来的仍是 ``diff-sha256-U0-v1`` 指纹，与
+       :func:`team_board.reviewhead.fingerprint` 同一个值；
+    2. 取不到对象（fetch 失败 / 没有这条 sha / 与 base 无共同祖先）→ ``False``：
+       **不可验证 = 缺证据**，不许当齐（``fingerprint_of_commit`` 已把这些折成 ``None``）；
+    3. ``current`` 是 :class:`team_board.reviewhead.Fingerprint`；``kind`` 不是 ``patch``
+       （二进制 / 空 diff 的 ``value`` 恒为 ``None``）或 ``value`` 不是非空字符串 → ``False``。
+
+    真·环境故障（PATH 里没有 git）**不吞成** ``False``：
+    :class:`team_board.reviewhead.GitMissingError` 原样抛出 —— 「这台机器没有 git」与
+    「这条 sha 取不到」是两件事（``fingerprint_of_commit`` 的 docstring 同一口径）。
+
+    本函数是 :mod:`team_board.evidence` 里唯一会做 IO 的判定入口（git 调用都在
+    ``reviewhead`` 里）；``repo`` / ``base`` 本身非法属于调用方的 bug，不在这里兜。
+    """
+
+    current_value = getattr(current, "value", None)
+    if not isinstance(current_value, str) or not current_value:
+        return False
+    if not isinstance(head_sha, str) or not head_sha:
+        # payload 里没有可换算的 sha（缺键 / 非字符串）：同样「不可验证」
+        return False
+    try:
+        computed = reviewhead.fingerprint_of_commit(repo, base, head_sha, remote)
+    except reviewhead.GitMissingError:
+        # 环境故障 ≠「这条 sha 取不到」：原样抛，别让「没装 git」静默变成「证据失效」
+        raise
+    except reviewhead.PatchIdError:
+        # 形态非法 / diff 读不出来：这一槽**不可验证**，按缺证据处理
+        return False
+    if computed is None or computed.value is None:
+        return False
+    return computed.value == current_value
+
+
+def _content_matches(
+    payload: Mapping[str, object],
+    head: str,
+    matches: Callable[[object], bool] | None,
+) -> bool:
+    """槽位是否绑当前内容：head 逐字相同 → :func:`slot_matches`（内容指纹）。
+
+    ``matches`` 为 ``None``（``evidence audit`` 这类不读 git 的入口）时退回逐字比 head ——
+    「不读仓库」不等于「放行」，两种口径并存。
+    """
+
+    event_head = payload.get("head_sha")
+    if event_head == head:
+        # 同一条提交：内容必然相同，不必再去读仓库（正常合并不额外 fetch / diff）
+        return True
+    if matches is None:
+        return False
+    return matches(event_head)
+
+
+def _content_mismatch(
+    payload: Mapping[str, object], head: str, matches: Callable[[object], bool] | None
+) -> str:
+    """失效槽位的 detail 文案：能说内容指纹就说内容指纹。"""
+
+    event_head = payload.get("head_sha")
+    if matches is None:
+        return f"head {_short(event_head)} != {_short(head)}"
+    return (
+        f"head {_short(event_head)} 的内容指纹与当前内容不同"
+        f"（当前 head {_short(head)}；取不到该提交也按「不可验证」记失效）"
+    )
+
+
 def judge(
     events: Iterable[Event],
     head: str,
     pr: int | None = None,
     tier_required: str | None = None,
+    matches: Callable[[object], bool] | None = None,
 ) -> Judgment:
-    """判「四槽证据是否齐、是否绑 ``head``」（纯函数；不查库、不解 JSON）。
+    """判「四槽证据是否齐、是否绑当前内容」（纯判定；不查库、不解 JSON）。
 
     四槽（:data:`REQ_SLOTS`）各取 id 最大的一条，逐槽按
-    ``角色 → 缺证据 → head → 双问`` 的顺序定状态；四个之外再补两条：
+    ``角色 → 缺证据 → 内容 → 双问`` 的顺序定状态；四个之外再补两条：
     ``impl_done`` 存在但 ``pr`` 不等 → 证据串卡；``tier == "C"`` 必须有 ``pr`` 相等的
     ``boss_approve``。多个问题同时存在时按 :data:`VERDICT_PRIORITY` 取最左一个当
     verdict，其余问题写进 :attr:`Judgment.detail`。
@@ -393,9 +486,13 @@ def judge(
     ``pr`` 为 ``None``（``--pr`` 没给）时跳过依赖 PR 相等的两条判定；
     ``tier_required`` 给了值就要求 tier 槽位证据的档位**恰好等于**它。
 
-    tier 槽在 head 之外还要求 ``payload['tier']`` 落在 :data:`TIERS`（``A``/``B``/``C``）
+    「内容」由 ``matches`` 决定：给了 ``matches``（``merge_guard`` 的证据闸门传的是
+    :func:`slot_matches`）就按**内容指纹**判 —— 事件 head 与当前 head 不同但内容等价
+    （纯 rebase）照样算绑对了；``matches`` 为 ``None`` 时退回逐字比 head。
+
+    tier 槽在内容之外还要求 ``payload['tier']`` 落在 :data:`TIERS`（``A``/``B``/``C``）
     里 —— 缺键 / 非字符串 / 取值域外一律记 ``missing``（verdict 落「缺证据」），
-    不许「head 对得上就算齐」。
+    不许「内容对得上就算齐」。
     """
     ordered = tuple(events)
     slots: list[Slot] = []
@@ -430,10 +527,13 @@ def judge(
                     f"tier：档位证据缺键 {'/'.join(absent)}"
                     f"（三键必须齐：{'/'.join(REQUIRED_KEYS['tier'])}）"
                 )
-            elif event.payload.get("head_sha") != head:
+            elif not _content_matches(event.payload, head, matches):
+                # E5：内容口径由 ``matches`` 定（``merge_guard`` 传 slot_matches → 按内容
+                # 指纹判；纯 rebase 复用成立）。取不到该提交同样是 False —— 「不可验证」
+                # 不等于「内容相同」。
                 state = SLOT_HEAD_MISMATCH
                 problems[VERDICT_HEAD_MISMATCH].append(
-                    f"{name}：{_short(event.payload.get('head_sha'))} != {_short(head)}"
+                    f"{name}：{_content_mismatch(event.payload, head, matches)}"
                 )
             elif name == "tier" and not _tier_is_legal(event.payload.get("tier")):
                 # tier 槽的档位是「本 PR 走哪一档」的唯一依据：缺键 / 非字符串 /
@@ -497,7 +597,14 @@ def judge(
             break
 
     if verdict == VERDICT_PASS:
-        detail = f"四槽齐且绑定 head {_short(head)}" + ("" if pr is None else f"（pr #{pr}）")
+        # 绑定口径随 ``matches`` 变：按内容指纹判时 detail 里点名「内容」，别让人误以为
+        # 判的是 sha（纯 rebase 复用正是「sha 变了、内容没变」）。
+        bound = (
+            f"内容指纹（当前 head {_short(head)}）"
+            if matches is not None
+            else f"head {_short(head)}"
+        )
+        detail = f"四槽齐且绑定 {bound}" + ("" if pr is None else f"（pr #{pr}）")
     else:
         lines = [
             f"{candidate}：{line}"
