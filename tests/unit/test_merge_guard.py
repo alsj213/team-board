@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from team_board import merge_guard as mg
+from team_board import merges
 
 #: 假 ``gh pr view`` 报出来的 head 提交（40 位十六进制）
 HEAD_OID = "4f2a9c0e5b1d3a7c8e6f90b2d4a1c3e5f7b9d0a2"
@@ -1206,6 +1207,46 @@ def test_validate_rejects_bad_by_shape(bad_by: str) -> None:
     with pytest.raises(mg.MergeGuardError) as excinfo:
         mg.validate(_validated_ns(by=bad_by))
     assert "--by" in str(excinfo.value)
+
+
+# ------------------------- --by 的身份（R15-B）：语法合法 ≠ 有资格，只认 repo
+#
+# 形态校验（``MERGE_BY_RE``）与身份校验（``merges.MERGE_BY_PROFILE``）是两道：
+# ``pm/run9`` 语法过、身份不过。入口侧必须自己拦，否则「入口只认 repo」这条要等到
+# body 一致性那条才可能碰巧拒掉（body 写 pm 时），body 写 repo 时就直接放过 ——
+# 一份口径两个答案。常量只许 import，不许在这里复制字面量。
+
+
+@pytest.mark.parametrize("bad_by", ["pm/run9", "pm/run200", "qa/run1", "ops/run7", "user/run1"])
+def test_validate_rejects_non_repo_by(bad_by: str) -> None:
+    """形态合法但 profile 不是 repo → ``MergeGuardError``（rc2 档），文案给正确写法。"""
+
+    with pytest.raises(mg.MergeGuardError) as excinfo:
+        mg.validate(_validated_ns(by=bad_by))
+
+    message = str(excinfo.value)
+    assert "合并权归 repo bot" in message, message
+    assert "repo/run<N>" in message, message
+    assert repr(bad_by) in message, message
+    # 在 ``check_message`` 之前就拒：不许绕到「body 与参数不一致」那条上
+    assert "--body-file" not in message, message
+
+
+def test_by_profile_constant_is_imported_not_copied() -> None:
+    """入口侧的 profile 判定复用 ``merges.MERGE_BY_PROFILE``（同一对象，不是同值字符串）。"""
+
+    assert mg.MERGE_BY_PROFILE is merges.MERGE_BY_PROFILE
+
+
+def test_by_help_only_teaches_repo() -> None:
+    """``--by`` 的帮助文本不许再把人教成 ``pm/runNNN``。"""
+
+    action = next(a for a in mg.build_parser()._actions if "--by" in a.option_strings)
+
+    assert action.help is not None
+    assert "repo/runNNN" in action.help, action.help
+    assert "合并权归 repo bot" in action.help, action.help
+    assert "pm/run" not in action.help, action.help
 
 
 @pytest.mark.parametrize(

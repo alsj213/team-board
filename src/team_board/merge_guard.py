@@ -187,7 +187,8 @@ rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdou
   远端 / ``--verify-only`` 时分支仍在远端或无法判定。
 - ``2``：参数或环境错误：缺 ``--delete-branch``、``--method`` 不是 ``merge``（``squash``
   / ``rebase`` 一律拒）、合并模式缺 ``--card`` / ``--by`` / ``--subject`` / ``--body-file``
-  任一项、``--card`` / ``--by`` 形态非法、``--subject`` 空 / 纯空白 / 含换行、``--body-file``
+  任一项、``--card`` / ``--by`` 形态非法、``--by`` 的 profile 不是 ``repo``（合并权归
+  repo bot，R15-B；判据复用 ``merges.MERGE_BY_PROFILE``）、``--subject`` 空 / 纯空白 / 含换行、``--body-file``
   路径为空 / 文件不存在 / 不是普通文件 / 非严格 UTF-8 / 空文件、body 经
   ``merges.check_message`` 判出问题（缺字段 / 重复 / 格式错 / 与参数不一致）、
   ``--verify-only`` 与这四个认账参数同给、``--pr`` / ``--timeout`` /
@@ -250,7 +251,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from team_board import db, evidence, prclaim, reviewhead
-from team_board.merges import MERGE_BY_RE, MERGE_CARD_RE, check_message
+from team_board.merges import MERGE_BY_PROFILE, MERGE_BY_RE, MERGE_CARD_RE, check_message
 from team_board.model import DEFAULT_DB
 
 #: 唯一合法的合并方式（R13：squash / rebase 一律不许，所以值域只有一个值）
@@ -1232,7 +1233,16 @@ def validate_accounting(args: argparse.Namespace, pr: int) -> Accounting | None:
     by = args.by
     if MERGE_BY_RE.fullmatch(by) is None:
         raise MergeGuardError(
-            f"--by 形态非法：{by!r}（应为 <profile>/run<NNN>，例 pm/run200）"
+            f"--by 形态非法：{by!r}（应为 <profile>/run<NNN>，例 repo/run200）"
+        )
+    # 判据②（R15）：形态合法不等于有资格 —— 合并权只归 repo bot。判据本身在
+    # ``team_board.merges``（``MERGE_BY_PROFILE`` / ``check_actor``），这里只复用常量，
+    # 不复制那份口径；放在 ``check_message`` 之前，是为了让「--by 填了别家身份」先
+    # 得到一条指明正确写法的报错，而不是绕到 body 一致性那条上。
+    if by.partition("/")[0] != MERGE_BY_PROFILE:
+        raise MergeGuardError(
+            f"--by 必须表明 repo 身份：合并权归 repo bot（R15），"
+            f"正确写法 repo/run<N>（收到 {by!r}）"
         )
     subject = check_subject(args.subject)
     body_file = args.body_file
@@ -1853,7 +1863,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="WHO",
         help=(
-            "必填（合并模式）：合并提交的 merged-by（形如 pm/run200）；"
+            "必填（合并模式）：合并提交的 merged-by（必须是 repo/runNNN；"
+            "合并权归 repo bot）；"
             "--verify-only 时不许给"
         ),
     )

@@ -1826,10 +1826,9 @@ def _fill_documented(argv: list[str], stub: Stub) -> list[str]:
         .replace("<卡号>", MERGE_CARD)
         .replace("<NNN>", "200")
         .replace("<body-file>", str(stub.body_file))
-        # R15：执行者只能是 repo。docs/merge-policy.md 的样例行仍写旧 profile
-        # （改它归 G1-b），这里按 repo 填，否则占位值自己就把命令挡在预检之前 ——
-        # 那不再是「文档命令能不能跑」的判据。G1-b 改完文档后这两条 replace 变成空操作。
-        .replace("pm/run", "repo/run")
+        # R15：执行者只能是 repo —— 文档样例行本身就是 ``repo/run<NNN>``（G1-b 改的），
+        # 这里**不做**任何 ``pm/run`` → ``repo/run`` 归一：文档再教旧 profile 时必须
+        # 在这里判红，而不是被守卫悄悄抹平。
         for arg in argv
     ]
 
@@ -2326,6 +2325,74 @@ def _replace_flag_value(argv: list[str], flag: str, value: str) -> list[str]:
     index = out.index(flag)
     out[index + 1] = value
     return out
+
+
+# ---------------------- ②c. --by 的身份（R15-B）：入口侧只认 repo
+#
+# 语法（``MERGE_BY_RE``）与身份（``merges.MERGE_BY_PROFILE``）分开判。``pm/run9`` 语法
+# 合法、身份不合规 —— 这一道必须在入口就拦住，且**不发起任何 gh / git 调用**：
+# 参数阶段拒掉，才不会出现「预检跑了一半、body 也读了、才发现 --by 填错人」。
+
+#: 形态合法、身份不合规的 ``--by``（覆盖几个真实会出现的 profile 名）
+NON_REPO_BY = ("pm/run9", "pm/run200", "qa/run1", "ops/run7", "user/run1")
+
+
+@pytest.mark.parametrize("bad_by", NON_REPO_BY)
+def test_non_repo_by_rc2_with_zero_calls(
+    stub: Stub, capsys: pytest.CaptureFixture[str], bad_by: str
+) -> None:
+    """非 repo 的 ``--by`` → rc2、stdout **0 字节**、stderr 恰一行、零 gh 零 git 调用。"""
+
+    rc, out, err = run(_replace_flag_value(args_for(stub), "--by", bad_by), capsys)
+
+    assert rc == 2, bad_by
+    assert out == ""  # 0 字节 stdout
+    assert err.startswith("错误: "), err
+    assert err.count("\n") == 1, err  # stderr 严格一行
+    assert "合并权归 repo bot" in err, err
+    assert "repo/run<N>" in err, err
+    assert bad_by in err, err
+    # 走的是「--by 身份」那条，不是绕到 body 一致性上
+    assert "--body-file" not in err, err
+    assert stub.calls() == []  # 参数阶段就拒：一个外部命令都没发
+
+
+def test_non_repo_by_rejected_before_body_consistency(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """body 写的是合规的 ``repo/run200``：``--by pm/run9`` 仍必须被**身份**那条拒掉。
+
+    这是「两份口径」的回归：只靠 ``check_message`` 的一致性判定时，body 合规 + 参数
+    不合规会被报成「字段与参数不一致」，读的人不知道该改哪一头。
+    """
+
+    stub.set_body(f"merged-by: {MERGE_BY}\nmerge-card: {MERGE_CARD}\nmerge-pr: #9\n")
+
+    rc, out, err = run(_replace_flag_value(args_for(stub), "--by", "pm/run9"), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "--by 必须表明 repo 身份" in err, err
+    assert "字段与参数不一致" not in err, err
+    assert stub.calls() == []
+
+
+def test_body_merged_by_non_repo_rc2_with_zero_calls(
+    stub: Stub, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """body 里写 ``merged-by: pm/run1`` + ```--by repo/run7``` → rc2（``check_message`` 那条）。"""
+
+    stub.set_body(f"merged-by: pm/run1\nmerge-card: {MERGE_CARD}\nmerge-pr: #9\n")
+
+    rc, out, err = run(_replace_flag_value(args_for(stub), "--by", "repo/run7"), capsys)
+
+    assert rc == 2
+    assert out == ""
+    assert err.count("\n") == 1, err
+    assert "合并权归 repo bot" in err, err
+    assert "--body-file" in err, err  # 这里是 body 内容那条（与 --by 那条区分开）
+    assert stub.calls() == []
 
 
 # ---------------------- ②b. --body-file 的路径形态（P2-1：两套 cwd 解析同一个相对路径）

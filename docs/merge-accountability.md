@@ -27,7 +27,7 @@ CI 不是「豁免判据①」：它的字段部分已在 CI 常驻判，卡级�
 约定与人工复核。
 
 ```
-merged-by: <profile>/run<NNN>       # 例 pm/run137
+merged-by: <profile>/run<NNN>       # 例 repo/run137
 merge-card: t_[0-9a-f]{8}           # 例 t_ad5e7ff6
 merge-pr: #<正整数>                  # 例 #1
 ```
@@ -42,6 +42,41 @@ PYTHONPATH=src python -m team_board.cli merge-audit --repo . --card t_xxxxxxxx -
 trailer 区 / `merged-by` 与 assignee 不符；`2` = 参数或环境错。
 合并前用 `merge-record` 生成认账块，照抄它打印的 `merge_guard` 命令（body 就是同一份
 `--body-out` 文件），别手写。
+
+## 判据② · 合并权归 repo bot（R15-B）
+
+> **编号提示（两条 判据② 不同 lineage，都要过）**：本节是 R15-B 的「判据②」，代码与测试里
+> 写作「判据②（R15 合并权只归 repo bot）」（`src/team_board/merges.py` 的 `MERGE_BY_PROFILE` /
+> `check_actor`）。下一节 `## 判据② · author 白名单` 属于 R15-A 那条 lineage，**编号沿用不动**
+> —— 一条合并提交既要是 `repo` 身份（本节），author / committer 也仍要过白名单（下一节与本文件
+> 判据③）。两条互不替代。
+
+`merged-by` 的 `/` 之前那段（profile）必须**恒为 `repo`**：合并权归 repo bot。语法
+（`merges.MERGE_BY_RE`）与身份（`merges.MERGE_BY_PROFILE = "repo"`）分开判 —— `pm/run9`
+语法合法、身份不合规。
+
+```
+merged-by: repo/run<NNN>            # 例 repo/run137
+merge-card: t_[0-9a-f]{8}           # 例 t_ad5e7ff6
+merge-pr: #<正整数>                  # 例 #1
+```
+
+回溯审查（谁合的，事后判）：
+
+```
+PYTHONPATH=src python -m team_board.cli merge-audit --repo . --baseline <基线> --rev HEAD; echo rc=$?
+```
+
+- `0` = 区间内的合并全是 repo 身份（或落在切换点之前）；`1` = 出现非 repo 的合并，问题行长这样：
+  `<sha7> merged-by 的 profile 不是 repo：merged-by=pm/run9；合并权归 repo bot（R15），正确写法 repo/run<N>`
+- **切换点豁免（历史不追溯）**：判定段按 first-parent **时间正序**取，区间内**最早一条
+  `merged-by` 为 `repo` 的合并**即分界（输出里有 `合并权切换点（首次 repo 合并）：<sha>`）——
+  它之前的合并不判（历史里的 `pm/runN` 不追溯），它及之后一律判，**含别的卡**。区间内
+  **还没有任何 repo 合并** = 过渡期，本条整段不生效（既不判也不豁免，输出里明写）。
+  分界取**完整判定段**，不随 `--card` 漂移。
+- **入口侧同样只认 repo**：`merge_guard --by` / `merge-record --by` 的非 repo 取值在**预检阶段**
+  就 rc2（stdout 0 字节、stderr 恰一行、零 `gh` 调用），不会走到合并那一步；`--by` 的帮助文本
+  也只教 `repo/runNNN`。
 
 ## 判据② · author 白名单（取「建卡时 assignee」）
 

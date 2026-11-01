@@ -523,7 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--by",
         default=None,
         metavar="PROFILE/RUN",
-        help="谁按了合并（形如 pm/run137；生成模式必给，预检模式可选作一致性校验）",
+        help="谁按了合并（形如 repo/run137；生成模式必给，预检模式可选作一致性校验）",
     )
     record_cmd.add_argument(
         "--pr",
@@ -1314,7 +1314,7 @@ def _merge_identity(
     if by is not None and (
         not isinstance(by, str) or merges.MERGE_BY_RE.fullmatch(by) is None
     ):
-        raise merges.MergeAuditError(f"执行者标识非法：{by!r}（应形如 pm/run137）")
+        raise merges.MergeAuditError(f"执行者标识非法：{by!r}（应形如 repo/run137）")
     return card, by, None if pr is None else _parse_merge_pr(pr)
 
 
