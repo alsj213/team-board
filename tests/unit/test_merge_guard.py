@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import tempfile
 import time
 from collections.abc import Callable
@@ -39,6 +40,45 @@ def body_file() -> str:
         Path(name).write_text(BODY_TEXT, encoding="utf-8")
         _BODY_PATH = name
     return _BODY_PATH
+
+
+_BOARD_PATH: str | None = None
+
+
+def board_with_merge_run() -> str:
+    """造一份「``MERGE_CARD`` + ``MERGE_BY`` 对得上」的看板库，返回路径（模块级缓存）。
+
+    入口预检现在要核 run 归属（``merged-by`` 的 run 必须属于本卡）：走 ``validate()``
+    的用例一律喂这份库，既不读真板，也顺带证明「合法 body + 合法 run」这条路是通的。
+    """
+
+    global _BOARD_PATH
+    if _BOARD_PATH is None:
+        handle, name = tempfile.mkstemp(prefix="mg-board-", suffix=".db")
+        os.close(handle)
+        conn = sqlite3.connect(name)
+        try:
+            conn.execute(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT,"
+                " status TEXT, created_at INTEGER, started_at INTEGER, completed_at INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT,"
+                " profile TEXT, status TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status) VALUES (?, ?, ?, ?)",
+                (MERGE_CARD, MERGE_CARD, "repo", "done"),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+                (200, MERGE_CARD, "repo", "completed"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _BOARD_PATH = name
+    return _BOARD_PATH
 
 
 class FakeClock:
@@ -643,6 +683,8 @@ def _validated_ns(**overrides: object) -> argparse.Namespace:
             MERGE_SUBJECT,
             "--body-file",
             body_file(),
+            "--db",
+            board_with_merge_run(),
         ]
     )
     for key, value in overrides.items():
@@ -666,23 +708,7 @@ def test_methods_only_merge() -> None:
 def test_method_default_is_merge_and_optional() -> None:
     """不传 ``--method`` 也能解析，取到的就是默认值 merge。"""
 
-    ns = mg.build_parser().parse_args(
-        [
-            "--pr",
-            "9",
-            "--branch",
-            "wt/t_bbeab29f",
-            "--delete-branch",
-            "--card",
-            MERGE_CARD,
-            "--by",
-            MERGE_BY,
-            "--subject",
-            MERGE_SUBJECT,
-            "--body-file",
-            body_file(),
-        ]
-    )
+    ns = _validated_ns()
 
     assert ns.method == mg.DEFAULT_METHOD == "merge"
     assert mg.validate(ns).method == "merge"

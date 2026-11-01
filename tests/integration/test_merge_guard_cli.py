@@ -371,12 +371,18 @@ def make_board_db(
     ``evidence_card`` 非空时把 ``evidence``（缺省 = :func:`default_evidence_rows` 四槽齐）
     写进该卡的 evidence 事件 —— 证据状态机闸门按 ``--branch`` 取实现卡号，所以这里的
     卡号必须是 ``wt/t_<卡号>`` 的那个实现卡。
+
+    ``task_runs`` 带上 ``task_id`` / ``status`` 并预置一条 ``repo/run200`` → ``MERGE_CARD``
+    的行：认账预检（``merged-by`` 的 run 属于本卡）排在证据闸门之前，读的就是这两列。
     """
 
     conn = sqlite3.connect(str(path))
     try:
         conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, body TEXT)")
-        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, profile TEXT)")
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT,"
+            " profile TEXT, status TEXT)"
+        )
         conn.execute(
             "CREATE TABLE task_events ("
             "id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
@@ -387,8 +393,14 @@ def make_board_db(
             [(card, status, "engineer", body) for card, status, body in cards],
         )
         conn.executemany(
-            "INSERT INTO task_runs (id, profile) VALUES (?, ?)",
-            [(1, "pm"), (2, "qa"), (3, "paimeng")],
+            "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+            [
+                (1, None, "pm", "done"),
+                (2, None, "qa", "done"),
+                (3, None, "paimeng", "done"),
+                # 认账预检要的「本卡 + repo 身份」那一行（``MERGE_BY`` = repo/run200）
+                (200, MERGE_CARD, "repo", "completed"),
+            ],
         )
         if evidence_card is not None:
             rows = default_evidence_rows() if evidence is None else evidence
@@ -2614,15 +2626,24 @@ def test_merge_guard_commit_passes_merge_audit_require(
             "INSERT INTO tasks (id, assignee, status, body) VALUES (?, ?, ?, ?)",
             (PROBE_CARD, "repo", "running", f"PR-CLAIM: #{PROBE_PR}\n"),
         )
-        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, profile TEXT)")
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT,"
+            " profile TEXT, status TEXT)"
+        )
         conn.execute(
             "CREATE TABLE task_events ("
             "id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
             "run_id INTEGER, created_at INTEGER)"
         )
         conn.executemany(
-            "INSERT INTO task_runs (id, profile) VALUES (?, ?)",
-            [(1, "pm"), (2, "qa"), (3, "paimeng")],
+            "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+            [
+                (1, None, "pm", "done"),
+                (2, None, "qa", "done"),
+                (3, None, "paimeng", "done"),
+                # run 归属闸门要的那一行：merged-by 的 run200 属于探针卡、repo 身份、非 blocked
+                (200, PROBE_CARD, "repo", "completed"),
+            ],
         )
         conn.executemany(
             "INSERT INTO task_events (task_id, kind, payload, run_id, created_at) "
@@ -3616,4 +3637,99 @@ def test_printed_command_reaches_claim_gate_when_default_db_missing(
     assert err.startswith("错误: 读看板库失败（--db ")
     assert str(missing) in err
     assert "不在 origin 远端" not in err  # 不是更早的「源分支存在」闸门
+    assert not merged(stub)
+
+
+# ------------------------ 认账预检：merged-by 的 run 必须属于 --card 这张卡（判据③）
+
+
+def _retarget_run(path: Path, *, task_id: str, status: str, profile: str = "repo") -> Path:
+    """把 fixture 库里 ``run 200`` 那一行改成给定归属（换掉本卡 / 换掉状态）。"""
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "UPDATE task_runs SET task_id = ?, profile = ?, status = ? WHERE id = 200",
+            (task_id, profile, status),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def test_run_owner_gate_rejects_run_of_another_card(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``merged-by`` 的 run 属于别的卡 → rc2、stdout 空、stderr 一行、零 gh 写操作。
+
+    只比 profile 的旧口径在这里是全绿的（``repo/run200`` 的 profile 确实是 ``repo``）：
+    认账字段于是连「这条 run 是在哪张卡上跑的」都对不上。
+    """
+
+    board = make_board_db(
+        tmp_path / "other-card.db",
+        [(MERGE_CARD, "running", "PR-CLAIM: #9\n")],
+        evidence_card=MERGE_CARD,
+    )
+    _retarget_run(board, task_id="t_99999999", status="completed")
+
+    rc, out, err = run(args_for(stub, "--db", str(board)), capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.count("\n") == 1
+    assert err.startswith("错误: run 归属闸门拦下 PR #9")
+    assert "merged-by 的 run 不属于本卡" in err
+    assert "t_99999999" in err
+    assert not merged(stub)  # 零 gh 写操作
+
+
+@pytest.mark.parametrize("status", ["blocked", "reclaimed"])
+def test_run_owner_gate_rejects_blocked_or_reclaimed_run(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str], status: str
+) -> None:
+    """run 属于本卡但状态是 blocked / reclaimed → 同样 rc2（那种 run 不能认账）。"""
+
+    board = make_board_db(
+        tmp_path / "blocked-run.db",
+        [(MERGE_CARD, "running", "PR-CLAIM: #9\n")],
+        evidence_card=MERGE_CARD,
+    )
+    _retarget_run(board, task_id=MERGE_CARD, status=status)
+
+    rc, out, err = run(args_for(stub, "--db", str(board)), capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "merged-by 的 run 不属于本卡" in err
+    assert f"status={status}" in err
+    assert not merged(stub)
+
+
+def test_run_owner_gate_db_unreadable_rc2(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """库能读不出版本的话（没有 ``task_runs`` 表）也是 rc2：不许读不到就当通过。"""
+
+    board = tmp_path / "no-runs-table.db"
+    conn = sqlite3.connect(str(board))
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT, assignee TEXT, body TEXT)")
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?)",
+            (MERGE_CARD, "running", "engineer", "PR-CLAIM: #9\n"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc, out, err = run(args_for(stub, "--db", str(board)), capsys)
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.count("\n") == 1
+    assert "task_runs" in err
+    assert str(board) in err
     assert not merged(stub)

@@ -70,6 +70,48 @@ def board(tmp_path: Path) -> Path:
     return make_board(tmp_path / "board.db")
 
 
+#: ``task_runs`` 表结构（判据③ 只读 id / task_id / profile / status）
+_TASK_RUNS_SCHEMA = """
+CREATE TABLE task_runs (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT,
+    profile TEXT,
+    status TEXT
+);
+"""
+
+
+def make_runs_board(
+    path: Path,
+    cards: dict[str, str],
+    runs: dict[int, tuple[str, str, str]],
+) -> Path:
+    """在 ``path`` 造 ``tasks`` + ``task_runs`` 两张表的看板库（判据③ 的对照值）。"""
+
+    board = make_board(path, cards)
+    conn = sqlite3.connect(str(board))
+    try:
+        conn.executescript(_TASK_RUNS_SCHEMA)
+        for run_id, (task_id, profile, status) in runs.items():
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+                (run_id, task_id, profile, status),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return board
+
+
+def write_run_baseline(repo: Path, sha: str) -> Path:
+    """写 ``.team-board/merge-run-audit-baseline``（判据③ 的窗口起点）。"""
+
+    path = repo / ".team-board" / "merge-run-audit-baseline"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sha + "\n", encoding="utf-8")
+    return path
+
+
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "merge-audit-test",
@@ -1280,3 +1322,337 @@ def test_actor_other_card_not_swallowed_by_card_filter(
     # 记录清单照旧只留该卡（只改判定覆盖面，不改 report.records 的过滤）
     assert "判定（1 条）" in out
 
+
+
+# ------------------------------------- 判据③（merged-by 的 run 属于本卡，rc / 文案）
+
+#: 判据③ 专测用的卡：``assignee=repo``（判据① 才不会先红）
+RUN_CARD = "t_ad5e7ff6"
+RUN_BASELINE_REL = ".team-board/merge-run-audit-baseline"
+
+
+def test_run_check_red_for_four_kinds_of_bad_run(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """4 条坏 run（不存在 / 别的卡 / profile 不符 / blocked）→ rc1，每条都带新 kind。
+
+    一条坏合并报一条：同一张卡的四条合并各踩一档，问题段必须是 4 条
+    ``merged-by 的 run 不属于本卡``。
+    """
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    shas = [
+        merge_in(repo, _message(11, RUN_CARD, "repo/run700"), branch="b700", name="a.txt"),
+        merge_in(repo, _message(12, RUN_CARD, "repo/run745"), branch="b745", name="b.txt"),
+        merge_in(repo, _message(13, RUN_CARD, "repo/run746"), branch="b746", name="c.txt"),
+        merge_in(repo, _message(14, RUN_CARD, "repo/run648"), branch="b648", name="d.txt"),
+    ]
+    board_path = make_runs_board(
+        tmp_path / "board.db",
+        {RUN_CARD: "repo"},
+        {
+            745: ("t_99999999", "repo", "completed"),
+            746: (RUN_CARD, "pm", "completed"),
+            648: (RUN_CARD, "repo", "blocked"),
+        },
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 1, (rc, out, err)
+    assert err == ""
+    assert "run 归属判定（merged-by 的 run 属于本卡）" in out
+    assert "判 4 条 → FAIL" in out
+    assert out.count("merged-by 的 run 不属于本卡：") == 4
+    # 四档文案各一条（run 不存在 / 属于别的卡 / profile 不符 / status=blocked）
+    for sha, needle in zip(
+        shas,
+        [
+            "的 run 700 在 task_runs 里不存在",
+            "的 run 745 属于卡 t_99999999",
+            "的 run 746 profile=pm，与 trailer 的 profile=repo 不符",
+            "的 run 648 status=blocked",
+        ],
+        strict=True,
+    ):
+        assert f"{sha[:7]} merged-by 的 run 不属于本卡：merged-by=repo/run" in out
+        assert needle in out
+    assert "结论：发现 4 个问题" in out
+
+
+def test_run_check_green_when_run_belongs_to_card(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """好 run（属本卡、completed）→ rc0 + 判据③ PASS。"""
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    merge_in(repo, _message(21, RUN_CARD, "repo/run726"), branch="ok", name="ok.txt")
+    board_path = make_runs_board(
+        tmp_path / "board.db", {RUN_CARD: "repo"}, {726: (RUN_CARD, "repo", "completed")}
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert (
+        f"run 归属判定（merged-by 的 run 属于本卡）：卡 {RUN_CARD}，"
+        f"窗口起点 {base[:7]}，判 1 条 → PASS"
+    ) in out
+    assert "结论：无问题" in out
+
+
+def test_run_check_skips_merge_before_window_start(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """历史不追溯：合并在窗口起点之前（含起点自身）→ 不判，rc0。"""
+
+    base = head(repo)
+    old = merge_in(repo, _message(22, RUN_CARD, "repo/run745"), branch="old", name="old.txt")
+    write_run_baseline(repo, old)
+    board_path = make_runs_board(tmp_path / "board.db", {RUN_CARD: "repo"}, {})
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert "区间内无该卡窗口内的合并 → 不适用" in out
+    assert "merged-by 的 run 不属于本卡" not in out
+
+
+def test_run_check_without_window_file_says_not_in_effect(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """没声明窗口 → 判据③ 未生效**并明写**（不静默当成通过）。"""
+
+    base = head(repo)
+    merge_in(repo, _message(23, RUN_CARD, "repo/run745"), branch="noWin", name="w.txt")
+    board_path = make_runs_board(tmp_path / "board.db", {RUN_CARD: "repo"}, {})
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert f"未生效（缺 {RUN_BASELINE_REL}" in out
+
+
+def test_run_check_not_applied_without_card(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """没有 ``--card`` 就没有「哪张卡」可比：判据③ 整段不打，也不读 task_runs。"""
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    merge_in(repo, _message(24, RUN_CARD, "repo/run745"), branch="nocard", name="n.txt")
+
+    # 不传 --db 也不该报错（该判定不生效，就不会去碰库）
+    rc, out, err = run(["--repo", str(repo), "--baseline", base], capsys)
+
+    assert rc == 0, (rc, out, err)
+    assert err == ""
+    assert "run 归属判定" not in out
+
+
+def test_run_check_rc2_when_task_runs_table_missing(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """库读不到 ``task_runs`` → rc2（不静默放过），文案点名表名与 --db。"""
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    merge_in(repo, _message(25, RUN_CARD, "repo/run726"), branch="notruns", name="t.txt")
+    board_path = make_board(tmp_path / "board.db", {RUN_CARD: "repo"})
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert err.count("\n") == 1
+    assert err.startswith("错误: ")
+    assert "task_runs" in err
+
+
+def test_run_check_rc2_when_board_db_missing(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """库文件不存在 → rc2（判据① 先撞同一件事：缺库不静默跳过判据）。"""
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    merge_in(repo, _message(26, RUN_CARD, "repo/run726"), branch="nodb", name="x.txt")
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(tmp_path / "nope.db"),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "nope.db" in err
+
+
+def test_run_check_rc2_when_window_start_not_ancestor(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """窗口起点在被审 rev 之后 → rc2（空窗口会静默假绿，故一律报错）。"""
+
+    base = head(repo)
+    later = merge_in(repo, _message(27, RUN_CARD, "repo/run726"), branch="late", name="l.txt")
+    write_run_baseline(repo, later)
+    board_path = make_runs_board(
+        tmp_path / "board.db", {RUN_CARD: "repo"}, {726: (RUN_CARD, "repo", "completed")}
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--rev",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "run 判定窗口起点不是被审 rev 的祖先" in err
+
+
+def test_run_check_rc2_when_window_file_malformed(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """窗口文件写坏了（不是 sha）→ rc2，不许退化成「没有窗口」。"""
+
+    base = head(repo)
+    write_run_baseline(repo, "not-a-sha")
+    merge_in(repo, _message(28, RUN_CARD, "repo/run726"), branch="badwin", name="b.txt")
+    board_path = make_runs_board(
+        tmp_path / "board.db", {RUN_CARD: "repo"}, {726: (RUN_CARD, "repo", "completed")}
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 2, (rc, out, err)
+    assert out == ""
+    assert "7–40 位小写十六进制" in err
+
+
+def test_run_check_breaks_require(
+    repo: Path, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """run 对不上的合并不算「零问题的认账合并」：``--require`` 一并判红。"""
+
+    base = head(repo)
+    write_run_baseline(repo, base)
+    merge_in(repo, _message(29, RUN_CARD, "repo/run745"), branch="req", name="r.txt")
+    board_path = make_runs_board(
+        tmp_path / "board.db", {RUN_CARD: "repo"}, {745: ("t_99999999", "repo", "completed")}
+    )
+
+    rc, out, err = run(
+        [
+            "--repo",
+            str(repo),
+            "--baseline",
+            base,
+            "--card",
+            RUN_CARD,
+            "--require",
+            "--db",
+            str(board_path),
+        ],
+        capsys,
+    )
+
+    assert rc == 1, (rc, out, err)
+    assert "merged-by 的 run 不属于本卡" in out
+    assert "缺认账字段" in out

@@ -26,13 +26,16 @@ from team_board.merges import (
     KIND_MERGED_BY_MISMATCH,
     KIND_MISMATCH,
     KIND_MISSING,
+    KIND_NO_MERGE,
     KIND_NOT_MERGE,
     KIND_NOT_TRAILER,
+    KIND_RUN_NOT_OF_CARD,
     MERGE_BY_PROFILE,
     MergeAuditError,
     MergeRecord,
     MergeReport,
     Problem,
+    RunOwner,
     actor_of,
     audit,
     build_message,
@@ -40,10 +43,13 @@ from team_board.merges import (
     check_actor,
     check_merged_by,
     check_message,
+    check_run_owner,
     legacy_record,
     parse_trailers,
+    read_runs,
     record_from_commit,
     render_report,
+    run_id_of,
 )
 
 SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
@@ -1449,3 +1455,310 @@ class TestActorSwitchPoint:
         assert KIND_ACTOR_NOT_REPO in kinds_here
         assert not report.ok
 
+
+
+# --------------------------------------------------- 判据③：merged-by 的 run 归属
+
+_RUNS_SCHEMA = """
+CREATE TABLE task_runs (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT,
+    profile TEXT,
+    status TEXT
+);
+"""
+
+
+def make_runs_board(
+    path: Path,
+    cards: dict[str, str | None],
+    runs: dict[int, tuple[str | None, str | None, str | None]],
+) -> Path:
+    """造一个带 ``task_runs`` 的看板库（判据③ 的对照值），返回路径。"""
+
+    board = make_board(path, cards)
+    conn = sqlite3.connect(str(board))
+    try:
+        conn.executescript(_RUNS_SCHEMA)
+        for run_id, (task_id, profile, status) in runs.items():
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, profile, status) VALUES (?, ?, ?, ?)",
+                (run_id, task_id, profile, status),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return board
+
+
+def write_run_baseline(repo: Path, sha: str) -> Path:
+    """在 ``repo`` 里写 ``.team-board/merge-run-audit-baseline``（判据③ 的窗口起点）。"""
+
+    path = repo / ".team-board" / "merge-run-audit-baseline"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sha + "\n", encoding="utf-8")
+    return path
+
+
+class TestRunIdOf:
+    """``merged-by`` → run 号。"""
+
+    def test_ok(self) -> None:
+        assert run_id_of("repo/run726") == 726
+
+    @pytest.mark.parametrize("bad", ["repo/run", "repo/runx", "repo726", "", "repo/run1x"])
+    def test_bad_value_raises(self, bad: str) -> None:
+        with pytest.raises(MergeAuditError) as excinfo:
+            run_id_of(bad)
+        assert "run" in str(excinfo.value)
+
+
+class TestReadRuns:
+    """``task_runs`` 的只读取数：查得到就回填，读不到就是 rc2。"""
+
+    def test_reads_rows(self, tmp_path: Path) -> None:
+        board = make_runs_board(
+            tmp_path / "board.db",
+            {CARD: "repo"},
+            {726: (CARD, "repo", "completed"), 745: ("t_309b4c30", "pm", "blocked")},
+        )
+        owners = read_runs(board, [726, 745])
+        assert owners[726] == RunOwner(726, CARD, "repo", "completed")
+        assert owners[745] == RunOwner(745, "t_309b4c30", "pm", "blocked")
+
+    def test_unknown_run_is_absent_not_error(self, tmp_path: Path) -> None:
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {})
+        assert read_runs(board, [999999]) == {}
+
+    def test_empty_ids_skips_the_db_entirely(self, tmp_path: Path) -> None:
+        # 没有 run 号就不该碰库（连不存在的库也不报错）
+        assert read_runs(tmp_path / "nope.db", []) == {}
+
+    def test_board_file_bytes_are_unchanged(self, tmp_path: Path) -> None:
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {1: (CARD, "repo", "done")})
+        before = board.read_bytes()
+        read_runs(board, [1])
+        assert board.read_bytes() == before
+
+    def test_missing_db_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(MergeAuditError) as excinfo:
+            read_runs(tmp_path / "nope.db", [1])
+        assert "run 归属判定" in str(excinfo.value)
+
+    def test_missing_task_runs_table_raises(self, tmp_path: Path) -> None:
+        board = make_board(tmp_path / "board.db", {CARD: "repo"})
+        with pytest.raises(MergeAuditError) as excinfo:
+            read_runs(board, [1])
+        assert "task_runs" in str(excinfo.value)
+
+    def test_null_columns_render_as_empty_strings(self, tmp_path: Path) -> None:
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {7: (None, None, None)})
+        assert read_runs(board, [7])[7] == RunOwner(7, "", "", "")
+
+
+class TestCheckRunOwner:
+    """四档坏 run 各报一条 ``KIND_RUN_NOT_OF_CARD``；好 run 零问题。"""
+
+    def test_good_run_passes(self) -> None:
+        owner = RunOwner(726, CARD, "repo", "completed")
+        assert check_run_owner("repo/run726", CARD, owner) == ()
+
+    def test_missing_run(self) -> None:
+        problems = check_run_owner("repo/run726", CARD, None)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD]
+        assert "不存在" in problems[0].detail
+        assert "726" in problems[0].detail
+
+    def test_run_of_another_card(self) -> None:
+        owner = RunOwner(745, "t_309b4c30", "repo", "completed")
+        problems = check_run_owner("repo/run745", CARD, owner)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD]
+        assert "t_309b4c30" in problems[0].detail
+        assert CARD in problems[0].detail
+
+    def test_profile_mismatch(self) -> None:
+        owner = RunOwner(745, CARD, "pm", "completed")
+        problems = check_run_owner("repo/run745", CARD, owner)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD]
+        assert "profile=pm" in problems[0].detail
+
+    @pytest.mark.parametrize("status", ["blocked", "reclaimed"])
+    def test_blocked_or_reclaimed_status(self, status: str) -> None:
+        owner = RunOwner(648, CARD, "repo", status)
+        problems = check_run_owner("repo/run648", CARD, owner)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD]
+        assert status in problems[0].detail
+
+    def test_two_defects_report_two_problems(self) -> None:
+        # 一样一条：run 既属于别的卡、又处于 blocked
+        owner = RunOwner(745, "t_309b4c30", "repo", "blocked")
+        problems = check_run_owner("repo/run745", CARD, owner)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD, KIND_RUN_NOT_OF_CARD]
+
+
+class TestCheckMessageRunOwnership:
+    """候选 message（``merge_guard`` / ``merge-record --check-file`` 入口）同判。"""
+
+    def test_without_db_path_the_check_does_not_run(self, tmp_path: Path) -> None:
+        # 纯函数用法：不给库就不碰库（单测解析/格式口径时不该被 run 归属拖红）
+        assert check_message(GOOD, card=CARD, by=BY, pr=15) == ()
+
+    def test_good_run_passes(self, tmp_path: Path) -> None:
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {137: (CARD, "repo", "running")})
+        assert check_message(GOOD, card=CARD, by=BY, pr=15, db_path=board) == ()
+
+    @pytest.mark.parametrize(
+        ("owner", "needle"),
+        [
+            (None, "不存在"),
+            ((CARD, "pm", "completed"), "profile=pm"),
+            ((CARD, "repo", "blocked"), "status=blocked"),
+            (("t_99999999", "repo", "completed"), "属于卡 t_99999999"),
+        ],
+    )
+    def test_bad_run_is_reported(
+        self,
+        tmp_path: Path,
+        owner: tuple[str, str, str] | None,
+        needle: str,
+    ) -> None:
+        runs: dict[int, tuple[str | None, str | None, str | None]] = (
+            {} if owner is None else {137: owner}
+        )
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, runs)
+        problems = check_message(GOOD, card=CARD, by=BY, pr=15, db_path=board)
+        assert [p.kind for p in problems] == [KIND_RUN_NOT_OF_CARD]
+        assert needle in problems[0].detail
+
+    def test_missing_task_runs_table_raises(self, tmp_path: Path) -> None:
+        board = make_board(tmp_path / "board.db", {CARD: "repo"})
+        with pytest.raises(MergeAuditError) as excinfo:
+            check_message(GOOD, card=CARD, by=BY, pr=15, db_path=board)
+        assert "task_runs" in str(excinfo.value)
+
+    def test_malformed_merged_by_is_not_sent_to_the_db(self, tmp_path: Path) -> None:
+        # 畸形值已被「格式非法」报过；不许再拿它去查库（库里不可能有畸形 run 号）
+        board = make_board(tmp_path / "board.db", {CARD: "repo"})
+        message = GOOD.replace("repo/run137", "repo/run")
+        problems = check_message(message, card=CARD, by="repo/run", pr=15, db_path=board)
+        assert [p.kind for p in problems] == [KIND_BAD_FORMAT]
+
+
+class TestRunOwnershipInAudit:
+    """``audit(only_card=…)`` 的判据③：窗口、四档坏 run、``require`` 交互。"""
+
+    def test_run_of_card_is_green(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run726")])
+        write_run_baseline(repo, baseline)
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {726: (CARD, "repo", "completed")})
+
+        report = audit(repo=repo, baseline=baseline, only_card=CARD, db_path=board)
+
+        assert report.ok, report.problems
+        assert report.run_baseline == baseline
+        assert report.run_checked == 1
+        assert "判 1 条 → PASS" in render_report(report)
+
+    def test_run_of_another_card_is_red(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        write_run_baseline(repo, baseline)
+        board = make_runs_board(
+            tmp_path / "board.db",
+            {CARD: "repo"},
+            {745: ("t_309b4c30", "repo", "completed")},
+        )
+
+        report = audit(repo=repo, baseline=baseline, only_card=CARD, db_path=board)
+
+        assert not report.ok
+        assert [p.kind for p in report.problems] == [KIND_RUN_NOT_OF_CARD]
+        assert report.problems[0].sha == shas[0]
+        assert "FAIL" in render_report(report)
+
+    def test_merge_at_window_start_is_not_judged(self, tmp_path: Path) -> None:
+        # 窗口起点自身不算「之后」：历史不追溯，也不拿起点那条当判据③ 的对象
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        write_run_baseline(repo, shas[0])
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {})
+
+        report = audit(repo=repo, baseline=baseline, only_card=CARD, db_path=board)
+
+        assert report.ok, report.problems
+        assert report.run_checked == 0
+        assert "不适用" in render_report(report)
+
+    def test_missing_run_baseline_file_means_not_in_effect(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {})
+
+        report = audit(repo=repo, baseline=baseline, only_card=CARD, db_path=board)
+
+        assert report.ok, report.problems
+        assert report.run_baseline is None
+        assert report.run_checked == 0
+        assert "未生效" in render_report(report)
+
+    def test_without_card_the_check_does_not_run(self, tmp_path: Path) -> None:
+        # 没有 --card 就没有「哪张卡」可比：判定整段不生效（也不读 task_runs）
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        write_run_baseline(repo, baseline)
+
+        report = audit(repo=repo, baseline=baseline)
+
+        assert report.ok, report.problems
+        assert report.run_baseline is None
+        assert "run 归属判定" not in render_report(report)
+
+    def test_run_baseline_not_ancestor_is_rc2(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run726")])
+        write_run_baseline(repo, shas[0])
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {726: (CARD, "repo", "done")})
+
+        with pytest.raises(MergeAuditError) as excinfo:
+            audit(repo=repo, baseline=baseline, rev=baseline, only_card=CARD, db_path=board)
+        assert "run 判定窗口起点" in str(excinfo.value)
+
+    def test_malformed_run_baseline_is_rc2(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run726")])
+        write_run_baseline(repo, "not-a-sha")
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {726: (CARD, "repo", "done")})
+
+        with pytest.raises(MergeAuditError) as excinfo:
+            audit(repo=repo, baseline=baseline, only_card=CARD, db_path=board)
+        assert "7–40 位小写十六进制" in str(excinfo.value)
+
+    def test_run_problem_breaks_require(self, tmp_path: Path) -> None:
+        # run 对不上的合并不算「零问题的认账合并」：--require 不许把它糊成通过
+        repo = tmp_path / "repo"
+        baseline, _shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        write_run_baseline(repo, baseline)
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {})
+
+        report = audit(
+            repo=repo, baseline=baseline, only_card=CARD, require=True, db_path=board
+        )
+
+        kinds = [p.kind for p in report.problems]
+        assert KIND_RUN_NOT_OF_CARD in kinds
+        assert KIND_NO_MERGE in kinds
+
+    def test_history_segment_is_not_judged(self, tmp_path: Path) -> None:
+        # 主基线之前的历史合并（历史段）不进判据③：历史段没有判定段记录
+        repo = tmp_path / "repo"
+        baseline, shas = _audit_repo(repo, [_pr_msg(21, CARD, "repo/run745")])
+        write_run_baseline(repo, baseline)
+        board = make_runs_board(tmp_path / "board.db", {CARD: "repo"}, {})
+
+        # 主基线 = 该合并本身 → 它落到历史段（只回显、不判定）
+        report = audit(repo=repo, baseline=shas[0], only_card=CARD, db_path=board)
+
+        assert report.ok, report.problems
+        assert report.run_checked == 0
+        assert report.records == ()
