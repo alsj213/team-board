@@ -133,3 +133,14 @@ git -C <checkout> fetch origin main -q && git -C <checkout> log --first-parent -
 
 - **合并方式本身可以做机器校验**（R13 ③④⑤ 三层），所以本条的强制不依赖自觉；
   但「直推 main」这半条做不到，按老板要求在此明写原因，不写成「规则已定，执行靠自觉」。
+
+## 五、合并前的证据闸门（判据见 docs/evidence-events.md）
+
+`merge_guard` 在 rebase 与 `gh pr merge` 之前还有证据状态机闸门，闸门顺序是
+「认领 → 证据四槽 → CI 全绿 → 双问 → rebase → 合并」，拒绝时 `rc=2`、`stdout` 0 字节、
+零 `gh` 写调用（实跑例见该文第五节）。
+
+**判据单一来源是 `docs/evidence-events.md`**：四槽内容、判定字面量、C 档的老板点头条件、
+串卡与角色反查、以及旧文字判据（review_head）的删除时点，都以该文为准，本节不复述
+（避免两处口径分叉）。
+
