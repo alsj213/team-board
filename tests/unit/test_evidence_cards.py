@@ -342,3 +342,32 @@ def test_guard_block_falls_back_to_plan_file(tmp_path: Path, monkeypatch: pytest
     assert specs[0].idempotency_key in text
     # 不重试、不换 env 绕过：仍然只发过一次子进程
     assert len(runner.calls) == 1
+
+
+def test_guard_block_with_two_cards_keeps_both_in_plan_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """两张卡同时缺、守卫拦住第一张 → 计划文件里两张都还在（不许被后一张覆盖掉）。
+
+    这是双问缺陷视角收口的那条：逐张各写一次同一文件会让最后一张覆盖前面的，人工接手
+    时漏卡。同时「守卫拦下后不再发子进程」= 一轮到底，不重试（R22）。
+    """
+
+    monkeypatch.chdir(tmp_path)
+    events = slot_events(with_qa=False, with_tier=False)
+    specs = evidence_cards.plan(judged(events), CARD, PR, HEAD, events=events)
+    assert sorted(spec.assignee for spec in specs) == ["pm", "qa"]
+    runner = FakeRunner([FakeProc(rc=1, stderr="kanban: scoped to task t_deadbeef")])
+    lines: list[str] = []
+    creator = evidence_cards.CardCreator(runner=runner, echo=lines.append, scratch_dir=tmp_path)
+    outcomes = creator.ensure(specs, impl_card=CARD, head=HEAD)
+
+    print("子进程调用次数：", len(runner.calls))
+    print("回显：", lines)
+    assert [o.status for o in outcomes] == ["guard-blocked", "guard-blocked"]
+    assert len(runner.calls) == 1, "守卫拦下后不许再为剩下的卡发子进程"
+    assert len(lines) == 1, "只回一行提示转 paimeng"
+    text = (tmp_path / "evidence" / f"{CARD}-{HEAD[:12]}.cards.txt").read_text(encoding="utf-8")
+    for spec in specs:
+        assert spec.idempotency_key in text, spec.title
+        assert spec.title in text, spec.title

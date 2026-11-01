@@ -433,10 +433,19 @@ class CardCreator:
     def ensure(
         self, specs: Iterable[CardSpec], *, impl_card: str, head: str
     ) -> tuple[CreateOutcome, ...]:
-        """逐条建卡，返回每条的结果（``skipped`` 表示同一 key 已建过、不发子进程）。"""
+        """逐条建卡，返回每条的结果（``skipped`` 表示同一 key 已建过、不发子进程）。
 
+        守卫拦下之后的处理是「一轮到底」：scope guard 拦的从来不是某一张卡，而是这个
+        worker 的全部 ``hermes kanban`` 写操作 —— 所以命中一次就把**剩余全部**计划落进
+        同一份 ``evidence/<卡号>-<head12>.cards.txt``，后面的卡不再发子进程（不重试、不换
+        env 绕过），只回显一行提示转 paimeng。逐张各写一次同一文件会让最后一张覆盖前面
+        的，人工接手时漏卡（双问缺陷视角，2026-11-01 收口）。
+        """
+
+        items = tuple(specs)
         outcomes: list[CreateOutcome] = []
-        for spec in specs:
+        blocked_at: int | None = None
+        for position, spec in enumerate(items):
             if spec.idempotency_key in self._done:
                 outcomes.append(
                     CreateOutcome(
@@ -447,11 +456,30 @@ class CardCreator:
                     )
                 )
                 continue
+            if blocked_at is not None:
+                # 守卫已拦：剩余计划已在落盘的那一份里，这里不再发子进程、也不再回显
+                outcomes.append(CreateOutcome(spec, "guard-blocked", 0, ""))
+                continue
             outcome = self._create(spec, impl_card=impl_card, head=head)
             if outcome.status == "created":
                 self._done.add(spec.idempotency_key)
+            if outcome.status == "guard-blocked":
+                blocked_at = position
+                target = self.write_plan_file(
+                    items[position:],
+                    impl_card=impl_card,
+                    head=head,
+                    reason="被作用域守卫拦下",
+                )
+                outcome = CreateOutcome(
+                    spec,
+                    "guard-blocked",
+                    outcome.rc,
+                    f"建卡被作用域守卫拦下，计划已落 {target}，请转 paimeng",
+                )
             outcomes.append(outcome)
-            self._echo(outcome.line)
+            if outcome.line:
+                self._echo(outcome.line)
         return tuple(outcomes)
 
     # ---- 内部 ----
