@@ -22,10 +22,10 @@ team-board member engineer
 team-board export
 ```
 
-共十八个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+共十九个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
 `commit-audit` / `merge-record` / `body-audit` / `gate` / `output-audit` / `push-guard` /
 `pr-claim-audit` / `pr-review-head-audit` / `evidence` / `merge-owner-audit` /
-`verify-batch` / `serve`
+`verify-batch` / `merge-train` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节，`merge-owner-audit` 见「PR 合并归属稽核」一节，
@@ -599,11 +599,12 @@ python3 -m team_board.merge_guard \
      逻辑与 `team-board pr-claim-audit` 同源（`prclaim.audit` / `Report.sole_claim_id`），
      本工具不复制正则。三种拒绝文案一眼可分：`无未结卡认领该 PR` / `重复认领`（附卡号
      清单） / `认领卡 <id> ≠ --card <card>`。这一步一次 gh 都不调。
-  2. **证据状态机（四槽绑当前 head，`t_1429d01c`）**：实现卡号从 `--branch` 取（必须整串
+  2. **证据状态机（四槽绑当前内容，`t_1429d01c`）**：实现卡号从 `--branch` 取（必须整串
      `wt/t_<8 位小写十六进制>`，否则「无法定位实现卡」rc2），读 `--db` 的 evidence 事件
      （`evidence.collect`，与 `team-board evidence audit` 同一份实现），要求 `tier` /
-     `qa_pass` / `review:defect` / `review:regression` 四槽各取 id 最大的一条、全部绑预检
-     读到的 `headRefOid`。`tier` 槽按 `REQUIRED_KEYS["tier"]` 三键齐才算齐（`tier` /
+     `qa_pass` / `review:defect` / `review:regression` 四槽各取 id 最大的一条、全部绑
+     当前内容：事件带 `patch` 时比 patch（纯 rebase 复用），没带才退回预检读到的
+     `headRefOid`。`tier` 槽按 `REQUIRED_KEYS["tier"]` 三键齐才算齐（`tier` /
      `reason` / `head_sha`，**缺任一键一律「缺证据」**，不许因为 head 对得上就算齐），
      且档位必须是 `A`/`B`/`C` 之一；`tier=C` 还必须有同 `--pr` 的 `boss_approve`。
      `review:defect` / `review:regression` 两槽的 `verdict` 只认 `pass` / `block` 两个
@@ -846,6 +847,39 @@ $ python3 -m team_board.merge_guard --pr 9 --branch 'refs/heads/wt/t_x' --method
 分支删除 | FAIL | git -C <repo> ls-remote --exit-code --refs origin refs/heads/wt/t_bbeab29f | rc=0 | c5768d4	refs/heads/wt/t_bbeab29f
 结论：合并成功但源分支仍在远端（合并不算完成）
 ```
+
+## 串行汇入（merge-train）
+
+把“并行开发 + 手工逐个合”改成“并行开发 + 单条队列串行汇入”。train 只负责调度与
+`update-branch`，**不绕过** `merge_guard` 的认领 / 证据 / 双问 / rebase / 合并闸门：
+
+```
+team-board merge-train --queue queue.json          # 缺省 dry-run（只读预检 + 证据）
+team-board merge-train --queue queue.json --apply  # 真正 update-branch / merge
+```
+
+队列是 JSON 数组（也接受 `{"queue": [...]}`）：
+
+```json
+[
+  {"pr": 62, "card": "t_12345678", "branch": "wt/t_12345678",
+   "by": "repo/run200", "base": "main"}
+]
+```
+
+- 必填 `pr` / `card` / `branch` / `by`；`by` 必须是 `repo/run<N>`（合并权归 repo）；
+- 可选 `base`（默认 `main`）、`subject`（默认 `Merge PR #<n>（<card>）`）、
+  `body_file`（缺省用 `merge-record --body-out` 生成到
+  `~/.cache/team-board/merge-train/`）；
+- 每条按 `预检 → 证据（patch）→ 可选 update-branch → 等 CI → merge_guard` 执行；
+- 失败记 `bounced`，**队列继续**；只有 `git fetch` 等全局环境错误才停整条；
+- `--apply` 才写远端；同时用 `~/.cache/team-board/merge-train.lock` 的 `flock`
+  保证同一时间只有一条 train；
+- 退出码：`0` 全部 merged / dry-run，`1` 有 bounced，`2` 参数或环境错误。
+
+`update-branch` 走 GitHub API（不 force-push）；更新后重新算内容指纹，patch 变了就
+bounce 回作者重跑双问/证据，patch 没变则复用四槽。分支落后且没给 `--update-branch`
+时也 bounce，交回作者 rebase。
 
 ## 提交身份稽核（commit-audit）
 
@@ -1255,8 +1289,8 @@ PR #50 MERGED
 ## evidence 事件（evidence emit / audit）
 
 `evidence` 有两个动词：`emit` 写入一条事件、`audit` 只读判「四槽齐不齐、是否绑当前
-head」（`audit` 见下一节「证据状态机稽核」）。两者共用父解析器，`evidence --help` 里是
-`{emit,audit}`。
+内容（patch/head）」（`audit` 见下一节「证据状态机稽核」）。两者共用父解析器，
+`evidence --help` 里是 `{emit,audit,patch}`。
 
 ```
 team-board evidence emit --kind KIND (--payload '<json>' | --head SHA ...) [--card t_xxxxxxxx] [--db PATH]
@@ -1271,6 +1305,7 @@ team-board evidence emit --kind KIND (--payload '<json>' | --head SHA ...) [--ca
   JSON → **rc2**；是 JSON 但违反契约（含不是对象）→ **rc1**。
 - 便捷参数（给了就**不许**再给 `--payload`，同给 → **rc2**）—— 把 payload 按键拆开
   写，拼不出来时按契约层同一套规则判 rc1/rc2：`--head SHA`（`head_sha`）、
+  `--patch 40HEX`（内容指纹；`tier` / `qa_pass` / `review` 可用，rebase 后复用证据）、
   `--disc defect|regression`（`review` 的 `kind`）、`--verdict pass|block`
   （`review` 的 `verdict`）、`--tier A|B|C` 与 `--reason TEXT`（`tier`）、
   `--pr N`（`impl_done` / `boss_approve`）、`--run-id RUN`（`qa_pass` 的 `run_id`，
@@ -1310,15 +1345,31 @@ evidence emit: kind=qa_pass card=t_deadbeef run=7 profile=qa event=1 payload={"h
 
 一次成功只追加一行 `task_events`，`kind` 就是 `--kind`，`run_id` 就是那个 running run。
 
+## 内容指纹（evidence patch）
+
+worker 在写 `qa_pass` / `tier` / `review` 前先算一次当前内容指纹，避免 rebase 后重跑：
+
+```
+team-board evidence patch [--repo PATH] [--base REF=origin/main] [--head REV=HEAD] [--json]
+```
+
+stdout 默认只打一行 40 位 hex（可直接 `PATCH=$(...)`）；`--json` 打
+`{kind,value,algo,base,head}`。退出码：`0` patch 可复用 / `1` 空 diff、二进制或取不到
+对象（不可复用）/ `2` 参数或 git 错误。
+
 ## 证据状态机稽核（evidence audit）
 
 ```
-team-board evidence audit --card t_xxxxxxxx --head <40/64 位小写 hex> [--pr N] [--db PATH]
+team-board evidence audit --card t_xxxxxxxx --head <40/64 位小写 hex> \
+  [--patch <40 位小写 hex>] [--pr N] [--db PATH]
 ```
 
 四槽（`tier` / `qa_pass` / `review:defect` / `review:regression`）各取 id 最大的一条，
-按 `角色 → 缺证据 → head → 双问` 的顺序判定；判定逻辑与 `merge_guard` 的证据闸门
-同源（`evidence.judge`），两处给同一份库必须给同一结论。
+按 `角色 → 缺证据 → 内容（patch/head） → 双问` 的顺序判定；判定逻辑与 `merge_guard`
+的证据闸门同源（`evidence.judge`），两处给同一份库必须给同一结论。
+给了 `--patch` 时，事件带 `patch` 的按内容指纹判（纯 rebase 复用）；旧事件没有
+`patch` 才退回 `head_sha`。事件带 `patch` 且给了 `--patch` 时 patch 是权威，head 相同
+但 patch 不同也判失效。
 
 - `tier` 槽按 `REQUIRED_KEYS["tier"]` **三键齐**（`tier` / `reason` / `head_sha`），
   缺任一键记「缺证据」；档位取值域是 `A`/`B`/`C`。
@@ -1331,7 +1382,7 @@ team-board evidence audit --card t_xxxxxxxx --head <40/64 位小写 hex> [--pr N
   出一行 `review kind 域外: 事件 id=… kind=…（…，已丢弃）` 点名，不把「写错 kind」读成
   「没写 review」。
 
-退出码：`0` 四槽齐且全绑 `--head` **且没有解析失败的事件**；`1` 判定不通过（缺证据 /
+退出码：`0` 四槽齐且全绑 `--head` 或 `--patch`（按上一条口径）**且没有解析失败的事件**；`1` 判定不通过（缺证据 /
 证据对新 head 无效 / 双问阻塞 / 缺老板点头 / 证据串卡 / 角色不符）**或有解析失败的事件**；
 `2` 参数或环境错误（`--card` / `--head` / `--pr` 形态非法、库不存在或不是合法 SQLite、
 缺 `task_events` / `task_runs` 表），stderr 恰一行 `错误: …`、stdout 为空。

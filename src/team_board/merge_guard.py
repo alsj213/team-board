@@ -1552,6 +1552,35 @@ def evidence_slots_summary(judgment: evidence.Judgment) -> str:
     return f"tier={tier}, qa_pass=*** review={'+'.join(reviews) or '-'}"
 
 
+def _current_patch(opts: Options, info: Preflight) -> str:
+    """算当前 PR 的内容指纹，供证据 v2 在 head 变更后复用四槽。
+
+    ``ensure_pr_refs`` 把远端 base/head 抓进 ``refs/merge-guard/<pr>/{base,head}``；
+    ``reviewhead.fingerprint`` 的 ``diff-sha256-U0-v1`` 逐字节哈希内容行，纯 rebase
+    不换值。算不出 / 二进制 / 空 diff 一律 rc2 —— 不许把「算不出」读成「内容没变」。
+    """
+
+    ensure_pr_refs(opts, info.base_ref)
+    try:
+        fp = reviewhead.fingerprint(
+            opts.repo, rebase_base_ref(opts.pr), rebase_head_ref(opts.pr)
+        )
+    except reviewhead.PatchIdError as exc:
+        raise MergeGuardError(
+            f"无法计算 PR #{opts.pr} 的内容指纹，不能判定证据能否复用：{exc}；拒绝合并"
+        ) from exc
+    except OSError as exc:
+        raise MergeGuardError(
+            f"计算 PR #{opts.pr} 的内容指纹失败（{exc}）；拒绝合并"
+        ) from exc
+    if fp.kind != "patch" or fp.value is None:
+        raise MergeGuardError(
+            f"PR #{opts.pr} 的内容指纹不可复用（kind={fp.kind}），head 变了必须重跑证据；"
+            "拒绝合并"
+        )
+    return fp.value
+
+
 def evidence_gate(opts: Options, info: Preflight) -> str:
     """**合并前证据状态机闸门**：四槽齐、且全绑预检读到的 ``headRefOid``，否则 rc2。
 
@@ -1596,11 +1625,17 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         ) from exc
     parse_failures = 0
     failure_ids: tuple[int, ...] = ()
+    patch_used: str | None = None
     try:
         events = evidence.collect(conn, impl_card)
         parse_failures = events.parse_failures
         failure_ids = events.parse_failure_ids
         judgment = evidence.judge(events, head, opts.pr)
+        if not judgment.ok and judgment.verdict == evidence.VERDICT_HEAD_MISMATCH:
+            # v2：head 变了但内容没变（纯 rebase）→ 用内容指纹复用四槽证据。
+            # 只在 head 判定失败时才取指纹，正常合并不多发一次 fetch。
+            patch_used = _current_patch(opts, info)
+            judgment = evidence.judge(events, head, opts.pr, patch=patch_used)
     except evidence.EvidenceReadError as exc:
         raise MergeGuardError(
             f"读取实现卡 {impl_card} 的 evidence 事件失败（--db {opts.db_path}）：{exc}；"
@@ -1617,12 +1652,12 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         raise MergeGuardError(
             f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：有 {parse_failures} 条 "
             f"evidence 事件的 payload 解析失败（坏事件 id: {bad}；--db {opts.db_path}）；"
-            f"无法确认槽位的最新证据，拒绝合并（证据必须绑当前 head，R 状态机化）"
+            f"无法确认槽位的最新证据，拒绝合并（证据必须绑当前内容，R 状态机化）"
         )
     if not judgment.ok:
         raise MergeGuardError(
             f"证据闸门拦下 PR #{opts.pr}（实现卡 {impl_card}）：{judgment.verdict}；"
-            f"{judgment.detail}；拒绝合并（证据必须绑当前 head，R 状态机化）"
+            f"{judgment.detail}；拒绝合并（证据必须绑当前内容，R 状态机化）"
         )
     return format_step(
         STEP_EVIDENCE,
@@ -1633,8 +1668,9 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
         # 用 ``shlex.quote`` 转义 —— 无空格时输出与原来逐字相同。
         command=(
             f"PYTHONPATH=src python3 -m team_board.cli evidence audit "
-            f"--card {impl_card} --head {head} --pr {opts.pr} "
-            f"--db {shlex.quote(opts.db_path)}"
+            f"--card {impl_card} --head {head}"
+            + (f" --patch {patch_used}" if patch_used is not None else "")
+            + f" --pr {opts.pr} --db {shlex.quote(opts.db_path)}"
         ),
         rc=0,
         key=evidence_slots_summary(judgment),

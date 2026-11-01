@@ -214,6 +214,7 @@ from . import (
     prclaim,
     pushguard,
     reviewhead,
+    train,
     verifybatch,
     web,
 )
@@ -806,10 +807,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     evidence_audit.add_argument(
+        "--patch",
+        default=None,
+        metavar="40HEX",
+        help=(
+            "当前内容指纹（40 位小写十六进制；给了就按 patch 判，rebase 后可复用证据；"
+            "缺省按 --head 判）"
+        ),
+    )
+    evidence_audit.add_argument(
         "--db",
         default=DEFAULT_DB,
         metavar="PATH",
         help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+
+    patch_cmd = evidence_sub.add_parser(
+        "patch",
+        help="计算当前 PR 的内容指纹（rebase 复用证据用；stdout 一行 40 hex）",
+    )
+    patch_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="git 仓库路径（默认当前目录）",
+    )
+    patch_cmd.add_argument(
+        "--base",
+        default="origin/main",
+        metavar="REF",
+        help="基准 ref（默认 origin/main）",
+    )
+    patch_cmd.add_argument(
+        "--head",
+        default="HEAD",
+        metavar="REV",
+        help="head 提交（默认 HEAD）",
+    )
+    patch_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="输出 JSON（kind/value/algo/base/head）而不是裸指纹",
     )
 
     emit_cmd = evidence_sub.add_parser(
@@ -845,6 +883,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SHA",
         help="要绑定的 head sha（等价于 --payload 里的 head_sha；40 或 64 位小写十六进制）",
+    )
+    emit_cmd.add_argument(
+        "--patch",
+        default=None,
+        metavar="40HEX",
+        help=(
+            "要绑定的内容指纹（等价于 --payload 里的 patch；tier/qa_pass/review 可用；"
+            "40 位小写十六进制）"
+        ),
     )
     emit_cmd.add_argument(
         "--pr",
@@ -976,6 +1023,80 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-worktrees",
         action="store_true",
         help="跑完不删临时 worktree，路径打进摘要（默认删掉）",
+    )
+
+    train_cmd = subparsers.add_parser(
+        "merge-train",
+        help=(
+            "串行汇入队列：预检 / 证据 / update-branch / merge_guard"
+            "（缺省 dry-run，--apply 才写远端）"
+        ),
+    )
+    train_cmd.add_argument(
+        "--queue",
+        required=True,
+        metavar="PATH",
+        help="队列 JSON（数组；元素含 pr/card/branch/by，可选 base/subject/body_file）",
+    )
+    train_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="git 仓库路径（默认当前目录）",
+    )
+    train_cmd.add_argument(
+        "--remote",
+        default="origin",
+        metavar="NAME",
+        help="远端名（默认 origin）",
+    )
+    train_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板库路径（默认 {DEFAULT_DB}）",
+    )
+    train_cmd.add_argument(
+        "--max",
+        type=int,
+        default=5,
+        metavar="N",
+        help="本次最多处理几条（默认 5，必须 ≥1）",
+    )
+    train_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="真正写远端（update-branch / merge）；缺省只做只读预检与证据判定",
+    )
+    train_cmd.add_argument(
+        "--update-branch",
+        action="store_true",
+        help="分支落后时调用 GitHub update-branch（不 force-push）；缺省 bounce 回作者",
+    )
+    train_cmd.add_argument(
+        "--timeout",
+        type=float,
+        default=900.0,
+        metavar="SEC",
+        help="等待新 head / CI 的总超时秒数（默认 900）",
+    )
+    train_cmd.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="轮询间隔秒数（默认 5）",
+    )
+    train_cmd.add_argument(
+        "--body-dir",
+        default=None,
+        metavar="DIR",
+        help="自动生成的认账 body 目录（默认 ~/.cache/team-board/merge-train）",
+    )
+    train_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="以 JSON 输出每一步结果",
     )
 
     serve = subparsers.add_parser(
@@ -2036,6 +2157,12 @@ def _run_evidence_audit(args: argparse.Namespace) -> int:
         except prclaim.ClaimAuditError as exc:
             _write_stderr_error(str(exc))
             return 2
+    patch = args.patch
+    if patch is not None and evidence.PATCH_RE.fullmatch(patch) is None:
+        _write_stderr_error(
+            f"--patch 非法：{patch!r}（应为 40 位小写十六进制的内容指纹）"
+        )
+        return 2
 
     conn = None
     try:
@@ -2048,7 +2175,11 @@ def _run_evidence_audit(args: argparse.Namespace) -> int:
         if conn is not None:
             conn.close()
 
-    judgment = evidence.judge(collection, head, pr)
+    judgment = (
+        evidence.judge(collection, head, pr, patch=patch)
+        if patch is not None
+        else evidence.judge(collection, head, pr)
+    )
     lines = evidence.render(
         judgment,
         card,
@@ -2262,6 +2393,43 @@ def _run_merge_owner_audit(args: argparse.Namespace) -> int:
         )
     return code
 
+def _run_evidence_patch(args: argparse.Namespace) -> int:
+    """``evidence patch``：算当前内容的指纹；rc0 只打 40 hex，供命令替换。
+
+    退出码：0 patch 可复用 / 1 不可复用（empty/binary，不猜成 PASS）/ 2 参数或 git 错误。
+    """
+
+    try:
+        fp = reviewhead.fingerprint(args.repo, args.base, args.head)
+    except reviewhead.PatchIdError as exc:
+        _write_stderr_error(f"计算内容指纹失败：{exc}")
+        return 2
+    except OSError as exc:
+        _write_stderr_error(f"计算内容指纹失败：{exc}")
+        return 2
+    if fp.kind != "patch" or fp.value is None:
+        _write_stderr_error(
+            f"内容指纹不可复用（kind={fp.kind}）；空 diff / 二进制不能当证据"
+        )
+        return 1
+    if args.json:
+        text = json.dumps(
+            {
+                "kind": fp.kind,
+                "value": fp.value,
+                "algo": fp.algo,
+                "base": args.base,
+                "head": args.head,
+            },
+            ensure_ascii=False,
+        )
+    else:
+        text = fp.value
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0
+
+
 def _emit_payload_text(args: argparse.Namespace) -> str:
     """把 ``--payload`` 或便捷参数拼成 payload JSON 文本（参数错一律抛 StoreError → rc2）。
 
@@ -2278,7 +2446,7 @@ def _emit_payload_text(args: argparse.Namespace) -> str:
 
     convenience = {
         flag: getattr(args, flag, None)
-        for flag in ("head", "disc", "verdict", "tier", "reason", "pr", "run_id")
+        for flag in ("head", "patch", "disc", "verdict", "tier", "reason", "pr", "run_id")
     }
     given = sorted(flag for flag, value in convenience.items() if value is not None)
     if args.payload is not None:
@@ -2293,6 +2461,7 @@ def _emit_payload_text(args: argparse.Namespace) -> str:
     built: dict[str, object] = {}
     for flag, key in (
         ("head", "head_sha"),
+        ("patch", "patch"),
         ("disc", "kind"),
         ("verdict", "verdict"),
         ("tier", "tier"),
@@ -2303,7 +2472,9 @@ def _emit_payload_text(args: argparse.Namespace) -> str:
         value = convenience[flag]
         if value is None:
             continue
-        if required is None or key in required:
+        if required is None or key in required or (
+            key == "patch" and args.kind in evidence.PATCH_KINDS
+        ):
             built[key] = (
                 _parse_positive_int("--" + flag.replace("_", "-"), str(value))
                 if key in ("pr", "run_id")
@@ -2312,11 +2483,11 @@ def _emit_payload_text(args: argparse.Namespace) -> str:
         elif flag != "run_id":
             raise evidence_store.EvidenceStoreError(
                 f"--{flag} 不适用于 kind={args.kind}（该 kind 的 payload 键："
-                f"{list(required)}）"
+                f"{sorted(set(required) | ({'patch'} if args.kind in evidence.PATCH_KINDS else set()))}）"
             )
     if not built:
         raise evidence_store.EvidenceStoreError(
-            "缺 --payload（或至少一个便捷参数 --head/--disc/--verdict/--tier/"
+            "缺 --payload（或至少一个便捷参数 --head/--patch/--disc/--verdict/--tier/"
             "--reason/--pr/--run-id）"
         )
     return json.dumps(built, ensure_ascii=False)
@@ -2373,13 +2544,15 @@ def _run_evidence_emit(args: argparse.Namespace) -> int:
 
 
 def _run_evidence(args: argparse.Namespace) -> int:
-    """``evidence`` 子命令总入口：按 ``evidence_command`` 分派 ``emit`` / ``audit``。"""
+    """``evidence`` 子命令总入口：按 ``evidence_command`` 分派 ``emit`` / ``audit`` / ``patch``。"""
 
     action = getattr(args, "evidence_command", None)
     if action == "emit":
         return _run_evidence_emit(args)
     if action == "audit":
         return _run_evidence_audit(args)
+    if action == "patch":
+        return _run_evidence_patch(args)
     _write_stderr_error(f"未知的 evidence 动词: {action}")  # pragma: no cover
     return 2
 
@@ -2394,6 +2567,78 @@ def _write_summary_before_commit(summary: str) -> None:
 
     if not _write_stdout(summary):
         raise _StdoutUnwritable
+
+
+def _run_merge_train(args: argparse.Namespace) -> int:
+    """``merge-train``：队列串行汇入；缺省 dry-run，``--apply`` 才写远端。"""
+
+    if args.max < 1:
+        _write_stderr_error(f"--max 必须 ≥1（收到 {args.max}）")
+        return 2
+    if args.timeout <= 0 or args.interval <= 0:
+        _write_stderr_error("--timeout / --interval 必须 > 0")
+        return 2
+    try:
+        items = train.load_queue(args.queue)
+    except (OSError, train.TrainError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    opts = train.TrainOptions(
+        repo=args.repo,
+        db_path=args.db,
+        remote=args.remote,
+        max_items=args.max,
+        dry_run=not args.apply,
+        update_branch=args.update_branch,
+        timeout=args.timeout,
+        interval=args.interval,
+        body_dir=args.body_dir,
+    )
+
+    lock = None
+    if args.apply:
+        try:
+            import fcntl
+
+            lock_path = Path.home() / ".cache" / "team-board" / "merge-train.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = lock_path.open("w", encoding="utf-8")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (ImportError, OSError) as exc:
+            if lock is not None:
+                lock.close()
+            _write_stderr_error(f"拿 merge-train 锁失败：{exc}")
+            return 2
+
+    try:
+        results = train.run_train(items, opts)
+    except train.TrainError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if lock is not None:
+            lock.close()
+
+    if args.json:
+        text = json.dumps(
+            [
+                {
+                    "pr": result.pr,
+                    "status": result.status,
+                    "detail": result.detail,
+                    "head": result.head,
+                    "patch": result.patch,
+                }
+                for result in results
+            ],
+            ensure_ascii=False,
+        )
+    else:
+        text = "\n".join(result.render() for result in results)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 1 if any(result.status == "bounced" for result in results) else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2435,6 +2680,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "verify-batch":
         return _run_verify_batch(args)
+
+    if args.command == "merge-train":
+        return _run_merge_train(args)
 
     if args.command == "serve":
         return _run_serve(args)
