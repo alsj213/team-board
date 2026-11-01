@@ -9,8 +9,11 @@
 - E2（执行层，§4）：``run_groups`` 每组一个临时 worktree、组级检查跑一次、unit 自检逐条跑，
   日志落 ``<log_dir>/batch-<batch_id>.log``；``write_batch_json`` 每组一个账本（§5）；
   ``render_summary`` 只回摘要、**不打印**任何原始输出（本模块也确实不 print —— 打印归 E3 的 CLI）。
+- E4（§4 emit 行 + §6 审计）：``emit_commands`` 把逐 unit 的 ``evidence emit`` **命令原文**交给摘要
+  （只打印，**不执行、不写事件** —— 契约 §0 D2 的角色边界）；``audit_qa_runs`` 只读扫
+  ``task_runs``，判 qa 的 run 有没有带合法的 ``batch_id``。
 
-没接 CLI 的边界（E3 的活）：本模块不做 argparse、不决定 rc0/1/2、不打 ``--dry-run`` 的压缩率行。
+没接 CLI 的边界（E3/E4 的活）：本模块不做 argparse、不决定 rc0/1/2、不打 ``--dry-run`` 的压缩率行。
 
 三条容易写错的契约点，写在这里免得下游再猜：
 
@@ -34,6 +37,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 
 # bandit B404 假阳性：只用于调用固定的 git 可执行文件（见 _git / _git_raw）与 plan 里的检查命令，
 # 调用形式一律 argv 列表、shell=False，不拼 shell 字符串
@@ -45,31 +49,47 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# bandit 无关：只读连接一律经 ``db.connect``（``mode=ro``，不建表、不写），本模块不直接拼连接串
+from team_board import db as board_db
 from team_board import gatelog
 
 __all__ = [
+    "AUDIT_BAD",
+    "AUDIT_MISSING",
+    "AUDIT_NOFILE",
+    "AUDIT_OK",
     "CARD_RE",
     "DEFAULT_BASE",
+    "DEFAULT_BATCH_DIR",
     "DEFAULT_GROUP_CHECKS",
     "ECHO_LIMIT",
+    "EMIT_PREFIX",
     "GIT_TIMEOUT_S",
     "KIND_HEAD",
     "KIND_PATCH",
     "KIND_SOLO",
     "MAX_PR",
+    "QA_PROFILE",
+    "RUN_ID_PLACEHOLDER",
     "SHORT_SHA_LEN",
     "VERDICT_FAIL",
     "VERDICT_PASS",
+    "AuditEntry",
+    "AuditReport",
     "Group",
     "GroupRun",
     "Plan",
     "Unit",
     "UnitResult",
     "VerifyBatchError",
+    "audit_qa_runs",
     "batch_id_for",
     "build_groups",
+    "emit_commands",
     "load_plan",
     "patch_id",
+    "render_audit",
+    "render_audit_json",
     "render_summary",
     "resolve_head",
     "run_groups",
@@ -110,9 +130,28 @@ DEFAULT_GROUP_CHECKS: tuple[tuple[str, ...], ...] = (
     (sys.executable, "-m", "mypy"),
 )
 
+#: 摘要里 ``emit:`` 行的前缀（§4 示例逐字）
+EMIT_PREFIX = "emit: "
+
+#: ``emit`` 命令里的 run_id 占位符（§4 示例逐字）：由各卡自己的 qa run 替换成真实 run 号 ——
+#: 本模块不猜、**不执行**这条命令（契约 §0 D2：一次 qa run 只能给自己那张卡写 qa_pass）
+RUN_ID_PLACEHOLDER = "<你的 run_id>"
+
+#: 审计只看这个 profile 的 run（§6 逐字：``task_runs WHERE profile='qa'``）
+QA_PROFILE = "qa"
+
+#: 批次账本目录缺省值（§6 ``--batch-dir`` 默认 ``evidence``）
+DEFAULT_BATCH_DIR = gatelog.LOG_DIR_DEFAULT
+
+#: §6 的四种判定（三类违规 + 一种合规，封闭取值；没有「未知」）
+AUDIT_OK = "OK"
+AUDIT_MISSING = "MISSING"
+AUDIT_BAD = "BAD"
+AUDIT_NOFILE = "NOFILE"
+
 
 class VerifyBatchError(Exception):
-    """``verify-batch`` 的参数/环境级错误（CLI 层转 rc2 一行 ``错误: …``）。"""
+    """``verify-batch`` / ``verify-batch-audit`` 的参数或环境级错误（CLI 层转 rc2 一行 ``错误: …``）。"""
 
 
 # --------------------------------------------------------------------------- 数据类型
@@ -949,6 +988,32 @@ def write_batch_json(
     return tuple(paths)
 
 
+def emit_commands(run: GroupRun) -> tuple[str, ...]:
+    """逐 unit 一条 ``evidence emit`` **命令原文**（§4 最后一段），FAIL 的 unit 不给。
+
+    契约 §0 D2 的角色边界：``verify-batch`` 不写任何事件。``evidence emit`` 的身份规则是
+    ``--card`` 必须逐字等于调用者自己的卡，所以这些命令只能由**各卡自己的 qa run** 照抄执行 ——
+    本函数只拼字符串，不调用 :mod:`team_board.evidence`、不碰任何库（一次 ``subprocess`` 都没有）。
+
+    三条硬点：
+
+    - 每条都逐字含 ``evidence emit --kind qa_pass``（断言用的固定片段，不随格式化漂移）；
+    - ``head_sha`` 用**该 unit 自己的** ``UnitResult.head_sha``（解析后的 40 位 sha，不是 plan 里的
+      rev —— 分支名会被推新提交顶掉，sha 不会）；
+    - ``--card`` 用该 unit 的卡号；``run_id`` 留 :data:`RUN_ID_PLACEHOLDER` 占位符，不猜、不填 0。
+
+    FAIL 的 unit 不生成命令（§4「缺证据即不许合并」）：没有 PASS 就没有 qa_pass 事件可写。
+    """
+
+    return tuple(
+        f"PYTHONPATH=src python -m team_board.cli evidence emit --kind qa_pass "
+        f"--payload '{{\"head_sha\":\"{result.head_sha}\",\"run_id\":{RUN_ID_PLACEHOLDER}}}' "
+        f"--card {result.card}"
+        for result in run.results
+        if result.verdict == VERDICT_PASS
+    )
+
+
 def render_summary(
     runs: Sequence[GroupRun], *, batch_dir: str | os.PathLike[str] = gatelog.LOG_DIR_DEFAULT
 ) -> str:
@@ -1000,4 +1065,191 @@ def render_summary(
     for run in runs:
         lines.append(f"log: {run.log_path}")
         lines.append(f"batch-json: {_batch_json_path(batch_dir, run.group.batch_id)}")
+    # §4 最后一段：逐 unit 一条 emit 命令原文（只打印，不执行 —— 契约 §0 D2）。
+    # FAIL 的 unit 不占位，所以「有失败就没有 emit 行」这件事在摘要上一眼可数。
+    for run in runs:
+        lines.extend(f"{EMIT_PREFIX}{command}" for command in emit_commands(run))
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- 审计（§6）
+#
+# 口径逐字取自契约 §6「qa run 必须带 batch_id（E4）」：
+#   扫 ``task_runs WHERE profile='qa' AND started_at >= --since AND status != 'running'``；
+#   batch_id 来源二选一（``metadata`` JSON 的 ``batch_id``，或 ``summary`` 里顶格一行
+#   ``batch_id: b-[0-9a-f]{8}``）；缺 → MISSING、形态坏 → BAD、没有
+#   ``batch-<batch_id>.json`` → NOFILE，三类都算违规。
+# **只读**（``db.connect`` 就是 ``mode=ro``）：不建表、不写，跑完库的 md5 不变。
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """一条 qa run 的审计结果（§6 的一行 ``OK|MISSING|BAD|NOFILE run <id> card <task> started <ts>``）。"""
+
+    run_id: int
+    card: str
+    started_at: int
+    status: str
+    batch_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    """一次审计的全部结果（``since`` / ``batch_dir`` 留痕，便于回放同一口径）。"""
+
+    since: int
+    batch_dir: str
+    entries: tuple[AuditEntry, ...]
+
+    @property
+    def total(self) -> int:
+        """扫到的 qa run 条数（= 摘要末行的 ``N``）。"""
+
+        return len(self.entries)
+
+    @property
+    def violations(self) -> int:
+        """违规条数（= 摘要末行的 ``M``；MISSING / BAD / NOFILE 三类都算）。"""
+
+        return sum(1 for entry in self.entries if entry.status != AUDIT_OK)
+
+
+#: ``summary`` 里声明 batch_id 的那一行：**顶格**（第 0 列）起头，值不许带空白
+_SUMMARY_BATCH_ID_RE = re.compile(r"^batch_id[ \t]*:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
+
+#: §6 的取数语句。列名全是本模块常量级的字面量，没有外部输入拼进 SQL（bandit B608 假阳性）
+_QA_RUNS_SQL = """
+SELECT r.id, r.task_id, r.started_at, r.summary, r.metadata
+  FROM task_runs AS r
+ WHERE r.profile = ? AND r.started_at >= ? AND r.status != 'running'
+ ORDER BY r.started_at, r.id
+"""  # nosec B608
+
+
+def _declared_from_metadata(metadata: object) -> tuple[bool, object]:
+    """``metadata`` JSON 里的 ``batch_id``：``(是否声明, 原值)``。
+
+    ``metadata`` 是看板内核的自由字段：不是 JSON、不是对象、没这个键 → 视为「没声明」，
+    退回 ``summary`` 那条路（两种来源是「二选一」，不是「必须都有」）。声明了但类型/形态
+    不对 → 由 :func:`_judge_batch_id` 判 ``BAD``，**不静默退回 summary**（那会把写坏字段盖过去）。
+    """
+
+    if not isinstance(metadata, str) or not metadata.strip():
+        return False, None
+    try:
+        payload = json.loads(metadata)
+    except (TypeError, ValueError):
+        return False, None
+    if not isinstance(payload, dict) or "batch_id" not in payload:
+        return False, None
+    return True, payload["batch_id"]
+
+
+def _declared_from_summary(summary: object) -> tuple[bool, object]:
+    """``summary`` 顶格一行 ``batch_id: <值>``：``(是否声明, 原值)``（取第一条命中）。"""
+
+    if not isinstance(summary, str):
+        return False, None
+    match = _SUMMARY_BATCH_ID_RE.search(summary)
+    if match is None:
+        return False, None
+    return True, match.group(1)
+
+
+def _judge_batch_id(
+    summary: object, metadata: object, batch_dir: str | os.PathLike[str]
+) -> tuple[str, str | None]:
+    """一条 run 的 §6 判定：``(status, batch_id 原文或 None)``。"""
+
+    declared, raw = _declared_from_metadata(metadata)
+    if not declared:
+        declared, raw = _declared_from_summary(summary)
+    if not declared:
+        return AUDIT_MISSING, None
+    if not isinstance(raw, str) or _BATCH_ID_RE.match(raw) is None:
+        # 非字符串（``123`` / ``None`` / 对象）与形态坏同等处理：都是「写错了」，不是「没写」
+        return AUDIT_BAD, raw if isinstance(raw, str) else None
+    if not os.path.isfile(_batch_json_path(batch_dir, raw)):
+        return AUDIT_NOFILE, raw
+    return AUDIT_OK, raw
+
+
+def audit_qa_runs(
+    db_path: str | os.PathLike[str],
+    since: int,
+    batch_dir: str | os.PathLike[str] = DEFAULT_BATCH_DIR,
+) -> AuditReport:
+    """只读审计：qa 的 run 有没有带合法的 ``batch_id``（§6）。
+
+    - ``since`` 必填、不设默认值（本规则不回溯，否则历史 qa run 全红）；非整数或负数 →
+      :class:`VerifyBatchError`（CLI 层 rc2）；
+    - 库不可用 / 没有 ``task_runs`` 表 / 读失败 → :class:`VerifyBatchError`（rc2，不是「有违规」）；
+    - ``batch_dir`` 下没有 ``batch-<batch_id>.json`` → 该条 ``NOFILE``（目录整个不存在也一样，
+      不静默放过：账本没了就等于证据没了）。
+    """
+
+    if isinstance(since, bool) or not isinstance(since, int):
+        raise VerifyBatchError(f"since 须为整数 epoch 秒：{_echo(since)}")
+    if since < 0:
+        raise VerifyBatchError(f"since 不许为负数（epoch 秒）：{since}")
+
+    directory = os.path.abspath(os.fspath(batch_dir))
+    source = os.fspath(db_path)
+    conn = None
+    try:
+        conn = board_db.connect(source)
+        rows = conn.execute(_QA_RUNS_SQL, (QA_PROFILE, since)).fetchall()
+    except board_db.BoardError as exc:
+        raise VerifyBatchError(f"看板库不可用: {exc}") from exc
+    except sqlite3.Error as exc:
+        raise VerifyBatchError(f"读 task_runs 失败（{source}）: {exc}") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+    entries = []
+    for row in rows:
+        status, batch_id = _judge_batch_id(row[3], row[4], directory)
+        entries.append(
+            AuditEntry(
+                run_id=int(row[0]),
+                card=str(row[1]),
+                started_at=int(row[2]),
+                status=status,
+                batch_id=batch_id,
+            )
+        )
+    return AuditReport(since=since, batch_dir=directory, entries=tuple(entries))
+
+
+def render_audit(report: AuditReport) -> str:
+    """渲染 §6 的 stdout（不带尾随换行）：逐条一行 + 末行 ``结论: N 条 qa run，违规 M 条``。"""
+
+    lines = [
+        f"{entry.status} run {entry.run_id} card {entry.card} started {entry.started_at}"
+        for entry in report.entries
+    ]
+    lines.append(f"结论: {report.total} 条 qa run，违规 {report.violations} 条")
+    return "\n".join(lines)
+
+
+def render_audit_json(report: AuditReport) -> str:
+    """``--json``：与 :func:`render_audit` 同源的机器可读形态（``sort_keys``，可回放比对）。"""
+
+    payload = {
+        "since": report.since,
+        "batch_dir": report.batch_dir,
+        "total": report.total,
+        "violations": report.violations,
+        "runs": [
+            {
+                "run": entry.run_id,
+                "card": entry.card,
+                "started": entry.started_at,
+                "status": entry.status,
+                "batch_id": entry.batch_id,
+            }
+            for entry in report.entries
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)

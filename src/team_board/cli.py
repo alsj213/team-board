@@ -232,6 +232,9 @@ _LOCAL_BINDS = frozenset({"127.0.0.1", "localhost"})
 #: ASCII 数字（``"١٢٣"`` → 123），比 README 表格的「1–65535 的整数」宽得多。
 _PORT_DIGITS = re.compile(r"[0-9]+", re.ASCII)
 
+#: ``verify-batch-audit --since`` 只接受 ASCII 十进制（同一份理由，见 :func:`_parse_epoch`）
+_EPOCH_DIGITS = re.compile(r"[0-9]+", re.ASCII)
+
 #: ``--pr`` 的上限：唯一定义在 :data:`team_board.prclaim.MAX_PR`（PR 号池只有一个
 #: 口径）。GitHub 的 PR 号是仓库内递增计数，9 位（< 2**31）已经远超任何真实仓库；
 #: 13 位毫秒（``1793160000000``）与天文数字（``99999999999999999999``）都属
@@ -296,6 +299,22 @@ def _parse_port(value: str) -> int:
     return port
 
 
+def _parse_epoch(value: str) -> int:
+    """``verify-batch-audit --since``：纯 ASCII 十进制、非负的 epoch 秒，否则 rc2。
+
+    为什么不直接 ``type=int``：``int()`` 会静默接受 ``" 1793510469"``（空白）、``"+1793"``
+    （正号）、``"1_793"``（下划线）和 ``"١٢٣"``（阿拉伯-印度数字）—— 一个手滑多打的空格
+    就变成「扫全库」，看起来 rc0 其实口径全变了，所以全拒。
+    ``--since`` 没有默认值（§6「本规则不回溯」）：不给就是 argparse 级 rc2。
+    """
+
+    if not isinstance(value, str) or _EPOCH_DIGITS.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"--since 应为非负的 ASCII 十进制 epoch 秒: {value!r}"
+        )
+    return int(value)
+
+
 def _parse_bind(value: str) -> str:
     """``serve --bind``：只接受本机地址，其它（含 ``0.0.0.0``、空串、IPv6 字面量）rc2。"""
     if value not in _LOCAL_BINDS:
@@ -306,10 +325,10 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十七个**子命令（个数以
+    """建 CLI 前端：prog=team-board，共**十九个**子命令（个数以
     ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
     不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
-    与 README 的「共十七个子命令」同源）。
+    与 README 的「共十九个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -350,6 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
       环境错误），吃 ``--plan`` / ``--repo`` / ``--dry-run`` / ``--log-dir`` /
       ``--keep-worktrees``；stdout 只回摘要，全量输出落
       ``<log-dir>/batch-<batch_id>.log``；
+    - ``verify-batch-audit``：稽核 qa 的 run 有没有带合法 batch_id（0 无违规 / 1 有违规 /
+      2 参数或库不可用），吃 ``--db`` / ``--since``（必填）/ ``--batch-dir`` / ``--json``，
+      **只读**（``mode=ro`` 一条 SELECT）；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -976,6 +998,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-worktrees",
         action="store_true",
         help="跑完不删临时 worktree，路径打进摘要（默认删掉）",
+    )
+
+    vba_cmd = subparsers.add_parser(
+        "verify-batch-audit",
+        help=(
+            "稽核 qa 的 run 是否都带合法 batch_id（0 无违规 / 1 有违规 / 2 参数或库不可用）"
+        ),
+    )
+    vba_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（mode=ro；默认 {DEFAULT_DB}）",
+    )
+    vba_cmd.add_argument(
+        "--since",
+        required=True,
+        default=None,
+        type=_parse_epoch,
+        metavar="EPOCH",
+        help=(
+            "只看 started_at >= EPOCH 的 qa run（必填、无默认值：本规则不回溯，"
+            "否则历史 qa run 全红）"
+        ),
+    )
+    vba_cmd.add_argument(
+        "--batch-dir",
+        default=verifybatch.DEFAULT_BATCH_DIR,
+        metavar="DIR",
+        help=(
+            f"批次账本目录（默认 {verifybatch.DEFAULT_BATCH_DIR}，相对当前目录）；"
+            "目录下没有 batch-<batch_id>.json 判 NOFILE"
+        ),
+    )
+    vba_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="输出 JSON 报告（字段与逐条摘要同源）",
     )
 
     serve = subparsers.add_parser(
@@ -1813,6 +1873,32 @@ def _run_verify_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_verify_batch_audit(args: argparse.Namespace) -> int:
+    """``verify-batch-audit`` 子命令：qa 的 run 有没有带合法 ``batch_id``（契约 §6）。
+
+    退出码：**0** 无违规 / **1** 有违规（MISSING / BAD / NOFILE）/ **2** 参数或库不可用。
+
+    库不可用、``task_runs`` 表不存在、``since`` 不合规一律 rc2 且 stdout 0 字节 ——
+    「读不到库」不许长得像「没有违规」（那是把闸门做成白名单）。
+    只读：取数走 ``verifybatch.audit_qa_runs`` → ``db.connect``（``mode=ro``）。
+    """
+
+    try:
+        report = verifybatch.audit_qa_runs(args.db, args.since, args.batch_dir)
+    except verifybatch.VerifyBatchError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    text = (
+        verifybatch.render_audit_json(report)
+        if args.json
+        else verifybatch.render_audit(report)
+    )
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 1 if report.violations else 0
+
+
 def _run_output_audit(args: argparse.Namespace) -> int:
     """``output-audit`` 子命令：读失败一律 stderr 一行 ``错误: …`` + rc2。
 
@@ -2435,6 +2521,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "verify-batch":
         return _run_verify_batch(args)
+
+    if args.command == "verify-batch-audit":
+        return _run_verify_batch_audit(args)
 
     if args.command == "serve":
         return _run_serve(args)

@@ -51,6 +51,7 @@ EXPECTED_SUBCOMMANDS = (
     "evidence",
     "merge-owner-audit",
     "verify-batch",
+    "verify-batch-audit",
     "serve",
 )
 
@@ -70,6 +71,7 @@ CN_DIGITS = {
     16: "十六",
     17: "十七",
     18: "十八",
+    19: "十九",
 }
 
 
