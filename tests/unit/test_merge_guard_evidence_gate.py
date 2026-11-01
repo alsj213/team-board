@@ -60,16 +60,33 @@ def four_slots(
     tier: str = "B",
     qa_head: str | None = None,
     with_qa: bool = True,
+    patch: str | None = None,
 ) -> list[tuple[str, str, int | None]]:
-    """四槽齐的默认证据集（``head`` 全绑当前 head；qa_head 可单独指旧 head）。"""
+    """四槽齐的默认证据集（``head`` 全绑当前 head；qa_head 可单独指旧 head）。
+
+    ``patch`` 非空时四槽都带同一个内容指纹（v2 rebase 复用场景）。
+    """
+
+    def with_patch(payload: dict[str, object]) -> dict[str, object]:
+        return {**payload, "patch": patch} if patch is not None else payload
 
     rows = [
-        e_row("tier", {"tier": tier, "reason": "文档 + 单测", "head_sha": head}, 1),
-        e_row("review", {"kind": "defect", "head_sha": head, "verdict": "pass"}, 2),
-        e_row("review", {"kind": "regression", "head_sha": head, "verdict": "pass"}, 1),
+        e_row("tier", with_patch({"tier": tier, "reason": "文档 + 单测", "head_sha": head}), 1),
+        e_row(
+            "review",
+            with_patch({"kind": "defect", "head_sha": head, "verdict": "pass"}),
+            2,
+        ),
+        e_row(
+            "review",
+            with_patch({"kind": "regression", "head_sha": head, "verdict": "pass"}),
+            1,
+        ),
     ]
     if with_qa:
-        rows.append(e_row("qa_pass", {"head_sha": qa_head or head, "run_id": 2}, 2))
+        rows.append(
+            e_row("qa_pass", with_patch({"head_sha": qa_head or head, "run_id": 2}), 2)
+        )
     return rows
 
 
@@ -345,6 +362,38 @@ def test_pass_line_after_head_sha_and_before_merge(
     evidence = next(i for i, line in enumerate(lines) if line.startswith("证据状态机 | PASS |"))
     merge = next(i for i, line in enumerate(lines) if line.startswith("合并 | PASS |"))
     assert head < evidence < merge
+
+
+def test_rebase_reuses_patch_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """v2：四槽绑旧 head、但 patch 与当前内容一致 → 纯 rebase 后照样合并。"""
+
+    patch = "c" * 40
+    rc, out, err = run_main(
+        tmp_path, monkeypatch, capsys, events=four_slots(head=OLD_OID, patch=patch)
+    )
+
+    assert (rc, err) == (0, "")
+    evidence = next(
+        line for line in out.splitlines() if line.startswith("证据状态机 | PASS |")
+    )
+    assert f"--patch {patch}" in evidence
+
+
+def test_changed_patch_still_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """内容变了（patch 不同）时 head 变了也照旧拒：patch 不是免死金牌。"""
+
+    rc, out, err = run_main(
+        tmp_path, monkeypatch, capsys, events=four_slots(head=OLD_OID, patch="d" * 40)
+    )
+
+    assert rc == 2
+    assert out == ""
+    assert "证据对新 head 无效" in err
+    assert "patch" in err
 
 
 def test_tier_c_with_boss_approve_passes(

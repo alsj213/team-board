@@ -86,6 +86,13 @@ REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
 #: ``head_sha`` 的形态：40 或 64 位小写十六进制（整串 fullmatch；缩写/大写/空白都不算）
 HEAD_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$", re.ASCII)
 
+#: 可携带内容指纹的 kind（v2 增量）。旧事件没有 ``patch`` 仍按 ``head_sha`` 判；
+#: 新事件两者都给，rebase 后 patch 不变 → 证据继续有效。
+PATCH_KINDS: frozenset[str] = frozenset({"tier", "qa_pass", "review"})
+
+#: ``patch`` 的形态：40 位小写十六进制（``reviewhead.Fingerprint.value`` 的唯一形态）
+PATCH_RE = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
+
 #: 卡分支的唯一形态：``wt/t_<8 位小写十六进制>``（整串 fullmatch）
 BRANCH_RE = re.compile(r"^wt/(t_[0-9a-f]{8})$")
 
@@ -200,6 +207,15 @@ def _check_head(key: str, value: object) -> str:
     return value
 
 
+def _check_patch(key: str, value: object) -> str:
+    """``patch``：40 位小写十六进制内容指纹（不做前缀/大小写归一）。"""
+    if not isinstance(value, str) or PATCH_RE.fullmatch(value) is None:
+        raise ValueError(
+            f"payload['{key}'] 非法：{value!r}（应为 40 位小写十六进制的内容指纹）"
+        )
+    return value
+
+
 def _check_run_id(key: str, value: object) -> int:
     """``run_id``：正整数 int（bool 不算）。"""
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -253,11 +269,18 @@ def validate_payload(kind: str, payload: Mapping[str, object]) -> dict[str, obje
         raise ValueError(
             f"payload 缺键：{'/'.join(absent)}（kind={kind}；实际键：{sorted(actual)}）"
         )
-    extra = sorted(actual - set(required))
+    allowed = set(required) | ({"patch"} if kind in PATCH_KINDS else set())
+    extra = sorted(actual - allowed)
     if extra:
         raise ValueError(
-            f"payload 多键：{'/'.join(extra)}（kind={kind}；允许键：{list(required)}）"
+            f"payload 多键：{'/'.join(extra)}（kind={kind}；允许键：{sorted(allowed)}）"
         )
+
+    def _with_patch(normalized: dict[str, object]) -> dict[str, object]:
+        """v2：``patch`` 可选；有就校验并保留，没有就只按旧口径返回。"""
+        if "patch" in payload:
+            normalized["patch"] = _check_patch("patch", payload["patch"])
+        return normalized
 
     if kind == "spec_sign":
         return {}
@@ -267,22 +290,22 @@ def validate_payload(kind: str, payload: Mapping[str, object]) -> dict[str, obje
             "head_sha": _check_head("head_sha", payload["head_sha"]),
         }
     if kind == "tier":
-        return {
+        return _with_patch({
             "tier": _check_choice("tier", payload["tier"], TIERS),
             "reason": _check_reason("reason", payload["reason"]),
             "head_sha": _check_head("head_sha", payload["head_sha"]),
-        }
+        })
     if kind == "qa_pass":
-        return {
+        return _with_patch({
             "head_sha": _check_head("head_sha", payload["head_sha"]),
             "run_id": _check_run_id("run_id", payload["run_id"]),
-        }
+        })
     if kind == "review":
-        return {
+        return _with_patch({
             "kind": _check_choice("kind", payload["kind"], REVIEW_KINDS),
             "head_sha": _check_head("head_sha", payload["head_sha"]),
             "verdict": _check_choice("verdict", payload["verdict"], REVIEW_VERDICTS),
-        }
+        })
     # boss_approve
     approved_by = payload["approved_by"]
     if approved_by != "boss":
@@ -376,27 +399,54 @@ def _tier_is_legal(value: object) -> bool:
     return isinstance(value, str) and value in TIERS
 
 
+def _content_matches(payload: Mapping[str, object], head: str, patch: str | None) -> bool:
+    """槽位是否绑当前内容：有 patch 时以 patch 为权威，否则按 head。
+
+    调用方给了 ``patch`` 且事件里也带 ``patch`` 时，只比 patch（即使 head 相同但 patch
+    不同，也判失效）；事件是旧格式（没有 patch）才退回 head。``patch`` 为 ``None`` 时
+    完全走旧口径 —— 迁移期两种事件可以并存。
+    """
+
+    if patch is not None and "patch" in payload:
+        return payload.get("patch") == patch
+    return payload.get("head_sha") == head
+
+
+def _content_mismatch(payload: Mapping[str, object], head: str, patch: str | None) -> str:
+    """失效槽位的 detail 文案：能说 patch 就不说 head，方便定位是哪一层变了。"""
+
+    if patch is not None and "patch" in payload:
+        return f"patch {_short(payload.get('patch'))} != {_short(patch)}"
+    return f"head {_short(payload.get('head_sha'))} != {_short(head)}"
+
+
 def judge(
     events: Iterable[Event],
     head: str,
     pr: int | None = None,
     tier_required: str | None = None,
+    patch: str | None = None,
 ) -> Judgment:
-    """判「四槽证据是否齐、是否绑 ``head``」（纯函数；不查库、不解 JSON）。
+    """判「四槽证据是否齐、是否绑当前内容」（纯函数；不查库、不解 JSON）。
 
     四槽（:data:`REQ_SLOTS`）各取 id 最大的一条，逐槽按
-    ``角色 → 缺证据 → head → 双问`` 的顺序定状态；四个之外再补两条：
+    ``角色 → 缺证据 → 内容（patch/head） → 双问`` 的顺序定状态；四个之外再补两条：
     ``impl_done`` 存在但 ``pr`` 不等 → 证据串卡；``tier == "C"`` 必须有 ``pr`` 相等的
     ``boss_approve``。多个问题同时存在时按 :data:`VERDICT_PRIORITY` 取最左一个当
     verdict，其余问题写进 :attr:`Judgment.detail`。
 
     ``pr`` 为 ``None``（``--pr`` 没给）时跳过依赖 PR 相等的两条判定；
-    ``tier_required`` 给了值就要求 tier 槽位证据的档位**恰好等于**它。
+    ``tier_required`` 给了值就要求 tier 槽位证据的档位**恰好等于**它；
+    ``patch`` 给了值且事件带 ``patch`` 时按 patch 判（rebase 复用证据），否则按 head。
 
-    tier 槽在 head 之外还要求 ``payload['tier']`` 落在 :data:`TIERS`（``A``/``B``/``C``）
+    tier 槽在内容之外还要求 ``payload['tier']`` 落在 :data:`TIERS`（``A``/``B``/``C``）
     里 —— 缺键 / 非字符串 / 取值域外一律记 ``missing``（verdict 落「缺证据」），
-    不许「head 对得上就算齐」。
+    不许「内容对得上就算齐」。
     """
+    if patch is not None and PATCH_RE.fullmatch(patch) is None:
+        raise ValueError(
+            f"patch 非法：{patch!r}（应为 40 位小写十六进制的内容指纹）"
+        )
     ordered = tuple(events)
     slots: list[Slot] = []
     missing: list[str] = []
@@ -430,10 +480,10 @@ def judge(
                     f"tier：档位证据缺键 {'/'.join(absent)}"
                     f"（三键必须齐：{'/'.join(REQUIRED_KEYS['tier'])}）"
                 )
-            elif event.payload.get("head_sha") != head:
+            elif not _content_matches(event.payload, head, patch):
                 state = SLOT_HEAD_MISMATCH
                 problems[VERDICT_HEAD_MISMATCH].append(
-                    f"{name}：{_short(event.payload.get('head_sha'))} != {_short(head)}"
+                    f"{name}：{_content_mismatch(event.payload, head, patch)}"
                 )
             elif name == "tier" and not _tier_is_legal(event.payload.get("tier")):
                 # tier 槽的档位是「本 PR 走哪一档」的唯一依据：缺键 / 非字符串 /
@@ -497,7 +547,12 @@ def judge(
             break
 
     if verdict == VERDICT_PASS:
-        detail = f"四槽齐且绑定 head {_short(head)}" + ("" if pr is None else f"（pr #{pr}）")
+        target = (
+            f"patch {_short(patch)} / head {_short(head)}"
+            if patch is not None
+            else f"head {_short(head)}"
+        )
+        detail = f"四槽齐且绑定当前内容（{target}）" + ("" if pr is None else f"（pr #{pr}）")
     else:
         lines = [
             f"{candidate}：{line}"

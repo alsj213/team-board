@@ -16,6 +16,8 @@ from team_board import evidence
 HEAD = "a" * 40
 OLD_HEAD = "b" * 40
 HEAD64 = "0123456789abcdef" * 4
+PATCH = "c" * 40
+OLD_PATCH = "d" * 40
 PR = 42
 
 
@@ -1037,6 +1039,99 @@ class TestTierKeyCompleteness:
         assert judgment.verdict == evidence.VERDICT_MISSING
         assert states(judgment)["tier"] == evidence.SLOT_MISSING
         assert "A/B/C" in judgment.detail
+
+
+class TestPatchV2:
+    """v2：四槽可带 ``patch``，rebase 换 head 不换内容时复用证据。"""
+
+    @staticmethod
+    def _events(*, head: str = OLD_HEAD, patch: str = PATCH) -> list[evidence.Event]:
+        return [
+            evidence.Event(
+                id=1,
+                kind="tier",
+                payload={"tier": "B", "reason": "常规改动", "head_sha": head, "patch": patch},
+                run_id=101,
+                profile="pm",
+            ),
+            evidence.Event(
+                id=2,
+                kind="qa_pass",
+                payload={"head_sha": head, "patch": patch, "run_id": 202},
+                run_id=202,
+                profile="qa",
+            ),
+            evidence.Event(
+                id=3,
+                kind="review",
+                payload={"kind": "defect", "head_sha": head, "patch": patch, "verdict": "pass"},
+                run_id=101,
+                profile="pm",
+            ),
+            evidence.Event(
+                id=4,
+                kind="review",
+                payload={"kind": "regression", "head_sha": head, "patch": patch, "verdict": "pass"},
+                run_id=202,
+                profile="qa",
+            ),
+        ]
+
+    @pytest.mark.parametrize(
+        ("kind", "payload"),
+        [
+            ("tier", {"tier": "B", "reason": "常规改动", "head_sha": HEAD, "patch": PATCH}),
+            ("qa_pass", {"head_sha": HEAD, "patch": PATCH, "run_id": 1}),
+            ("review", {"kind": "defect", "head_sha": HEAD, "patch": PATCH, "verdict": "pass"}),
+        ],
+    )
+    def test_validate_accepts_patch_for_patch_kinds(self, kind: str, payload: dict) -> None:
+        out = evidence.validate_payload(kind, payload)
+        assert out["patch"] == PATCH
+        assert out["head_sha"] == HEAD
+
+    def test_validate_rejects_patch_on_impl_done(self) -> None:
+        with pytest.raises(ValueError, match="多键"):
+            evidence.validate_payload(
+                "impl_done", {"pr": PR, "head_sha": HEAD, "patch": PATCH}
+            )
+
+    @pytest.mark.parametrize("patch", ["c" * 39, "C" * 40, "c" * 41, "", None, 1])
+    def test_validate_patch_shape(self, patch: object) -> None:
+        with pytest.raises(ValueError, match="patch"):
+            evidence.validate_payload(
+                "qa_pass", {"head_sha": HEAD, "run_id": 1, "patch": patch}
+            )
+
+    def test_judge_reuses_evidence_when_patch_matches_after_rebase(self) -> None:
+        judgment = evidence.judge(self._events(), HEAD, PR, patch=PATCH)
+        assert judgment.verdict == evidence.VERDICT_PASS
+        assert states(judgment)["tier"] == evidence.SLOT_OK
+        assert "patch" in judgment.detail
+
+    def test_judge_rejects_when_patch_changed(self) -> None:
+        judgment = evidence.judge(
+            self._events(patch=OLD_PATCH), HEAD, PR, patch=PATCH
+        )
+        assert judgment.verdict == evidence.VERDICT_HEAD_MISMATCH
+        assert all(slot.state == evidence.SLOT_HEAD_MISMATCH for slot in judgment.slots)
+        assert "patch" in judgment.detail
+
+    def test_patch_is_authoritative_over_matching_head(self) -> None:
+        """事件带 patch 且调用方给了 patch：patch 不同就失效，head 相同也不放行。"""
+        events = self._events(head=HEAD, patch=OLD_PATCH)
+        judgment = evidence.judge(events, HEAD, PR, patch=PATCH)
+        assert judgment.verdict == evidence.VERDICT_HEAD_MISMATCH
+
+    def test_head_only_legacy_event_still_requires_head(self) -> None:
+        """旧事件没有 patch：给了 patch 也不能复用，仍按 head 判。"""
+        events = base_events()  # 全绑 HEAD，没有 patch
+        assert evidence.judge(events, OLD_HEAD, PR, patch=PATCH).verdict != evidence.VERDICT_PASS
+        assert evidence.judge(events, HEAD, PR, patch=PATCH).verdict == evidence.VERDICT_PASS
+
+    def test_judge_rejects_malformed_patch(self) -> None:
+        with pytest.raises(ValueError, match="patch"):
+            evidence.judge(self._events(), HEAD, PR, patch="not-a-patch")
 
 
 class TestZeroIo:
