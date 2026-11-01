@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
+import subprocess  # nosec B404 - argv 列表、shell=False
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -280,15 +280,19 @@ def parse_pr_view(payload: object, expected_pr: int) -> PrView:
         raise TrainError(f"PR #{expected_pr} 的 gh 输出缺字符串字段")
     if not isinstance(mergeable, str) or not isinstance(is_draft, bool):
         raise TrainError(f"PR #{expected_pr} 的 gh 输出缺 mergeable/isDraft")
-    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_oid) is None:
-        raise TrainError(f"PR #{expected_pr} 的 headRefOid 非法：{head_oid!r}")
+    state_text = str(state)
+    head_ref_text = str(head_ref)
+    base_ref_text = str(base_ref)
+    head_oid_text = str(head_oid)
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head_oid_text) is None:
+        raise TrainError(f"PR #{expected_pr} 的 headRefOid 非法：{head_oid_text!r}")
     return PrView(
         number=number,
-        state=state,
+        state=state_text,
         is_draft=is_draft,
-        head_ref=head_ref,
-        base_ref=base_ref,
-        head_oid=head_oid,
+        head_ref=head_ref_text,
+        base_ref=base_ref_text,
+        head_oid=head_oid_text,
         mergeable=mergeable.upper(),
         checks=checks_state(payload.get("statusCheckRollup")),
     )
