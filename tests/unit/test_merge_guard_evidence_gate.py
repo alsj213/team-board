@@ -46,6 +46,8 @@ REMOTE_URL = "git@github.com:alsj213/team-board.git"
 
 #: 判「认领唯一」的看板行：合并卡正文顶格写 PR-CLAIM
 CLAIM_BODY = f"PR-CLAIM: #{PR}\n合并卡（收口）\n"
+#: CI 全绿闸门（R6①）默认回放：``gh pr checks`` rc=0 + 一行 pass（末行进 CI | PASS 最后一格）
+CI_PASS_OUT = "pytest (3.12)\tpass\t11s"
 
 
 def e_row(kind: str, payload: dict[str, object], run_id: int | None) -> tuple[str, str, int | None]:
@@ -170,6 +172,8 @@ class FakeRunner:
         merge_rc: int = 0,
         view_rc: int = 0,
         config_rc: int = 0,
+        checks_rc: int = 0,
+        checks_out: str = CI_PASS_OUT,
     ) -> None:
         self.head_oid = head_oid
         self.head_ref = head_ref
@@ -177,6 +181,9 @@ class FakeRunner:
         self.merge_rc = merge_rc
         self.view_rc = view_rc
         self.config_rc = config_rc
+        #: CI 全绿闸门（R6①）的 ``gh pr checks`` 回放值：默认 rc=0 + 一行 pass
+        self.checks_rc = checks_rc
+        self.checks_out = checks_out
         self.calls: list[tuple[str, ...]] = []
 
     # -- 判定辅助 ---------------------------------------------------------
@@ -221,6 +228,9 @@ class FakeRunner:
         return 1, ""  # pragma: no cover - 本模块没有别的 git 调用
 
     def _gh(self, argv: tuple[str, ...]) -> tuple[int, str]:
+        if argv[:3] == ("gh", "pr", "checks"):
+            # CI 全绿闸门（R6①）：默认 rc=0 + 一行 pass；红样由构造参数覆盖
+            return self.checks_rc, self.checks_out
         if argv[:2] == ("gh", "pr") and argv[2] == "view":
             payload = {
                 "number": PR,

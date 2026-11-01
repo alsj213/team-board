@@ -84,13 +84,13 @@ grep / 文档 / 测试逐字断言）：
 rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-guard/<pr>/head | rc=0 | <base sha 前 7 位> 是 head <head sha 前 7 位> 的祖先（已 rebase 到 <base>）
 ```
 
-步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `证据状态机` → `双问绑定` → `rebase` → `合并` → `分支删除`。
-（本文各节的样例块是各卡当时的真跑原文；现行 9 行样例见本节末尾「现行 9 行样例」，由
+步骤行顺序固定：`分支存在` → `预检` → `head sha` → `认领唯一性` → `证据状态机` → `CI` → `双问绑定` → `rebase` → `合并` → `分支删除`。
+（本文各节的样例块是各卡当时的真跑原文；现行 10 行样例见本节末尾「现行 10 行样例」，由
 `tests/integration/test_merge_guard_cli.py` 的 `test_docs_declare_same_step_order` /
 `test_docs_sample_block_matches_step_order` 对着实跑钉住。）
 `--verify-only` 路径**不加**这一步（它一次 gh 都不调，也不宣称合并前状态）。
 
-现行 9 行样例（2026-10-31 证据状态机闸门卡 `t_1429d01c` 实跑：真 git + 假 gh，`origin` 的
+现行 10 行样例（2026-11-01 CI 全绿闸门卡 `t_1a042fbb` 又加了一行 `CI`；基底仍是 2026-10-31 证据状态机闸门卡 `t_1429d01c` 实跑：真 git + 假 gh，`origin` 的
 配置 URL 是 GitHub 形态、传输由 `url.<裸库>.insteadOf` 改写回本地裸库，一次网络调用都没有；
 `#20` / `t_deadbeef` 是合法假号。预检与合并两条命令都带 `-R alsj213/team-board`，脚本与完整
 日志是该卡的附件 `t_1429d01c-e2e-sample.log`）：
@@ -101,6 +101,7 @@ rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/bas
 head sha | PASS | 2e130b963160aca12e3548f2a1341b3ca23fb87c
 认领唯一性 | PASS | prclaim.audit(看板库 <board>（未结卡，mode=ro）, pr=#20) | rc=0 | 认领唯一 → t_deadbeef（与 --card 逐字一致）
 证据状态机 | PASS | PYTHONPATH=src python3 -m team_board.cli evidence audit --card t_deadbeef --head 2e130b963160aca12e3548f2a1341b3ca23fb87c --pr 20 --db <board> | rc=0 | tier=B, qa_pass=*** review=defect+regression
+CI | PASS | gh pr checks 20 -R alsj213/team-board | rc=0 | pytest (3.12)	pass	11s
 双问绑定 | PASS | gh api repos/alsj213/team-board/pulls/20/reviews --paginate + gh api repos/alsj213/team-board/issues/20/comments --paginate | rc=0 | head 2e130b963160 上 defect + regression 各 >=1 条（扫描正文 2 条、带标记 2 条）
 rebase | PASS | git -C <repo> merge-base --is-ancestor refs/merge-guard/20/base refs/merge-guard/20/head | rc=0 | 70ce884 是 head 2e130b9 的祖先（已 rebase 到 main）
 合并 | PASS | gh pr merge 20 -R alsj213/team-board --merge --delete-branch --match-head-commit 2e130b963160aca12e3548f2a1341b3ca23fb87c --subject Merge PR #20（t_deadbeef） --body-file <body> | rc=0 | fake gh: merged #20
