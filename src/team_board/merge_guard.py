@@ -79,9 +79,9 @@ git -C <repo> merge-base --is-ancestor refs/merge-guard/<pr>/base refs/merge-gua
   ``--no-verify``。``--verify-only`` 路径也不加这一步（它一次 gh 都不调，不宣称合并前
   状态）。
 
-合并前先过三道证据闸门（R17⑤ / 证据状态机 / R18④）
---------------------------------------------------
-rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdout 0 字节、**一个 gh 写操作
+合并前先过四道证据闸门（R17⑤ / 证据状态机 / R6① CI / R18④）
+------------------------------------------------------------
+rebase 闸门之前还有四道**只读**闸门，顺序固定（拒绝时 stdout 0 字节、**一个 gh 写操作
 都不发**）：
 
 1. **认领唯一性**（R17⑤）：读看板库（``--db``，只读 ``mode=ro``）的未结卡，判「恰好一张
@@ -97,14 +97,20 @@ rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdou
    判定**全调** :mod:`team_board.evidence` 的 ``collect`` + ``judge``（与 ``evidence audit``
    同一份实现），本模块不重写、也不写第二条 SQL。拒绝文案是「证据闸门拦下 PR #<n>（实现
    卡 <卡>）：<verdict>；<detail>」，verdict 只用 ``evidence`` 的七个字面量。一次 gh 都不调。
-3. **双问绑定 head sha**（R18④）：用 ``--pr`` 与预检读到的 ``headRefOid`` 调
+3. **CI 全绿**（R6①）：``gh pr checks <n> -R <slug>``（``-R`` 与预检 / 合并钉同一个 slug），
+   判定全调 :func:`team_board.checks.classify`。``rc=0`` = 全绿 → ``CI | PASS | <命令原文> |
+   rc=0 | <输出末行>``；``rc=1`` 且输出含 ``no checks reported`` = ``NO_CHECKS``（本仓 PR
+   #2 / #3 就是在这种分支上合进去的 —— **不算绿**）；``rc=1`` 其它 = ``CI 未通过``；其它
+   rc（找不到 gh / 超时 / 被杀）= 判不了。三种非 PASS 一律 rc2 拒绝，**没有**
+   ``--skip-ci`` / ``--allow-no-checks``。
+4. **双问绑定 head sha**（R18④）：用 ``--pr`` 与预检读到的 ``headRefOid`` 调
    :func:`team_board.reviewhead.fetch_bodies` / ``analyze``，要求该 sha 上 ``defect`` +
    ``regression`` 各 ≥1 条结构化标记（``REVIEW-HEAD`` / ``REVIEW-KIND``）。只发两条
    ``gh api GET``（``pulls/<n>/reviews`` + ``issues/<n>/comments``，``--paginate``），
    取数失败 / 证据不齐一律 rc2。三种拒绝文案：``双问缺证``（一条标记都没有） /
    ``双问陈旧``（有标记但都不是当前 head，即 head 变了没重跑双问） / ``双问缺类``
    （当前 head 上缺某一类）。
-3. **双问绑定内容指纹**（R18④）：先与 rebase 闸门共用一次 :func:`ensure_pr_refs`
+5. **双问绑定内容指纹**（R18④）：先与 rebase 闸门共用一次 :func:`ensure_pr_refs`
    （``git fetch`` 到 ``refs/merge-guard/<pr>/{base,head}``）、核对该 head ref 逐字等于预检
    读到的 ``headRefOid``，再用 :func:`team_board.reviewhead.fingerprint` 算这一轮的内容指纹
    （``git diff -U0 <mb> <head>`` 的内容行 sha256 前 40 位），最后用
@@ -123,9 +129,10 @@ rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdou
    （或不是 GitHub 形态 / 读不到 remote）→ rc2 拒绝。跨仓时它原本会去读**另一个仓库**
    同号 PR 的评审 —— 判的是别人的证据。
 
-三道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-evidence`` /
-``--skip-review-head``，也没有 ``--allow-stale`` / ``--force``），且都不在
-``--verify-only`` 路径上跑（那条路径不合并，不该要求认领、证据与双问）。
+这四道闸门都**没有**跳过开关（没有 ``--skip-claim`` / ``--skip-evidence`` /
+``--skip-ci`` / ``--allow-no-checks`` / ``--skip-review-head``，也没有 ``--allow-stale`` /
+``--force``），且都不在 ``--verify-only`` 路径上跑（那条路径不合并，不该要求认领、证据、
+CI 与双问）。
 
 合并方式只认一种
 ----------------
@@ -206,7 +213,8 @@ rebase 闸门之前还有三道**只读**闸门，顺序固定（拒绝时 stdou
   **合并前认领闸门拒绝**（读不到看板库 / PR 无未结卡认领 / 重复认领 / 认领卡 ≠
   ``--card``）、**合并前证据状态机闸门拒绝**（``--branch`` 不是 ``wt/t_xxxxxxxx`` 形态；
   读不到看板库 / 读 evidence 事件失败；四槽缺项 / 绑的是旧 head / 双问阻塞 / 缺老板点头 /
-  证据串卡 / 角色不符）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
+  证据串卡 / 角色不符）、**合并前 CI 全绿闸门拒绝**（``gh pr checks`` 判出 ``NO_CHECKS`` /
+  ``CI 未通过`` / ``CI 状态判不了``）、**合并前双问绑定闸门拒绝**（取不到评审正文 / 双问缺证 / 双问陈旧 /
   双问缺类 / ``--repo`` 的 remote 读不到或不是 GitHub 形态 / 该仓库 ≠
   ``alsj213/team-board``）、
   **合并前 rebase 闸门拒绝**（``gh pr view`` 的 ``baseRefName`` 形态非法；``git fetch``
@@ -256,7 +264,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from team_board import db, evidence, evidence_cards, prclaim, reviewhead
+from team_board import checks, db, evidence, evidence_cards, prclaim, reviewhead
 from team_board.merges import (
     MERGE_BY_PROFILE,
     MERGE_BY_RE,
@@ -313,6 +321,9 @@ STEP_REVIEW_HEAD = "双问绑定"
 #: 合并前「证据状态机」闸门的步骤标签（四槽 tier / qa_pass / review×2 绑当前 head；
 #: 判据 = ``evidence.collect`` + ``evidence.judge``，本模块不重写判定）
 STEP_EVIDENCE = "证据状态机"
+#: 合并前「CI 全绿」闸门的步骤标签（R6①；判据 = ``gh pr checks`` 的 rc + 输出，
+#: 分类在 :func:`team_board.checks.classify` —— ``no checks reported`` **不算绿**）
+STEP_CHECKS = "CI"
 
 #: 私有 ref 命名空间前缀：本工具把远端 base / head 抓到这里再判祖先关系。
 #: 它**不在** ``refs/heads`` / ``refs/remotes`` 下 —— :mod:`team_board.branches`
@@ -837,6 +848,17 @@ def pr_view_argv(
     """
 
     return ("gh", "pr", "view", str(pr), "-R", repo_slug, "--json", fields)
+
+
+def checks_argv(pr: int, repo_slug: str) -> tuple[str, ...]:
+    """``gh pr checks <n> -R <owner/name>``：CI 全绿闸门的唯一取数命令。
+
+    与 :func:`pr_view_argv` / :func:`merge_argv` 钉同一个 ``repo_slug``（同一份
+    ``git config --get remote.<name>.url`` 解析结果）：不钉 ``-R`` 时 gh 按 ``GH_REPO`` /
+    cwd 选仓库，于是「看的是 A 的 CI、合的是 B」——与 PR #46 那个双问缺陷同一个洞。
+    """
+
+    return ("gh", "pr", "checks", str(pr), "-R", repo_slug)
 
 
 class Probe:
@@ -1772,10 +1794,63 @@ def evidence_gate(opts: Options, info: Preflight) -> str:
     )
 
 
+def checks_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
+    """**合并前 CI 全绿闸门**（R6①）：``gh pr checks`` rc=0 才放行，``NO_CHECKS`` 不算绿。
+
+    为什么这一步必须在闸门链里、而不是留给「合并前人工看一眼」：R6 的三条前置里第 ① 条
+    就是 CI 全绿，但本仓 PR #2 / #3 是带着「没跑过任何 workflow」进 main 的 —— 靠人记
+    就是会漏。取数命令恒为 :func:`checks_argv`（``gh pr checks <n> -R <slug>``，``-R`` 与
+    预检 / 合并钉同一个 slug，「看的是 A 的 CI、合的是 B」不成立），判定交给
+    :func:`team_board.checks.classify`（四档：PASS / NO_CHECKS / FAIL / UNAVAILABLE，
+    **本模块不复制判定**），文案用 :func:`team_board.checks.key_line` 取输出末行。
+
+    三种非 PASS 都拒绝（rc2、stdout 0 字节、stderr 恰一行、零 gh 写调用），文案一眼可分：
+
+    - ``NO_CHECKS``：``… NO_CHECKS（no checks reported 不算绿（R6）…）`` —— 这个分支上
+      没有任何检查项，gh 的 ``no checks reported on the '<branch>' branch`` 属此档；
+    - ``FAIL``：``… CI 未通过；<输出末行>；拒绝合并`` —— 有检查项且没过；
+    - ``UNAVAILABLE``：``… CI 状态判不了（rc=<rc>）；拒绝合并（不知道不等于通过）``——
+      找不到 gh / 超时 / 被杀；**不知道不等于通过**，也不许降级成警告。
+
+    没有跳过开关（没有 ``--skip-ci`` / ``--allow-no-checks``），也不在 ``--verify-only``
+    路径上跑（那条路径不合并，一次 gh 都不调）。``info`` 只为与其他闸门同签名留位，
+    本步不读预检字段 —— CI 状态与 head 无关，gh 自己按 PR 当前 head 算。
+    """
+
+    del info  # 与 claim_gate / evidence_gate / review_head_gate 同签名；本闸门不读预检
+    argv = checks_argv(opts.pr, repo_slug)
+    proc = _run(argv, cwd=opts.repo, timeout=opts.command_timeout)
+    # 两股输出**合并**再分类：gh 把 `no checks reported` 这句错误提示打在 stderr，
+    # 而列表 / 汇总打在 stdout，只看一股会把 NO_CHECKS 读成 FAIL（文案就指错方向）。
+    output = f"{proc.stdout}\n{proc.stderr}"
+    verdict = checks.classify(proc.returncode, output)
+    if verdict == checks.CHECK_NO_CHECKS:
+        raise MergeGuardError(
+            f"CI 闸门拦下 PR #{opts.pr}：NO_CHECKS（no checks reported 不算绿（R6）："
+            "这个分支上没有任何检查项，没跑过 workflow 就没有绿灯可言）；拒绝合并"
+        )
+    if verdict == checks.CHECK_FAIL:
+        raise MergeGuardError(
+            f"CI 闸门拦下 PR #{opts.pr}：CI 未通过；{checks.key_line(output)}；拒绝合并"
+        )
+    if verdict != checks.CHECK_PASS:
+        raise MergeGuardError(
+            f"CI 闸门拦下 PR #{opts.pr}：CI 状态判不了（rc={proc.returncode}）；"
+            "拒绝合并（不知道不等于通过）"
+        )
+    return format_step(
+        STEP_CHECKS,
+        ok=True,
+        command=proc.command,
+        rc=proc.returncode,
+        key=checks.key_line(output),
+    )
+
+
 def review_head_gate(opts: Options, info: Preflight, repo_slug: str) -> str:
     """**合并前双问绑定闸门**（R18④）：当前**内容指纹**上 defect + regression 各 ≥1 条。
 
-    为什么绑内容而不是绑 head sha：纯 rebase（内容一个字节没改、只是换了个父提交）会把
+    为什么绑内容而不绑 head sha：纯 rebase（内容一个字节没改、只是换了个父提交）会把
     head sha 换掉，于是按 sha 绑的双问每次 rebase 都要重跑一遍 —— 判的不再是「这段改动
     被双问过没有」，而是「这条 sha 被双问过没有」。改绑 :func:`reviewhead.fingerprint`
     （``git diff -U0 <mb> <head> | git patch-id --stable``）之后，纯 rebase 复用同一份
@@ -2466,6 +2541,8 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
     # 认账预检：merged-by 的 run 必须属于 --card 这张卡（只读看板库，无 stdout 证据行）。
     run_owner_gate(opts)
     evidence_line = evidence_gate(opts, info)
+    # CI 全绿闸门（R6①）：排在证据状态机之后、双问绑定之前；NO_CHECKS 不算绿。
+    checks_line = checks_gate(opts, info, repo_slug)
     review_line = review_head_gate(opts, info, repo_slug)
     # 合并**前**的 rebase 闸门：base 不是 head 的祖先 → rc2、stdout 空、零 gh 写操作。
     # 排在这里（而不是 lines 攒完之后）是刻意的：拒绝时 stdout 必须 0 字节，
@@ -2494,6 +2571,7 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
         f"{STEP_HEAD_SHA} | PASS | {info.head_oid}",
         claim_line,
         evidence_line,
+        checks_line,
         review_line,
         rebase_line,
     ]
