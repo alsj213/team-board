@@ -26,6 +26,7 @@ import os
 import re
 import shlex
 import subprocess  # nosec B404 - 只为起 hermes kanban create 子进程
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -227,7 +228,7 @@ def _render_body(
     subject = f"Merge PR #{pr}（{impl_card}）：{_title_suffix(impl_title)}"
     repo_q = shlex.quote(os.path.realpath(repo if repo else "."))
     src_q = shlex.quote(os.path.realpath(repo if repo else ".") + "/src")
-    body_file = f"/tmp/{impl_card}-merge-{pr}.body"
+    body_file = os.path.join(tempfile.gettempdir(), f"{impl_card}-merge-{pr}.body")
     record = (
         f"cd {repo_q} && PYTHONPATH={src_q} python3 -m team_board.cli merge-record"
         f" --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID"

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import tempfile
 from collections.abc import Sequence
 from typing import Any
 
@@ -129,8 +131,10 @@ class TestBodyCommands:
             assert "cd /home/liu/project/team-board &&" in cmd
             assert "PYTHONPATH=/home/liu/project/team-board/src" in cmd
         record, merge = cmds
-        assert f"--body-out /tmp/{IMPL}-merge-{PR}.body" in record
-        assert f"--body-file /tmp/{IMPL}-merge-{PR}.body" in merge
+        body_file = os.path.join(tempfile.gettempdir(), f"{IMPL}-merge-{PR}.body")
+        assert os.path.isabs(body_file)
+        assert f"--body-out {body_file}" in record
+        assert f"--body-file {body_file}" in merge
         assert "--repo /home/liu/project/team-board" in merge
 
     def test_repo_path_with_space_is_quoted(self) -> None:
