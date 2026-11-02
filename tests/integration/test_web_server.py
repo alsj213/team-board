@@ -47,6 +47,10 @@ EXPECTED_SUBCOMMANDS = (
     "output-audit",
     "push-guard",
     "pr-claim-audit",
+    "path-claim-audit",
+    "path-claim-check",
+    "merge-card",
+    "tip-broadcast",
     "pr-review-head-audit",
     "evidence",
     "merge-owner-audit",
@@ -72,6 +76,10 @@ CN_DIGITS = {
     17: "十七",
     18: "十八",
     19: "十九",
+    20: "二十",
+    21: "二十一",
+    22: "二十二",
+    23: "二十三",
 }
 
 

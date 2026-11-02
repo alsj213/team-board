@@ -316,3 +316,27 @@ def load_rework_counts(conn: sqlite3.Connection) -> dict[str, int]:
     except sqlite3.Error as exc:
         raise BoardError(f"读取 task_events 失败: {exc}") from exc
     return {row[0]: int(row[1]) for row in rows if row[1]}
+
+
+def load_card_row(
+    conn: sqlite3.Connection, card_id: str
+) -> tuple[str, str, str]:
+    """``(status, title, body)``：一张卡（含 done/archived）的状态与正文。
+
+    ``merge-card`` 建卡前要确认实现卡已 done，但 ``iter_pending_cards`` 故意不含
+    done；这里单独取一行，NULL 归成空串。卡不存在 → :class:`BoardError`。
+    """
+
+    try:
+        row = conn.execute(
+            "SELECT status, title, body FROM tasks WHERE id = ?", (card_id,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.status/title/body 失败: {exc}") from exc
+    if row is None:
+        raise BoardError(f"卡不存在: {card_id}")
+    return (
+        "" if row[0] is None else str(row[0]),
+        "" if row[1] is None else str(row[1]),
+        "" if row[2] is None else str(row[2]),
+    )
