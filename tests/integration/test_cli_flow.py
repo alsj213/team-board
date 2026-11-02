@@ -26,6 +26,7 @@ def make_db(
     *,
     body: str = BODY,
     status: str = "running",
+    title: str = "测试卡",
     events: list[tuple[str, str]] | None = None,
 ) -> Path:
     conn = sqlite3.connect(path)
@@ -40,7 +41,7 @@ def make_db(
         )
         conn.execute(
             "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
-            (CARD, status, "engineer", "测试卡", body),
+            (CARD, status, "engineer", title, body),
         )
         for index, (kind, payload) in enumerate(events or [], start=1):
             conn.execute(
@@ -90,6 +91,43 @@ class TestCardAudit:
         assert code == 2
         assert out == ""
         assert err.startswith("错误:")
+
+    def test_impl_card_with_pr_claim_is_still_rc1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``kanban_claim_pr`` 会给任何 PR 卡补首行 PR-CLAIM；实现卡照常受检。"""
+
+        board = make_db(
+            tmp_path / "impl-claim.db",
+            title="脚本化流程预检：card-audit + handoff-check",
+            body="PR-CLAIM: #94\n## 目标\n",
+        )
+        code, out, _ = run(capsys, "card-audit", "--card", CARD, "--db", str(board))
+        assert code == 1
+        assert "（impl）" in out
+        assert "PATH-CLAIM" in out
+        assert out.splitlines()[-1].startswith("结论: 不通过")
+
+    def test_merge_card_is_exempt(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        board = make_db(
+            tmp_path / "merge.db",
+            title="收口：合并 PR #94（t_1234abcd）",
+            body="PR-CLAIM: #94\n",
+        )
+        code, out, err = run(capsys, "card-audit", "--card", CARD, "--db", str(board))
+        assert (code, err) == (0, "")
+        assert out.splitlines()[0].endswith("（merge）")
+        assert out.splitlines()[-1] == "结论: 通过"
+
+    def test_merge_title_without_claim_is_rc1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        board = make_db(tmp_path / "merge-gap.db", title="收口：合并 PR #94", body="## 目标\n")
+        code, out, _ = run(capsys, "card-audit", "--card", CARD, "--db", str(board))
+        assert code == 1
+        assert "[pr-claim-missing]" in out
 
 
 class TestHandoff:

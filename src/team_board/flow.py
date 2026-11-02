@@ -3,8 +3,8 @@
 两件事：
 
 1. :func:`audit_card` —— 派工前检查卡面是否有机器可读的
-   ``PATH-CLAIM`` / ``TEST-PLAN`` / ``CONSUMER`` / ``QA-SPEC``；合并卡（正文首行
-   ``PR-CLAIM``）豁免实现卡契约。
+   ``PATH-CLAIM`` / ``TEST-PLAN`` / ``CONSUMER`` / ``QA-SPEC``；合并卡（标题命中
+   合并语义 **且** 正文首行 ``PR-CLAIM``）豁免实现卡契约。
 2. :func:`check_handoff` —— 交 QA 前检查 ``impl_done`` 是否绑当前 head、返工次数是否
    超预算。它只做**纯判定**；取数（看板事件、卡状态）在 CLI 层。
 
@@ -84,10 +84,29 @@ class HandoffReport:
 
 
 def audit_card(card_id: str, title: str, body: str) -> CardAuditReport:
-    """检查一张卡的机器可读契约；合并卡只看首行 ``PR-CLAIM``。"""
+    """检查一张卡的机器可读契约。
 
-    if prclaim.first_claim_pr(body) is not None:
-        return CardAuditReport(card_id=card_id, kind="merge", findings=())
+    合并卡豁免**两条同时成立**（与 :func:`prclaim.audit_gaps` 同一口径，
+    见 ``docs/pr-claim-gate.md`` §1）：标题命中合并语义
+    :func:`prclaim.needs_claim`，且正文首行是 ``PR-CLAIM: #<n>``。
+
+    只看首行 ``PR-CLAIM`` 会把开了 PR 的实现卡整体豁免 —— ``kanban_claim_pr``
+    给**任何** PR 卡的首行补这一行，实现卡一旦提 PR 就不再受检。
+    """
+
+    if prclaim.needs_claim(title):
+        if prclaim.first_claim_pr(body) is not None:
+            return CardAuditReport(card_id=card_id, kind="merge", findings=())
+        return CardAuditReport(
+            card_id=card_id,
+            kind="merge",
+            findings=(
+                Finding(
+                    "pr-claim-missing",
+                    "合并卡正文首行必须是 PR-CLAIM: #<n>（顶格、无尾随字符）",
+                ),
+            ),
+        )
 
     findings: list[Finding] = []
     paths, issues = pathclaim.parse_body(body)

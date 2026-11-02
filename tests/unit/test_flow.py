@@ -33,6 +33,34 @@ class TestCardAudit:
         assert report.ok is True
         assert report.kind == "merge"
 
+    def test_impl_card_with_pr_claim_is_not_exempt(self) -> None:
+        """标题无合并语义时，首行 PR-CLAIM 不豁免（claim_pr 会给任何 PR 卡补）。"""
+
+        report = flow.audit_card(
+            CARD, "脚本化流程预检：card-audit + handoff-check", "PR-CLAIM: #94\n"
+        )
+        assert report.kind == "impl"
+        assert report.ok is False
+        codes = {item.code for item in report.findings}
+        assert codes == {
+            "path-claim-missing",
+            "test-plan-missing",
+            "consumer-missing",
+            "qa-spec-missing",
+        }
+
+    def test_impl_card_with_pr_claim_and_contract_passes(self) -> None:
+        report = flow.audit_card(CARD, "x", "PR-CLAIM: #94\n" + body())
+        assert report.ok is True
+        assert report.kind == "impl"
+
+    def test_merge_title_without_first_line_claim_is_reported(self) -> None:
+        report = flow.audit_card(CARD, "收口：合并 PR #9", "## 目标\n")
+        assert report.kind == "merge"
+        assert report.ok is False
+        assert [item.code for item in report.findings] == ["pr-claim-missing"]
+        assert flow.render_card(report).splitlines()[-1] == "结论: 不通过（1 条）"
+
     def test_missing_each_line_is_reported(self) -> None:
         report = flow.audit_card(CARD, "x", "## 目标\n")
         codes = {item.code for item in report.findings}

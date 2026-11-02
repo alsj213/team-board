@@ -1542,7 +1542,10 @@ CONSUMER: <下游会执行的命令>
 QA-SPEC: qa
 ```
 
-合并卡（正文首行 `PR-CLAIM`）豁免实现卡契约。缺项 rc1，库/参数错误 rc2。
+合并卡（标题命中合并语义 **且** 正文首行 `PR-CLAIM: #<n>`）豁免实现卡契约；
+只带首行 `PR-CLAIM` 的实现卡照常受检（`kanban_claim_pr` 会给任何 PR 卡补这一行）。
+标题命中合并语义但首行没有认领行 → `[pr-claim-missing]` rc1。
+缺项 rc1，库/参数错误 rc2。
 
 `handoff-check` 检查：
 
