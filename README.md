@@ -22,11 +22,11 @@ team-board member engineer
 team-board export
 ```
 
-共二十三个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+共二十五个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
 `commit-audit` / `merge-record` / `body-audit` / `gate` / `output-audit` / `push-guard` /
-`pr-claim-audit` / `path-claim-audit` / `path-claim-check` / `merge-card` / `tip-broadcast` /
-`pr-review-head-audit` / `evidence` / `merge-owner-audit` / `verify-batch` / `merge-train` /
-`serve`
+`pr-claim-audit` / `path-claim-audit` / `path-claim-check` / `merge-card` / `card-audit` /
+`handoff-check` / `tip-broadcast` / `pr-review-head-audit` / `evidence` / `merge-owner-audit` /
+`verify-batch` / `merge-train` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节，`path-claim-audit` / `path-claim-check`
@@ -1523,6 +1523,34 @@ team-board path-claim-check --card t_xxxxxxxx [--db PATH] [--json]  # 0 安全 /
 
 `--json` 输出 `claims` / `conflicts` / `issues`，供 dispatcher 或看板插件在
 spawn 前调用；有冲突的卡应串行，不要并行派工。
+
+## 卡面契约检查（card-audit）与交卡预检（handoff-check）
+
+这两条把“提示词里记得做”换成脚本判据：
+
+```bash
+team-board card-audit --card t_xxxxxxxx [--db PATH] [--json]
+team-board handoff-check --card t_xxxxxxxx --head <40hex> [--stage review|pm|merge] [--db PATH] [--json]
+```
+
+`card-audit` 检查实现卡正文必须有：
+
+```text
+PATH-CLAIM: ...
+TEST-PLAN: quick|full
+CONSUMER: <下游会执行的命令>
+QA-SPEC: qa
+```
+
+合并卡（正文首行 `PR-CLAIM`）豁免实现卡契约。缺项 rc1，库/参数错误 rc2。
+
+`handoff-check` 检查：
+
+- 最新 `impl_done` 是否绑当前 head（新 commit 必须重发）；
+- `changes_requested` 是否超过预算（默认 1 次，第 2 次停手交 ops）；
+- `--stage merge` 额外要求实现卡状态是 `done`。
+
+通过 rc0，不通过 rc1，参数/库错误 rc2。
 
 ## 合并卡生命周期（merge-card）
 

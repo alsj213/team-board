@@ -209,6 +209,7 @@ from . import (
     db,
     evidence,
     evidence_store,
+    flow,
     gatelog,
     mergecard,
     mergeowner,
@@ -312,10 +313,10 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**二十三个**子命令（个数以
+    """建 CLI 前端：prog=team-board，共**二十五个**子命令（个数以
     ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
     不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
-    与 README 的「共二十三个子命令」同源）。
+    与 README 的「共二十五个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -877,6 +878,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="机器可读输出",
     )
+
+    card_audit_cmd = subparsers.add_parser(
+        "card-audit",
+        help=(
+            "检查卡面机器可读契约（PATH-CLAIM/TEST-PLAN/CONSUMER/QA-SPEC）；"
+            "0 通过 / 1 有缺项 / 2 参数或环境错误"
+        ),
+    )
+    card_audit_cmd.add_argument("--card", required=True, metavar="CARD", help="卡号")
+    card_audit_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    card_audit_cmd.add_argument("--json", action="store_true", help="机器可读输出")
+
+    handoff_cmd = subparsers.add_parser(
+        "handoff-check",
+        help=(
+            "交卡预检：impl_done 是否绑当前 head、返工是否超预算；"
+            "0 通过 / 1 不通过 / 2 参数或环境错误"
+        ),
+    )
+    handoff_cmd.add_argument("--card", required=True, metavar="CARD", help="卡号")
+    handoff_cmd.add_argument("--head", required=True, metavar="SHA", help="当前 head（40 位）")
+    handoff_cmd.add_argument(
+        "--stage",
+        choices=flow.STAGES,
+        default="review",
+        help="交卡阶段（默认 review）",
+    )
+    handoff_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    handoff_cmd.add_argument("--json", action="store_true", help="机器可读输出")
 
     head_cmd = subparsers.add_parser(
         "pr-review-head-audit",
@@ -2508,6 +2548,84 @@ def _run_merge_card(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_card_audit(args: argparse.Namespace) -> int:
+    """``card-audit``：检查卡面机器可读契约。"""
+
+    if mergeowner.CARD_RE.fullmatch(args.card) is None:
+        _write_stderr_error(f"卡号形态非法: {args.card!r}（应为 t_ 开头 8 位小写十六进制）")
+        return 2
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        _status, title, body = db.load_card_row(conn, args.card)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    report = flow.audit_card(args.card, title, body)
+    text = flow.render_card_json(report) if args.json else flow.render_card(report)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0 if report.ok else 1
+
+
+def _run_handoff_check(args: argparse.Namespace) -> int:
+    """``handoff-check``：impl_done head + 返工预算的机械预检。"""
+
+    if mergeowner.CARD_RE.fullmatch(args.card) is None:
+        _write_stderr_error(f"卡号形态非法: {args.card!r}（应为 t_ 开头 8 位小写十六进制）")
+        return 2
+    if re.fullmatch(r"[0-9a-f]{40}", args.head, re.ASCII) is None:
+        _write_stderr_error(f"head 不是 40 位小写十六进制: {args.head!r}")
+        return 2
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        status, _title, _body = db.load_card_row(conn, args.card)
+        events = db.iter_card_events(
+            conn, args.card, ("impl_done", "changes_requested")
+        )
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    impl_heads: list[str] = []
+    rework_count = 0
+    for kind, payload in events:
+        if kind == "changes_requested":
+            rework_count += 1
+            continue
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            head = data.get("head_sha")
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head, re.ASCII):
+                impl_heads.append(head)
+
+    report = flow.check_handoff(
+        args.card,
+        args.head,
+        args.stage,
+        impl_heads=tuple(impl_heads),
+        rework_count=rework_count,
+        status=status,
+    )
+    text = (
+        flow.render_handoff_json(report) if args.json else flow.render_handoff(report)
+    )
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0 if report.ok else 1
+
+
 def _run_tip_broadcast(args: argparse.Namespace) -> int:
     """``tip-broadcast``：报告/更新落后于 origin/main 的卡分支 PR。"""
 
@@ -3087,6 +3205,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "merge-card":
         return _run_merge_card(args)
+    if args.command == "card-audit":
+        return _run_card_audit(args)
+    if args.command == "handoff-check":
+        return _run_handoff_check(args)
     if args.command == "tip-broadcast":
         return _run_tip_broadcast(args)
 

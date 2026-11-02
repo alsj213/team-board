@@ -306,16 +306,24 @@ def parse_created_id(stdout: str) -> str | None:
     return match.group(0) if match else None
 
 
+def _default_runner(argv: Sequence[str]) -> Any:
+    """默认执行器：捕获 stdout/stderr，``--json`` 才能被解析（2026-11-03 dogfood）。"""
+
+    return subprocess.run(  # nosec B603 - argv 是常量元组，不经 shell
+        tuple(argv), capture_output=True, text=True, check=False
+    )
+
+
 def create_merge_card(
     plan: MergeCardPlan,
     *,
     body_path: str,
-    runner: Runner = subprocess.run,  # type: ignore[assignment]
+    runner: Runner | None = None,
 ) -> CreateResult:
     """起 ``hermes kanban create``；不做重试，rc 交给调用方。"""
 
     argv = create_argv(plan, body_path)
-    proc = runner(argv)
+    proc = (runner or _default_runner)(argv)
     stdout = str(getattr(proc, "stdout", "") or "")
     stderr = str(getattr(proc, "stderr", "") or "")
     rc = int(getattr(proc, "returncode", 1))

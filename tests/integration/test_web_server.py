@@ -51,6 +51,8 @@ EXPECTED_SUBCOMMANDS = (
     "path-claim-check",
     "merge-card",
     "tip-broadcast",
+    "card-audit",
+    "handoff-check",
     "pr-review-head-audit",
     "evidence",
     "merge-owner-audit",
@@ -80,6 +82,8 @@ CN_DIGITS = {
     21: "二十一",
     22: "二十二",
     23: "二十三",
+    24: "二十四",
+    25: "二十五",
 }
 
 
@@ -950,7 +954,8 @@ def test_help_text_lists_all_subcommands() -> None:
     help_text = cli.build_parser().format_help()
     for name in EXPECTED_SUBCOMMANDS:
         assert f"    {name} " in help_text or f"    {name}\n" in help_text
-    assert "{" + ",".join(EXPECTED_SUBCOMMANDS) + "}" in help_text
+    # argparse 会按终端宽度折行，比较时先去掉空白（子命令顺序仍逐字校验）
+    assert "{" + ",".join(EXPECTED_SUBCOMMANDS) + "}" in "".join(help_text.split())
 
 
 # --------------------------------------------------------------------------- #
