@@ -36,6 +36,11 @@ TEST_PLAN_RE = re.compile(r"^TEST-PLAN:[ \t]*(quick|full)[ \t]*\r?$", re.M | re.
 CONSUMER_RE = re.compile(r"^CONSUMER:[ \t]*(\S.*?)[ \t]*\r?$", re.M)
 QA_SPEC_RE = re.compile(r"^QA-SPEC:[ \t]*qa[ \t]*\r?$", re.M)
 
+#: ``head_sha`` 形态：40 位（git sha1）或 64 位（sha256）小写十六进制，整串。
+#: 与 :data:`team_board.evidence.HEAD_RE` 同形态 —— 否则 64 位 ``impl_done``
+#: 会被这里判成“没有 impl_done”，两边契约打架。
+HEAD_RE = re.compile(r"^[0-9a-f]{40}$|^[0-9a-f]{64}$", re.ASCII)
+
 #: 交卡阶段（review = 交 qa；pm = 交 pm；merge = 交 repo）
 STAGES = ("review", "pm", "merge")
 

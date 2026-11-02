@@ -169,4 +169,65 @@ class TestHandoff:
         )
         assert code == 2
         assert out == ""
-        assert "40 位" in err
+        assert "40 或 64 位" in err
+
+    def test_sha256_head_passes(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """``--head`` 接受 64 位（与 ``evidence.HEAD_RE`` 一致）。"""
+
+        long_head = "c" * 64
+        board = make_db(
+            tmp_path / "sha256.db",
+            events=[("impl_done", json.dumps({"head_sha": long_head, "pr": 9}))],
+        )
+        code, out, err = run(
+            capsys,
+            "handoff-check",
+            "--card",
+            CARD,
+            "--head",
+            long_head,
+            "--db",
+            str(board),
+        )
+        assert (code, err) == (0, "")
+        assert out.splitlines()[-1] == "结论: 可以交卡"
+
+    def test_head_57_hex_is_rc2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        board = make_db(tmp_path / "odd.db")
+        code, out, err = run(
+            capsys,
+            "handoff-check",
+            "--card",
+            CARD,
+            "--head",
+            "d" * 57,
+            "--db",
+            str(board),
+        )
+        assert code == 2
+        assert out == ""
+        assert "40 或 64 位" in err
+
+    def test_merge_stage_not_done_is_rc1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        board = make_db(
+            tmp_path / "merge.db",
+            status="running",
+            events=[("impl_done", json.dumps({"head_sha": HEAD, "pr": 9}))],
+        )
+        code, out, _ = run(
+            capsys,
+            "handoff-check",
+            "--card",
+            CARD,
+            "--head",
+            HEAD,
+            "--stage",
+            "merge",
+            "--db",
+            str(board),
+        )
+        assert code == 1
+        assert "impl-not-done" in out
+

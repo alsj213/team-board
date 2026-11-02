@@ -903,7 +903,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     handoff_cmd.add_argument("--card", required=True, metavar="CARD", help="卡号")
-    handoff_cmd.add_argument("--head", required=True, metavar="SHA", help="当前 head（40 位）")
+    handoff_cmd.add_argument(
+        "--head", required=True, metavar="SHA", help="当前 head（40 或 64 位小写十六进制）"
+    )
     handoff_cmd.add_argument(
         "--stage",
         choices=flow.STAGES,
@@ -2578,8 +2580,8 @@ def _run_handoff_check(args: argparse.Namespace) -> int:
     if mergeowner.CARD_RE.fullmatch(args.card) is None:
         _write_stderr_error(f"卡号形态非法: {args.card!r}（应为 t_ 开头 8 位小写十六进制）")
         return 2
-    if re.fullmatch(r"[0-9a-f]{40}", args.head, re.ASCII) is None:
-        _write_stderr_error(f"head 不是 40 位小写十六进制: {args.head!r}")
+    if flow.HEAD_RE.fullmatch(args.head) is None:
+        _write_stderr_error(f"head 不是 40 或 64 位小写十六进制: {args.head!r}")
         return 2
     conn = None
     try:
@@ -2607,7 +2609,7 @@ def _run_handoff_check(args: argparse.Namespace) -> int:
             continue
         if isinstance(data, dict):
             head = data.get("head_sha")
-            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head, re.ASCII):
+            if isinstance(head, str) and flow.HEAD_RE.fullmatch(head):
                 impl_heads.append(head)
 
     report = flow.check_handoff(

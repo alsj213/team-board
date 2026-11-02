@@ -1530,7 +1530,7 @@ spawn 前调用；有冲突的卡应串行，不要并行派工。
 
 ```bash
 team-board card-audit --card t_xxxxxxxx [--db PATH] [--json]
-team-board handoff-check --card t_xxxxxxxx --head <40hex> [--stage review|pm|merge] [--db PATH] [--json]
+team-board handoff-check --card t_xxxxxxxx --head <40|64 hex> [--stage review|pm|merge] [--db PATH] [--json]
 ```
 
 `card-audit` 检查实现卡正文必须有：

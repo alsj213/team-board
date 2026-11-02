@@ -92,6 +92,19 @@ class TestHandoff:
         )
         assert [item.code for item in report.findings] == ["impl-not-done"]
 
+    def test_sha256_head_is_supported(self) -> None:
+        """``evidence.HEAD_RE`` 允许 64 位 head，这里不能把它判成“没有 impl_done”。"""
+
+        long_head = "c" * 64
+        report = flow.check_handoff(
+            CARD, long_head, "review", impl_heads=(long_head,), rework_count=0
+        )
+        assert report.ok is True
+        stale = flow.check_handoff(
+            CARD, HEAD, "review", impl_heads=(long_head,), rework_count=0
+        )
+        assert [item.code for item in stale.findings] == ["impl-done-stale"]
+
     def test_bad_stage_raises(self) -> None:
         import pytest
 
