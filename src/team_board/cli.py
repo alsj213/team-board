@@ -185,6 +185,7 @@ argparse 当成 flag → 照抄即 rc2「expected one argument」；``--opt=valu
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
@@ -193,6 +194,7 @@ import shlex
 import sqlite3
 import subprocess  # nosec B404 - gate 子命令要跑外部检查器，这是本工具的用途
 import sys
+import tempfile
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -208,12 +210,15 @@ from . import (
     evidence,
     evidence_store,
     gatelog,
+    mergecard,
     mergeowner,
     merges,
     outputaudit,
+    pathclaim,
     prclaim,
     pushguard,
     reviewhead,
+    tip,
     train,
     verifybatch,
     web,
@@ -307,10 +312,10 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**十七个**子命令（个数以
+    """建 CLI 前端：prog=team-board，共**二十三个**子命令（个数以
     ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
     不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
-    与 README 的「共十七个子命令」同源）。
+    与 README 的「共二十三个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -731,6 +736,146 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DB,
         metavar="PATH",
         help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+
+    path_cmd = subparsers.add_parser(
+        "path-claim-audit",
+        help=(
+            "稽核未结卡的 PATH-CLAIM 改动面（0 无冲突 / 1 有冲突或解析问题 / "
+            "2 参数或环境错误）"
+        ),
+    )
+    path_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    path_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="机器可读输出（给 dispatcher / 看板插件用）",
+    )
+
+    path_check = subparsers.add_parser(
+        "path-claim-check",
+        help=(
+            "只判一张卡的 PATH-CLAIM 是否与其它未结卡相交（0 无冲突 / 1 冲突或无认领 / "
+            "2 参数或环境错误）"
+        ),
+    )
+    path_check.add_argument(
+        "--card",
+        required=True,
+        metavar="CARD",
+        help="卡号（t_ 开头 8 位小写十六进制）",
+    )
+    path_check.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    path_check.add_argument(
+        "--json",
+        action="store_true",
+        help="机器可读输出",
+    )
+
+    merge_card_cmd = subparsers.add_parser(
+        "merge-card",
+        help=(
+            "实现卡 done 后建 repo 合并卡（0 已建/已存在 / 1 前置条件不满足 / "
+            "2 参数或环境错误）"
+        ),
+    )
+    merge_card_cmd.add_argument(
+        "--impl-card",
+        required=True,
+        metavar="CARD",
+        help="实现卡号（t_ 开头 8 位小写十六进制）",
+    )
+    merge_card_cmd.add_argument(
+        "--pr",
+        required=True,
+        type=int,
+        metavar="N",
+        help="要合并的 PR 号",
+    )
+    merge_card_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="git 仓库路径（默认当前目录）",
+    )
+    merge_card_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径，只读（默认 {DEFAULT_DB}）",
+    )
+    merge_card_cmd.add_argument(
+        "--branch",
+        default=None,
+        metavar="NAME",
+        help="卡分支（默认 wt/<impl-card>）",
+    )
+    merge_card_cmd.add_argument(
+        "--title",
+        default=None,
+        metavar="TEXT",
+        help="合并卡标题（默认按实现卡标题生成）",
+    )
+    merge_card_cmd.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印计划，不调 hermes create",
+    )
+    merge_card_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="机器可读输出",
+    )
+
+    tip_cmd = subparsers.add_parser(
+        "tip-broadcast",
+        help=(
+            "列出落后于 origin/main 的卡分支 PR；--apply 时用 gh pr update-branch --rebase "
+            "更新（默认 dry-run）"
+        ),
+    )
+    tip_cmd.add_argument(
+        "--repo",
+        default=".",
+        metavar="PATH",
+        help="git 仓库路径（默认当前目录）",
+    )
+    tip_cmd.add_argument(
+        "--remote",
+        default="origin",
+        metavar="NAME",
+        help="远端名（默认 origin）",
+    )
+    tip_cmd.add_argument(
+        "--main",
+        default="main",
+        metavar="NAME",
+        help="主分支名（默认 main）",
+    )
+    tip_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="真正执行 gh pr update-branch --rebase（缺省只报告）",
+    )
+    tip_cmd.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="不先 git fetch（用本地已有的远端 ref）",
+    )
+    tip_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="机器可读输出",
     )
 
     head_cmd = subparsers.add_parser(
@@ -2135,6 +2280,257 @@ def _run_pr_claim_audit(args: argparse.Namespace) -> int:
     return prclaim.exit_code(report)
 
 
+def _run_path_claim_audit(args: argparse.Namespace) -> int:
+    """``path-claim-audit``：读未结卡正文的 ``PATH-CLAIM``，判两两冲突。"""
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        rows = db.iter_claim_rows(conn)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    claims, issues = pathclaim.parse_rows(rows)
+    report = pathclaim.audit(claims, issues)
+    text = pathclaim.render_json(report) if args.json else pathclaim.render(report)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return pathclaim.exit_code(report)
+
+
+def _run_path_claim_check(args: argparse.Namespace) -> int:
+    """``path-claim-check``：只判指定卡与其它未结卡的路径冲突。"""
+
+    if mergeowner.CARD_RE.fullmatch(args.card) is None:
+        _write_stderr_error(f"卡号形态非法: {args.card!r}（应为 t_ 开头 8 位小写十六进制）")
+        return 2
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        rows = db.iter_claim_rows(conn)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    claims, issues = pathclaim.parse_rows(rows)
+    target = next((claim for claim in claims if claim.card_id == args.card), None)
+    if target is None:
+        _write_stderr_error(f"卡不存在或未结: {args.card}")
+        return 1
+    if not target.paths:
+        _write_stderr_error(
+            f"卡 {args.card} 没有 PATH-CLAIM；先在正文顶格写 "
+            "PATH-CLAIM: <path>[, <path>]"
+        )
+        return 1
+
+    report = pathclaim.check_card(claims, args.card, issues)
+    text = pathclaim.render_json(report) if args.json else pathclaim.render(report)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return pathclaim.exit_code(report)
+
+
+def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
+    """``gh pr view`` 取 state/headRefOid/title；失败抛 :class:`train.TrainError`（rc2）。
+
+    gh 挂掉 / 输出不是 JSON 属于**环境错误**（help 与 README 都写「2 参数或环境错误」），
+    不能折成 rc1 —— rc1 是「前置条件不满足」专用码。
+    """
+
+    proc = train.default_run(
+        (
+            "gh",
+            "pr",
+            "view",
+            str(pr),
+            "-R",
+            slug,
+            "--json",
+            "state,headRefOid,title",
+        ),
+        repo,
+    )
+    if proc.returncode != 0:
+        raise train.TrainError(
+            f"gh pr view #{pr} 失败（rc={proc.returncode}）：{proc.stderr.strip()}"
+        )
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise train.TrainError(
+            f"gh pr view #{pr} 输出不是合法 JSON：{proc.stdout[:200]!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise train.TrainError(f"gh pr view #{pr} 返回的不是对象")
+    return {
+        "state": str(payload.get("state", "")),
+        "head": str(payload.get("headRefOid", "")),
+        "title": str(payload.get("title", "")),
+    }
+
+
+def _run_merge_card(args: argparse.Namespace) -> int:
+    """``merge-card``：实现卡 done 后建 repo 合并卡（不再让 worker 提前建卡）。"""
+
+    if mergeowner.CARD_RE.fullmatch(args.impl_card) is None:
+        _write_stderr_error(
+            f"实现卡号形态非法: {args.impl_card!r}（应为 t_ 开头 8 位小写十六进制）"
+        )
+        return 2
+    if args.pr <= 0:
+        _write_stderr_error(f"PR 号非法: {args.pr}")
+        return 2
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        status, title, _body = db.load_card_row(conn, args.impl_card)
+        pending = db.iter_pending_cards(conn)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # done 前置**先**判：卡没 done 时不该因为 gh / repo 故障看到另一条错（qa F2）。
+    try:
+        mergecard.check_impl_done(args.impl_card, status)
+        slug = train.repo_slug(args.repo, "origin", train.default_run)
+        view = _gh_pr_view(args.repo, slug, args.pr)
+    except mergecard.MergeCardError as exc:
+        _write_stderr_error(str(exc))
+        return 1
+    except (train.TrainError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    try:
+        card_plan = mergecard.plan(
+            impl_card=args.impl_card,
+            impl_status=status,
+            impl_title=title,
+            pr=args.pr,
+            pr_state=view["state"],
+            head_oid=view["head"],
+            slug=slug,
+            pending_rows=pending,
+            branch=args.branch,
+            title=args.title,
+            repo=args.repo,
+        )
+    except mergecard.MergeCardError as exc:
+        _write_stderr_error(str(exc))
+        return 1
+    except (train.TrainError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    if card_plan.existing is not None:
+        if args.json:
+            text = json.dumps(
+                {"existing": card_plan.existing, "impl_card": args.impl_card, "pr": args.pr},
+                ensure_ascii=False,
+            )
+        else:
+            text = f"已存在开放合并卡: {card_plan.existing}（PR #{args.pr}，未重复建）"
+        if not _write_stdout(text + "\n"):
+            return 2
+        return 0
+
+    if args.dry_run:
+        if args.json:
+            text = json.dumps(
+                {
+                    "dry_run": True,
+                    "impl_card": args.impl_card,
+                    "pr": args.pr,
+                    "title": card_plan.title,
+                    "body": card_plan.body,
+                    "idempotency_key": card_plan.idempotency_key,
+                },
+                ensure_ascii=False,
+            )
+        else:
+            text = (
+                f"合并卡计划（dry-run）\n标题: {card_plan.title}\n"
+                f"assignee: repo\nparent: {args.impl_card}\n\n{card_plan.body}"
+            )
+        if not _write_stdout(text + "\n"):
+            return 2
+        return 0
+
+    body_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".md", delete=False
+        ) as handle:
+            handle.write(card_plan.body)
+            body_path = handle.name
+        result = mergecard.create_merge_card(card_plan, body_path=body_path)
+    except OSError as exc:
+        _write_stderr_error(f"写合并卡正文失败：{exc}")
+        return 2
+    finally:
+        if body_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(body_path)
+
+    if not result.ok:
+        detail = result.stderr.strip() or result.stdout.strip()
+        _write_stderr_error(
+            f"建合并卡失败（rc={result.rc}）：{detail or 'hermes create 无输出'}"
+        )
+        return 2
+    if args.json:
+        text = json.dumps(
+            {
+                "created": result.card_id,
+                "impl_card": args.impl_card,
+                "pr": args.pr,
+                "title": card_plan.title,
+            },
+            ensure_ascii=False,
+        )
+    else:
+        text = f"已建合并卡: {result.card_id}（实现卡 {args.impl_card} 已 done）"
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0
+
+
+def _run_tip_broadcast(args: argparse.Namespace) -> int:
+    """``tip-broadcast``：报告/更新落后于 origin/main 的卡分支 PR。"""
+
+    try:
+        report = tip.broadcast(
+            args.repo,
+            remote=args.remote,
+            main=args.main,
+            apply=args.apply,
+            fetch=not args.no_fetch,
+        )
+    except (tip.TipError, train.TrainError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    text = tip.render_json(report) if args.json else tip.render(report)
+    if not _write_stdout(text + "\n"):
+        return 2
+    if args.apply:
+        return 1 if report.failed else 0
+    return 1 if report.behind else 0
+
+
 def _run_evidence_audit(args: argparse.Namespace) -> int:
     """``evidence audit`` 子命令：只读取数 + 调 :func:`evidence.judge`，不重写判定。
 
@@ -2683,6 +3079,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "pr-claim-audit":
         return _run_pr_claim_audit(args)
+
+    if args.command == "path-claim-audit":
+        return _run_path_claim_audit(args)
+    if args.command == "path-claim-check":
+        return _run_path_claim_check(args)
+
+    if args.command == "merge-card":
+        return _run_merge_card(args)
+    if args.command == "tip-broadcast":
+        return _run_tip_broadcast(args)
 
     if args.command == "evidence":
         return _run_evidence(args)

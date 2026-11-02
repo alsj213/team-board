@@ -22,14 +22,16 @@ team-board member engineer
 team-board export
 ```
 
-共十九个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+共二十三个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
 `commit-audit` / `merge-record` / `body-audit` / `gate` / `output-audit` / `push-guard` /
-`pr-claim-audit` / `pr-review-head-audit` / `evidence` / `merge-owner-audit` /
-`verify-batch` / `merge-train` / `serve`
+`pr-claim-audit` / `path-claim-audit` / `path-claim-check` / `merge-card` / `tip-broadcast` /
+`pr-review-head-audit` / `evidence` / `merge-owner-audit` / `verify-batch` / `merge-train` /
+`serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
-`pr-claim-audit` 见「PR 认领唯一性稽核」一节，`merge-owner-audit` 见「PR 合并归属稽核」一节，
-`gate` 见「闸门日志」一节，
+`pr-claim-audit` 见「PR 认领唯一性稽核」一节，`path-claim-audit` / `path-claim-check`
+见「路径认领」一节，`merge-card` 见「合并卡生命周期」一节，`tip-broadcast` 见
+「tip 广播」一节，`merge-owner-audit` 见「PR 合并归属稽核」一节，`gate` 见「闸门日志」一节，
 `output-audit` 见「输出上限稽核」一节，`evidence` 见「evidence 事件」一节）。
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
@@ -1498,6 +1500,69 @@ team-board evidence audit --card t_xxxxxxxx --head <40/64 位小写 hex> \
 > 先建卡 → 分支叫 `wt/t_<卡号>` → 再开 PR。
 > 不许用 `wt/setup-xxx` / `chore/xxx` / 裸 `wt/t_x` 这类无卡号分支开 PR —— 这样的 PR
 > 过不了证据闸门（合并卡与证据卡是两张卡也没关系，合并卡号走 `--card`）。
+## 路径认领（path-claim-audit / path-claim-check）
+
+并行派工前先声明改动面，避免两张卡同时改同一文件（2026-11-02 实测：同文件并行会
+dirty → 多一轮 rebase）。卡正文**顶格**写（可重复，逗号分隔）：
+
+```text
+PATH-CLAIM: src/team_board/foo.py, tests/unit/test_foo.py
+```
+
+口径：
+
+- 只认顶格行；绝对路径、`..` 段、反斜杠、控制字符一律算解析问题；
+- 以 `/` 结尾表示目录认领，目录与其下任意路径相交；
+- 含 `*` / `?` / `[` 的认领按 `fnmatch` 保守匹配；
+- 只看**未结卡**（`status NOT IN ('done','archived')`）；已结卡不参与。
+
+```bash
+team-board path-claim-audit [--db PATH] [--json]   # 0 无冲突 / 1 有冲突或解析问题 / 2 环境错误
+team-board path-claim-check --card t_xxxxxxxx [--db PATH] [--json]  # 0 安全 / 1 冲突或无认领
+```
+
+`--json` 输出 `claims` / `conflicts` / `issues`，供 dispatcher 或看板插件在
+spawn 前调用；有冲突的卡应串行，不要并行派工。
+
+## 合并卡生命周期（merge-card）
+
+合并卡必须等**实现卡 done** 之后才能建。提前建会被 `kanban_unstick` 判成
+“重复认领”归档（2026-11-01/02 两次实测），所以把前置条件做成命令：
+
+```bash
+team-board merge-card --impl-card t_xxxxxxxx --pr 90 [--repo PATH] [--db PATH] \
+  [--branch wt/t_xxxxxxxx] [--title TEXT] [--dry-run] [--json]
+```
+
+- 实现卡状态必须是 `done`；PR 必须是 `OPEN`；
+- `done` 前置在调 `gh` **之前**判：实现卡还在 running 时报的是「只有 done 之后才能建
+  合并卡」，不会因为 `gh` 网络故障先冒另一条错；
+- 库里已有同 PR 的开放合并卡 → 幂等返回，不重复建；
+- 其它未结卡仍认领该 PR → rc1（先让它 done/归档）；
+- 通过后起 `hermes kanban create --assignee repo --parent <impl> --json`，
+  正文首行固定 `PR-CLAIM: #<n>`，并带**可照抄执行**的 merge-record / merge_guard
+  命令：以 `cd <repo> && PYTHONPATH=<repo>/src` 打头 + `python3 -m` 模块入口，与
+  `merge-record` 打印的那一行同形（不写裸 `merge_guard` —— 本仓没有这个可执行文件，
+  照抄只会 rc=127）。
+
+退出码：0 已建/已存在，1 前置条件不满足，2 参数或环境错误（`gh` / `git`
+取不到数、repo 不是 git 仓库、库读不到都算这一类）。
+
+## tip 广播（tip-broadcast）
+
+每次合并后 `origin/main` 前进，仍开着的卡分支需要跟 tip。命令默认 dry-run：
+
+```bash
+team-board tip-broadcast [--repo PATH] [--remote origin] [--main main] [--apply] [--json]
+```
+
+- 只检查 head 为 `wt/t_<8hex>`、base=main、非 draft 的开放 PR；
+- 用 `git merge-base --is-ancestor <tip> <head>` 判落后；rc1 = 落后，其它 rc = 判不了；
+- `--apply` 对落后 PR 执行 `gh pr update-branch <n> --rebase`，逐条记录 rc；
+- 更新后内容若变化，证据/双问是否仍有效由 `merge_guard` 的 patch 指纹重新判。
+
+退出码：dry-run 有落后 → 1，否则 0；`--apply` 有更新失败 → 1，否则 0；取数失败 → 2。
+
 ## 通用参数
 
 `list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
