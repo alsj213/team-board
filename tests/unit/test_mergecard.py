@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from collections.abc import Sequence
 from typing import Any
 
@@ -87,6 +88,67 @@ class TestPlan:
         card = plan(branch="wt/t_1234abcd", title="自定义")
         assert card.title == "自定义"
         assert "head=wt/t_1234abcd" in card.body
+
+
+class TestCheckImplDone:
+    def test_done_passes(self) -> None:
+        mergecard.check_impl_done(IMPL, "done")  # 不抛就是通过
+
+    @pytest.mark.parametrize("status", ["running", "ready", "blocked", ""])
+    def test_not_done_raises(self, status: str) -> None:
+        with pytest.raises(mergecard.MergeCardError, match="只有 done"):
+            mergecard.check_impl_done(IMPL, status)
+
+    def test_constant_is_done(self) -> None:
+        assert mergecard.IMPL_DONE == "done"
+
+
+class TestBodyCommands:
+    """qa F1：正文里的两条命令必须**照抄即能跑**（不是裸 ``merge_guard``）。"""
+
+    def commands(self, card: mergecard.MergeCardPlan) -> list[str]:
+        return [ln for ln in card.body.splitlines() if ln.startswith("cd ")]
+
+    def test_two_executable_commands(self) -> None:
+        cmds = self.commands(plan())
+        assert len(cmds) == 2
+        record, merge = cmds
+        assert " python3 -m team_board.cli merge-record" in record
+        assert " python3 -m team_board.merge_guard" in merge
+        assert "--delete-branch" in merge
+        assert "--method merge" in merge
+
+    def test_no_bare_merge_guard(self) -> None:
+        for line in plan().body.splitlines():
+            head = line.strip().split(" ")[0] if line.strip() else ""
+            assert head not in {"merge_guard", "team-board"}, line
+
+    def test_absolute_repo_and_body_file(self) -> None:
+        cmds = self.commands(plan(repo="/home/liu/project/team-board"))
+        for cmd in cmds:
+            assert "cd /home/liu/project/team-board &&" in cmd
+            assert "PYTHONPATH=/home/liu/project/team-board/src" in cmd
+        record, merge = cmds
+        assert f"--body-out /tmp/{IMPL}-merge-{PR}.body" in record
+        assert f"--body-file /tmp/{IMPL}-merge-{PR}.body" in merge
+        assert "--repo /home/liu/project/team-board" in merge
+
+    def test_repo_path_with_space_is_quoted(self) -> None:
+        merge = self.commands(plan(repo="/tmp/a b"))[1]
+        assert merge.startswith("cd '/tmp/a b' && PYTHONPATH='/tmp/a b/src'")
+        assert "--repo '/tmp/a b'" in merge
+
+    def test_subject_is_quoted_single_token(self) -> None:
+        merge = self.commands(plan(impl_title="fix: 空格 与 $HOME 都算标题"))[1]
+        tokens = shlex.split(merge)
+        subject = tokens[tokens.index("--subject") + 1]
+        assert subject == f"Merge PR #{PR}（{IMPL}）：fix: 空格 与 $HOME 都算标题"
+        assert len(merge.splitlines()) == 1
+
+    def test_body_fits_2048_bytes(self) -> None:
+        long_repo = "/home/liu/project/some-really-long-checkout-name/team-board"
+        body = plan(repo=long_repo).body
+        assert len(body.encode("utf-8")) <= 2048
 
 
 class TestCreatedId:

@@ -1535,12 +1535,18 @@ team-board merge-card --impl-card t_xxxxxxxx --pr 90 [--repo PATH] [--db PATH] \
 ```
 
 - 实现卡状态必须是 `done`；PR 必须是 `OPEN`；
+- `done` 前置在调 `gh` **之前**判：实现卡还在 running 时报的是「只有 done 之后才能建
+  合并卡」，不会因为 `gh` 网络故障先冒另一条错；
 - 库里已有同 PR 的开放合并卡 → 幂等返回，不重复建；
 - 其它未结卡仍认领该 PR → rc1（先让它 done/归档）；
 - 通过后起 `hermes kanban create --assignee repo --parent <impl> --json`，
-  正文首行固定 `PR-CLAIM: #<n>`，并带 merge-record / merge_guard 命令模板。
+  正文首行固定 `PR-CLAIM: #<n>`，并带**可照抄执行**的 merge-record / merge_guard
+  命令：以 `cd <repo> && PYTHONPATH=<repo>/src` 打头 + `python3 -m` 模块入口，与
+  `merge-record` 打印的那一行同形（不写裸 `merge_guard` —— 本仓没有这个可执行文件，
+  照抄只会 rc=127）。
 
-退出码：0 已建/已存在，1 前置条件不满足，2 参数或环境错误。
+退出码：0 已建/已存在，1 前置条件不满足，2 参数或环境错误（`gh` / `git`
+取不到数、repo 不是 git 仓库、库读不到都算这一类）。
 
 ## tip 广播（tip-broadcast）
 

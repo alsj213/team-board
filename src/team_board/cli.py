@@ -2340,7 +2340,11 @@ def _run_path_claim_check(args: argparse.Namespace) -> int:
 
 
 def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
-    """``gh pr view`` 取 state/headRefOid/title；失败抛 ``MergeCardError``。"""
+    """``gh pr view`` 取 state/headRefOid/title；失败抛 :class:`train.TrainError`（rc2）。
+
+    gh 挂掉 / 输出不是 JSON 属于**环境错误**（help 与 README 都写「2 参数或环境错误」），
+    不能折成 rc1 —— rc1 是「前置条件不满足」专用码。
+    """
 
     proc = train.default_run(
         (
@@ -2356,17 +2360,17 @@ def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
         repo,
     )
     if proc.returncode != 0:
-        raise mergecard.MergeCardError(
+        raise train.TrainError(
             f"gh pr view #{pr} 失败（rc={proc.returncode}）：{proc.stderr.strip()}"
         )
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
-        raise mergecard.MergeCardError(
+        raise train.TrainError(
             f"gh pr view #{pr} 输出不是合法 JSON：{proc.stdout[:200]!r}"
         ) from exc
     if not isinstance(payload, dict):
-        raise mergecard.MergeCardError(f"gh pr view #{pr} 返回的不是对象")
+        raise train.TrainError(f"gh pr view #{pr} 返回的不是对象")
     return {
         "state": str(payload.get("state", "")),
         "head": str(payload.get("headRefOid", "")),
@@ -2398,9 +2402,19 @@ def _run_merge_card(args: argparse.Namespace) -> int:
         if conn is not None:
             conn.close()
 
+    # done 前置**先**判：卡没 done 时不该因为 gh / repo 故障看到另一条错（qa F2）。
     try:
+        mergecard.check_impl_done(args.impl_card, status)
         slug = train.repo_slug(args.repo, "origin", train.default_run)
         view = _gh_pr_view(args.repo, slug, args.pr)
+    except mergecard.MergeCardError as exc:
+        _write_stderr_error(str(exc))
+        return 1
+    except (train.TrainError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    try:
         card_plan = mergecard.plan(
             impl_card=args.impl_card,
             impl_status=status,
@@ -2412,10 +2426,14 @@ def _run_merge_card(args: argparse.Namespace) -> int:
             pending_rows=pending,
             branch=args.branch,
             title=args.title,
+            repo=args.repo,
         )
-    except (mergecard.MergeCardError, train.TrainError, OSError) as exc:
+    except mergecard.MergeCardError as exc:
         _write_stderr_error(str(exc))
         return 1
+    except (train.TrainError, OSError) as exc:
+        _write_stderr_error(str(exc))
+        return 2
 
     if card_plan.existing is not None:
         if args.json:

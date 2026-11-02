@@ -70,6 +70,102 @@ class TestPreconditions:
         assert out == ""
         assert "只有 done" in err
 
+    def test_impl_running_beats_gh_failure(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """qa F2：卡没 done 时先报 done 前置，不冒 gh 的环境错误。"""
+
+        def boom(repo: str, remote: str, run: object) -> str:
+            raise cli.train.TrainError("取 remote origin 失败：not a git repository")
+
+        monkeypatch.setattr(cli.train, "repo_slug", boom)
+        board = make_db(tmp_path / "running2.db", [(IMPL, "running", "engineer", "x", "")])
+        code, out, err = run(
+            capsys, "merge-card", "--impl-card", IMPL, "--pr", str(PR), "--db", str(board)
+        )
+        assert (code, out) == (1, "")
+        assert "只有 done" in err
+        assert "取 remote" not in err
+
+    def test_repo_slug_failure_is_rc2(
+        self,
+        done_board: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """qa F2：取 remote 失败是环境错误 → rc2（不是 rc1）。"""
+
+        def boom(repo: str, remote: str, run: object) -> str:
+            raise cli.train.TrainError("取 remote origin 失败：not a git repository")
+
+        monkeypatch.setattr(cli.train, "repo_slug", boom)
+        code, out, err = run(
+            capsys,
+            "merge-card",
+            "--impl-card",
+            IMPL,
+            "--pr",
+            str(PR),
+            "--db",
+            str(done_board),
+            "--repo",
+            "/tmp",
+        )
+        assert (code, out) == (2, "")
+        assert "取 remote" in err
+
+    def test_gh_failure_is_rc2(
+        self,
+        done_board: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """qa F2：gh 取不到 PR 状态同样是环境错误 → rc2。"""
+
+        def boom(repo: str, slug: str, pr: int) -> dict[str, str]:
+            raise cli.train.TrainError("gh pr view #90 失败（rc=1）：HTTP 502")
+
+        monkeypatch.setattr(cli, "_gh_pr_view", boom)
+        code, out, err = run(
+            capsys, "merge-card", "--impl-card", IMPL, "--pr", str(PR), "--db", str(done_board)
+        )
+        assert (code, out) == (2, "")
+        assert "gh pr view" in err
+
+    def test_pr_merged_is_rc1(
+        self,
+        done_board: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            cli,
+            "_gh_pr_view",
+            lambda repo, slug, pr: {"state": "MERGED", "head": HEAD, "title": "x"},
+        )
+        code, out, err = run(
+            capsys, "merge-card", "--impl-card", IMPL, "--pr", str(PR), "--db", str(done_board)
+        )
+        assert (code, out) == (1, "")
+        assert "只有 OPEN" in err
+
+    def test_bad_card_shape_is_rc2(self, done_board: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        code, out, err = run(
+            capsys, "merge-card", "--impl-card", "t_ZZZZ", "--pr", str(PR), "--db", str(done_board)
+        )
+        assert (code, out) == (2, "")
+        assert "形态非法" in err
+
+    def test_zero_pr_is_rc2(self, done_board: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        code, out, err = run(
+            capsys, "merge-card", "--impl-card", IMPL, "--pr", "0", "--db", str(done_board)
+        )
+        assert (code, out) == (2, "")
+        assert "PR 号非法" in err
+
     def test_existing_merge_card_is_idempotent(
         self, done_board: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -108,6 +204,31 @@ class TestDryRun:
         assert (code, err) == (0, "")
         assert "合并卡计划（dry-run）" in out
         assert f"PR-CLAIM: #{PR}" in out
+
+    def test_dry_run_body_has_runnable_command(
+        self, done_board: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """qa F1：dry-run 打印的正文带可照抄执行的 merge_guard 命令。"""
+
+        code, out, err = run(
+            capsys,
+            "merge-card",
+            "--impl-card",
+            IMPL,
+            "--pr",
+            str(PR),
+            "--db",
+            str(done_board),
+            "--repo",
+            "/home/liu/project/team-board",
+            "--dry-run",
+        )
+        assert (code, err) == (0, "")
+        assert "python3 -m team_board.merge_guard" in out
+        assert "--delete-branch" in out
+        assert "cd /home/liu/project/team-board &&" in out
+        for line in out.splitlines():
+            assert not line.strip().startswith("merge_guard "), line
 
     def test_dry_run_json(
         self, done_board: Path, capsys: pytest.CaptureFixture[str]

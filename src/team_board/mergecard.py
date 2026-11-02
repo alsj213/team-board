@@ -7,9 +7,14 @@
 本模块把建卡前置条件做成一个纯计划函数：
 
 - 从 ``--impl-card``（或 ``wt/t_<id>`` 分支）取实现卡；
-- 实现卡状态必须是 ``done``；
+- 实现卡状态必须是 ``done``（:func:`check_impl_done`，CLI 在调 ``gh`` **之前**先跑它，
+  否则卡没 done 时用户看到的是 gh 的网络报错而不是这条前置条件）；
 - PR 必须 OPEN；已有开放合并卡则幂等返回它，不重复建；
 - 计划通过后才由适配层起 ``hermes kanban create`` 子进程。
+
+卡正文里的合并命令必须是**可照抄执行**的形态：``cd <repo> && PYTHONPATH=<repo>/src
+python3 -m team_board.merge_guard …``（与 ``merge-record`` 打印的那一行同形）。裸
+``merge_guard …`` 在本仓不存在这个可执行文件，repo 照抄只会得到 rc=127。
 
 ``merge_guard`` / ``kanban_unstick`` 的判定不改；本模块只在“建卡”这一步把关。
 """
@@ -17,7 +22,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess  # nosec B404 - 只为起 hermes kanban create 子进程
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -27,10 +34,12 @@ from . import prclaim
 
 __all__ = [
     "BOARD",
+    "IMPL_DONE",
     "CreateResult",
     "MergeCardError",
     "MergeCardPlan",
     "Runner",
+    "check_impl_done",
     "create_argv",
     "create_merge_card",
     "impl_from_branch",
@@ -45,7 +54,9 @@ BOARD = "devteam"
 _BRANCH_RE = re.compile(r"^(?:wt/)?(t_[0-9a-f]{8})$", re.ASCII)
 _CREATED_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 
-_IMPL_DONE = "done"
+#: 实现卡必须处于的状态（``check_impl_done`` 与 ``plan`` 的唯一判据）
+IMPL_DONE = "done"
+_IMPL_DONE = IMPL_DONE
 
 
 class MergeCardError(Exception):
@@ -100,6 +111,16 @@ def impl_from_branch(branch: str) -> str:
     return match.group(1)
 
 
+def check_impl_done(impl_card: str, impl_status: str) -> None:
+    """实现卡没 done 就抛 :class:`MergeCardError`；CLI 在调 ``gh`` 之前先跑这一条。"""
+
+    if impl_status != _IMPL_DONE:
+        raise MergeCardError(
+            f"实现卡 {impl_card} 当前状态是 {impl_status or '空'}；"
+            "只有 done 之后才能建合并卡（避免 kanban_unstick 判重复认领）"
+        )
+
+
 def _title_suffix(impl_title: str) -> str:
     cleaned = " ".join(impl_title.split())
     return cleaned[:60] if cleaned else "实现卡"
@@ -117,18 +138,19 @@ def plan(
     pending_rows: Sequence[tuple[str, str, str, str, str]],
     branch: str | None = None,
     title: str | None = None,
+    repo: str | None = None,
 ) -> MergeCardPlan:
     """校验并构造合并卡计划；不满足前置条件抛 :class:`MergeCardError`。
 
     ``pending_rows`` 是 ``db.iter_pending_cards`` 的 ``(id,status,assignee,title,body)``；
     只用来发现“同一 PR 已有开放合并卡”（幂等）或“别的未结卡仍认领该 PR”（拒绝）。
+
+    ``repo`` 是 ``--repo`` 的路径，只用来把正文里的合并命令拼成**可执行**的绝对路径
+    （``cd <repo> && PYTHONPATH=<repo>/src python3 -m team_board.merge_guard …``）；
+    缺省取当前目录的 realpath。
     """
 
-    if impl_status != _IMPL_DONE:
-        raise MergeCardError(
-            f"实现卡 {impl_card} 当前状态是 {impl_status or '空'}；"
-            "只有 done 之后才能建合并卡（避免 kanban_unstick 判重复认领）"
-        )
+    check_impl_done(impl_card, impl_status)
     if pr <= 0:
         raise MergeCardError(f"PR 号非法: {pr}")
     state = (pr_state or "").strip().upper()
@@ -172,6 +194,7 @@ def plan(
         head_oid=head_oid,
         slug=slug,
         branch=branch_name,
+        repo=repo,
     )
     return MergeCardPlan(
         impl_card=impl_card,
@@ -190,10 +213,32 @@ def _render_body(
     head_oid: str,
     slug: str,
     branch: str,
+    repo: str | None = None,
 ) -> str:
-    """合并卡正文（首行必须顶格 PR-CLAIM，供认领闸门读）。"""
+    """合并卡正文（首行必须顶格 PR-CLAIM，供认领闸门读）。
+
+    两条命令都必须**照抄即能跑**：本仓没有 ``merge_guard`` 这个可执行文件，裸写
+    ``merge_guard …`` 是 rc=127。形态与 ``merge-record`` 打印的那一行完全一致 ——
+    ``cd <repo> && PYTHONPATH=<repo>/src python3 -m team_board.merge_guard …``，
+    ``--body-file`` 恒为绝对路径（``merge_guard`` 拒相对路径）。路径与标题一律过
+    :func:`shlex.quote`（仓库路径含空格、标题含 ``'`` ``$`` 时照抄仍是一条命令）。
+    """
 
     subject = f"Merge PR #{pr}（{impl_card}）：{_title_suffix(impl_title)}"
+    repo_q = shlex.quote(os.path.realpath(repo if repo else "."))
+    src_q = shlex.quote(os.path.realpath(repo if repo else ".") + "/src")
+    body_file = f"/tmp/{impl_card}-merge-{pr}.body"
+    record = (
+        f"cd {repo_q} && PYTHONPATH={src_q} python3 -m team_board.cli merge-record"
+        f" --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID"
+        f" --pr {pr} --branch {branch} --body-out {body_file}"
+    )
+    merge = (
+        f"cd {repo_q} && PYTHONPATH={src_q} python3 -m team_board.merge_guard"
+        f" --pr {pr} --branch {branch} --method merge --delete-branch"
+        " --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID"
+        f" --subject {shlex.quote(subject)} --body-file {body_file} --repo {repo_q}"
+    )
     return f"""PR-CLAIM: #{pr}
 TEMPLATE: card-template.md#v3
 
@@ -201,8 +246,19 @@ TEMPLATE: card-template.md#v3
 
 - PR https://github.com/{slug}/pull/{pr}（base=main，head={branch} @ {head_oid}）
 - 实现卡 {impl_card} 已 done（{_title_suffix(impl_title)}）
-- 合并：`team-board merge-record --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID --pr {pr} --branch {branch} --body-out <绝对路径>`，再 `merge_guard --pr {pr} --branch {branch} --method merge --delete-branch --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID --subject '{subject}' --body-file <绝对路径> --repo <repo>`
-- 合并后 `git ls-remote --exit-code --refs origin refs/heads/{branch}` rc=2；`merge-audit --repo . --card $HERMES_KANBAN_TASK --require --rev origin/main` rc=0
+- 第 1 步 生成认账 body（同时打印第 2 步的命令）：
+
+```
+{record}
+```
+
+- 第 2 步 合并（R12 唯一入口，缺 --delete-branch 会被拒）：
+
+```
+{merge}
+```
+
+- 合并后 `git ls-remote --exit-code --refs origin refs/heads/{branch}` rc=2
 
 不做：不改代码、不改验收。
 """
