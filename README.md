@@ -1320,6 +1320,82 @@ PR #50 MERGED
 内容（patch/head）」（`audit` 见下一节「证据状态机稽核」）。两者共用父解析器，
 `evidence --help` 里是 `{emit,audit,patch}`。
 
+### 子命令表与 `--help` 原文（本机实跑，rc 均为 0）
+
+```
+$ PYTHONPATH=src python -m team_board.cli evidence --help; echo rc=$?
+usage: team-board evidence [-h] {audit,patch,emit} ...
+
+positional arguments:
+  {audit,patch,emit}
+    audit             判一张卡的四槽证据（0 四槽齐且绑该 head / 1 判定不通过 / 2 参数或环境错误）
+    patch             计算当前 PR 的内容指纹（rebase 复用证据用；stdout 一行 40 hex）
+    emit              追加一条 evidence 事件（身份取自看板库：tasks.current_run_id →
+                      task_runs.profile）
+
+options:
+  -h, --help          show this help message and exit
+rc=0
+```
+
+`emit` 一行（写入口）：
+
+```
+$ PYTHONPATH=src python -m team_board.cli evidence emit --help; echo rc=$?
+usage: team-board evidence emit [-h] --kind KIND [--payload JSON]
+                                [--disc defect|regression] [--head SHA]
+                                [--patch 40HEX] [--pr N] [--run-id RUN]
+                                [--tier A|B|C] [--reason TEXT]
+                                [--verdict pass|block] [--card t_xxxxxxxx]
+                                [--db PATH]
+
+options:
+  -h, --help            show this help message and exit
+  --kind KIND           事件类型（可 emit 的是 evidence.EMITTABLE_KINDS 里的六个；merged 由
+                        merge_audit trailer 承载，emit 一律 rc1）
+  --payload JSON        payload 的唯一权威入口（JSON 对象字符串；落库存 evidence.normalize 结果）。
+                        省略时用下面的便捷参数拼：--head/--disc/--verdict/--tier/--reason/-
+                        -pr/--run-id
+  --disc defect|regression
+                        review 事件的判别值（等价于 --payload 里的 kind；review 专用）
+  --head SHA            要绑定的 head sha（等价于 --payload 里的 head_sha；40 或 64
+                        位小写十六进制）
+  --patch 40HEX         要绑定的内容指纹（等价于 --payload 里的 patch；tier/qa_pass/review
+                        可用；40 位小写十六进制）
+  --pr N                PR 号（等价于 --payload 里的 pr；impl_done / boss_approve 用）
+  --run-id RUN          调用者 run 号（作为 --payload 里 run_id 的缺省值；给了就必须是本卡当前
+                        running run，否则 rc1）
+  --tier A|B|C          tier 事件的档位（等价于 --payload 里的 tier）
+  --reason TEXT         tier 事件的理由（等价于 --payload 里的 reason，≤200 字符）
+  --verdict pass|block  review 事件的结论（等价于 --payload 里的 verdict）
+  --card t_xxxxxxxx     调用者卡号（缺省取 HERMES_KANBAN_TASK，其次
+                        HERMES_KANBAN_WORKSPACE 的 basename）
+  --db PATH             看板 SQLite 路径（默认
+                        /home/liu/.hermes/kanban/boards/devteam/kanban.db）
+rc=0
+```
+
+`audit` 一行（只读判定）：
+
+```
+$ PYTHONPATH=src python -m team_board.cli evidence audit --help; echo rc=$?
+usage: team-board evidence audit [-h] --card ID --head SHA [--pr N]
+                                 [--patch 40HEX] [--db PATH]
+
+options:
+  -h, --help     show this help message and exit
+  --card ID      卡号（必须是 t_<8 位小写十六进制>，例 t_2ad370ff；其它形态 rc2）
+  --head SHA     要绑定的 head sha（40 或 64 位小写十六进制；39 位 / 大写一律 rc2）
+  --pr N         被合并的 PR 号（1-999999999 的 ASCII 十进制正整数；缺省不判 impl_done
+                 串卡，给了就必须合法，否则 rc2）
+  --patch 40HEX  当前内容指纹（40 位小写十六进制；给了就按 patch 判，rebase 后可复用证据；缺省按 --head 判）
+  --db PATH      看板 SQLite 路径，只读（默认
+                 /home/liu/.hermes/kanban/boards/devteam/kanban.db）
+rc=0
+```
+
+全过程（写证据 → 判定 → 合并闸门 → 证据缺失自动建卡）见 `docs/evidence-events.md`。
+
 ```
 team-board evidence emit --kind KIND (--payload '<json>' | --head SHA ...) [--card t_xxxxxxxx] [--db PATH]
 ```
