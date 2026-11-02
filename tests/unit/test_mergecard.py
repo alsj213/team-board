@@ -196,3 +196,15 @@ class TestCreate:
         assert result.ok is False
         assert result.card_id is None
         assert "boom" in result.stderr
+
+
+def test_default_runner_captures_stdout() -> None:
+    """2026-11-03 dogfood：默认 runner 不捕获 stdout 会把成功建卡误报成失败。"""
+
+    import sys
+
+    proc = mergecard._default_runner(
+        (sys.executable, "-c", "print('{\"id\": \"t_abcd1234\"}')")
+    )
+    assert proc.returncode == 0
+    assert "t_abcd1234" in (proc.stdout or "")

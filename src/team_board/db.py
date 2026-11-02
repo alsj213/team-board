@@ -340,3 +340,25 @@ def load_card_row(
         "" if row[1] is None else str(row[1]),
         "" if row[2] is None else str(row[2]),
     )
+
+
+def iter_card_events(
+    conn: sqlite3.Connection, card_id: str, kinds: tuple[str, ...]
+) -> list[tuple[str, str]]:
+    """``(kind, payload)`` 按事件 id 升序；payload 为 NULL 归成空串。
+
+    只读；``kinds`` 由调用方给常量元组，不拼接外部输入。
+    """
+
+    if not kinds:
+        return []
+    placeholders = ",".join("?" for _ in kinds)
+    sql = (
+        "SELECT kind, payload FROM task_events "  # nosec B608 - placeholders 由常量生成
+        f"WHERE task_id = ? AND kind IN ({placeholders}) ORDER BY id"
+    )
+    try:
+        rows = conn.execute(sql, (card_id, *kinds)).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 task_events 失败: {exc}") from exc
+    return [(str(row[0]), "" if row[1] is None else str(row[1])) for row in rows]
