@@ -898,7 +898,26 @@ def build_parser() -> argparse.ArgumentParser:
             "0 通过 / 1 有缺项 / 2 参数或环境错误"
         ),
     )
-    card_audit_cmd.add_argument("--card", required=True, metavar="CARD", help="卡号")
+    card_audit_cmd.add_argument(
+        "--card", default=None, metavar="CARD", help="卡号（与 --sweep 二选一）"
+    )
+    card_audit_cmd.add_argument(
+        "--sweep",
+        action="store_true",
+        help="扫描 ready/todo 卡；缺契约的卡报告或（--apply）block，防止带病派工",
+    )
+    card_audit_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="--sweep 时真正调用 hermes kanban block（缺省只报告）",
+    )
+    card_audit_cmd.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="--sweep 本次最多处理几张（默认 20）",
+    )
     card_audit_cmd.add_argument(
         "--db",
         default=DEFAULT_DB,
@@ -2780,9 +2799,98 @@ def _run_merge_card(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sweep_card_audit(args: argparse.Namespace) -> int:
+    """扫描 ready/todo 卡，报告或 block 缺卡面契约的卡（派工前机械闸门）。"""
+
+    if args.limit < 1:
+        _write_stderr_error(f"--limit 必须 >= 1: {args.limit}")
+        return 2
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        tasks = db.load_tasks(conn)
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    results: list[dict[str, object]] = []
+    seen = 0
+    try:
+        for task in tasks:
+            if task.status not in {"ready", "todo"}:
+                continue
+            if seen >= args.limit:
+                break
+            try:
+                _status, title, body = db.load_card_row(conn, task.id)
+            except db.BoardError as exc:
+                results.append({"card": task.id, "status": "error", "reason": str(exc)})
+                continue
+            report = flow.audit_card(task.id, title, body)
+            if report.ok:
+                continue
+            seen += 1
+            codes = ",".join(item.code for item in report.findings)
+            if not args.apply:
+                results.append(
+                    {"card": task.id, "status": "invalid", "reason": codes,
+                     "findings": [item.message for item in report.findings]}
+                )
+                continue
+            proc = subprocess.run(  # nosec B603 - argv 常量元组，不经 shell
+                (
+                    "hermes", "kanban", "--board", "devteam", "block", task.id,
+                    f"card-audit 机械拦截：{'；'.join(item.code for item in report.findings)}",
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                results.append(
+                    {"card": task.id, "status": "error", "reason": codes,
+                     "detail": (proc.stderr or proc.stdout).strip()}
+                )
+            else:
+                results.append(
+                    {"card": task.id, "status": "blocked", "reason": codes}
+                )
+    finally:
+        if conn is not None:
+            conn.close()
+
+    errors = [item for item in results if item["status"] == "error"]
+    if errors:
+        _write_stderr_error(
+            "；".join(
+                f"{item['card']}: {item.get('detail') or item.get('reason', '')}"
+                for item in errors
+            )
+        )
+        return 2
+
+    if args.json:
+        text = json.dumps(results, ensure_ascii=False)
+    else:
+        lines = [f"card-audit sweep：{len(results)} 张异常"]
+        for item in results:
+            lines.append(
+                f"{item['card']} | {item['status']} | {item.get('reason', '')}"
+            )
+        text = "\n".join(lines)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0 if args.apply else (1 if results else 0)
+
+
 def _run_card_audit(args: argparse.Namespace) -> int:
     """``card-audit``：检查卡面机器可读契约。"""
 
+    if args.sweep:
+        return _sweep_card_audit(args)
+    if not args.card:
+        _write_stderr_error("--card 与 --sweep 必须二选一")
+        return 2
     if mergeowner.CARD_RE.fullmatch(args.card) is None:
         _write_stderr_error(f"卡号形态非法: {args.card!r}（应为 t_ 开头 8 位小写十六进制）")
         return 2
