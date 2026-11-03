@@ -1762,3 +1762,38 @@ class TestRunOwnershipInAudit:
         assert report.ok, report.problems
         assert report.run_checked == 0
         assert report.records == ()
+
+
+class TestOpsMaintenanceMerge:
+    """operator ``ops/`` 直接合并：无卡/run 时按 maintenance 记录，不判三字段。"""
+
+    SUBJECT = "Merge pull request #95 from alsj213/ops/merge-card-sweep"
+    PARENTS = ("a" * 40, "b" * 40)
+
+    def test_ops_subject_without_trailers_is_maintenance(self) -> None:
+        record, problems = record_from_commit(
+            "c" * 40, self.SUBJECT, self.PARENTS, self.SUBJECT + "\n"
+        )
+        assert record.source == "maintenance"
+        assert record.pr == "#95"
+        assert record.by is None
+        assert problems == ()
+
+    def test_ops_subject_with_trailers_stays_trailer(self) -> None:
+        message = (
+            self.SUBJECT
+            + "\n\nmerged-by: repo/run1\nmerge-card: t_1234abcd\nmerge-pr: #95\n"
+        )
+        record, problems = record_from_commit(
+            "c" * 40, self.SUBJECT, self.PARENTS, message
+        )
+        assert record.source == "trailer"
+        assert problems == ()
+
+    def test_non_ops_branch_still_requires_trailers(self) -> None:
+        subject = "Merge pull request #95 from alsj213/feat/other"
+        record, problems = record_from_commit(
+            "c" * 40, subject, self.PARENTS, subject + "\n"
+        )
+        assert record.source == "trailer"
+        assert {p.kind for p in problems} == {KIND_MISSING}
