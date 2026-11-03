@@ -22,7 +22,7 @@ team-board member engineer
 team-board export
 ```
 
-共二十五个子命令：`list` / `summary` / `member` / `export` / `branch-audit` / `merge-audit` /
+共二十六个子命令：`list` / `summary` / `member` / `export` / `health` / `branch-audit` / `merge-audit` /
 `commit-audit` / `merge-record` / `body-audit` / `gate` / `output-audit` / `push-guard` /
 `pr-claim-audit` / `path-claim-audit` / `path-claim-check` / `merge-card` / `card-audit` /
 `handoff-check` / `tip-broadcast` / `pr-review-head-audit` / `evidence` / `merge-owner-audit` /
@@ -32,7 +32,8 @@ team-board export
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节，`path-claim-audit` / `path-claim-check`
 见「路径认领」一节，`merge-card` 见「合并卡生命周期」一节，`tip-broadcast` 见
 「tip 广播」一节，`merge-owner-audit` 见「PR 合并归属稽核」一节，`gate` 见「闸门日志」一节，
-`output-audit` 见「输出上限稽核」一节，`evidence` 见「evidence 事件」一节）。
+`output-audit` 见「输出上限稽核」一节，`health` 见「看板健康（health）」一节，
+`evidence` 见「evidence 事件」一节）。
 - `list` —— 未归档卡的总览表（卡号 / 负责人 / 状态 / 耗时(分) / 标题），
   按状态顺序（triage → todo → scheduled → ready → running → blocked →
   review → done）→ 同状态内耗时降序 → id 升序；`archived` 不显示。
@@ -60,6 +61,19 @@ team-board export
   对象的键顺序固定 `id, assignee, status, duration_minutes, title`，类型恒为
   `str, str, str, int, str`（`assignee` / `status` / `title` 为空时是空串，
   不是 `list` 里的 `—`），标题不截断。没有任何未归档卡时输出 `[]`、退出码 0。
+- `health` —— 看板健康指标：窗口内按 profile 汇总 run 数与分钟、返工次数、
+  ready 卡的张数与最老年龄；文本最后一行是结论，`--json` 给下游脚本：
+
+  ```
+  看板健康（窗口 7 天；快照 2026-11-04 01:42）
+  runs: 9 次 / 54 分钟
+    engineer: 4 次 / 50 分钟
+  rework: 2 张卡 / 3 次
+  ready: 3 张（最老 t_c3，180 分钟）
+  结论: 关注（窗口内返工 3 次）
+  ```
+
+  口径与字段见下面「看板健康（health）」一节。
 
 ## Web 看板（serve）
 
@@ -1603,9 +1617,72 @@ team-board tip-broadcast [--repo PATH] [--remote origin] [--main main] [--apply]
 
 退出码：dry-run 有落后 → 1，否则 0；`--apply` 有更新失败 → 1，否则 0；取数失败 → 2。
 
+## 看板健康（health）
+
+一次看完三件事：**谁花了多少 run 成本**、**窗口内返工多少**、**ready 卡积压多久**。
+只读（`mode=ro` 一条都不写），文本最后一行固定是结论；给脚本用 `--json`。
+
+```bash
+team-board health [--db PATH] [--now EPOCH] [--since-days N] [--json]
+```
+
+- `--since-days N` —— 窗口天数，**正整数**，默认 `7`；窗口按
+  `task_runs.started_at >= now - N*86400`（左闭）取数，只影响 `runs` 与 `rework`；
+  `0` / 负数 / 空串 / `+7` / `7.0` / `1_0` 一律退出码 2（stderr 一行
+  `错误: --since-days …`），大正整数（全量历史）是合法输入。
+- `--now` / `--db` —— 与其它只读子命令同义（见「通用参数」）。
+
+文本形态（首行标题、末行结论，profile 明细缩进两格）：
+
+```
+看板健康（窗口 7 天；快照 2026-11-04 01:42）
+runs: 9 次 / 54 分钟
+  engineer: 4 次 / 50 分钟
+rework: 2 张卡 / 3 次
+ready: 3 张（最老 t_c3，180 分钟）
+结论: 关注（窗口内返工 3 次）
+```
+
+`--json` 是**单行**（无 indent / 无 sort_keys / `ensure_ascii=False`），键顺序固定：
+
+```json
+{"window_days": 7, "runs": {"engineer": {"count": 4, "minutes": 50}},
+ "rework": {"cards": 2, "events": 3},
+ "ready": {"count": 3, "oldest_card": "t_c3", "oldest_minutes": 180},
+ "generated_at": 1793727772}
+```
+
+（实际输出是一行，`generated_at` 就是 `--now`。）
+
+口径：
+
+- **窗口**：`now - since_days * 86400`（左闭），只看 `task_runs.started_at`；
+  跨窗口的 run 整条归给起点所在的那一侧，不切分。
+- **runs.count / minutes**：同一 profile 的 run 秒数**先求和、再整除 60**（向下
+  取整）；未结束的 run（`ended_at IS NULL`）算到 `now`；`ended_at < started_at`
+  的脏数据夹 0 但次数照计。逐 run 取整再求和会系统性少算，本命令不做。
+- **profile**：`task_runs.profile` 为 NULL / 空串归成键 `""`（不丢 run），文本里
+  显示成 `（无 profile）`；`runs` 按 profile 升序。
+- **rework**：`task_events` 里 `kind = 'changes_requested'` 且
+  `created_at >= 窗口起点` 的事件；`events` 是事件行数，`cards` 是其中不同
+  `task_id` 的个数（一张卡被打回两次 = 1 卡 2 次）。
+- **ready**：`tasks.status = 'ready'` 的快照（与窗口无关）。年龄 =
+  `max(0, (now - COALESCE(started_at, created_at)) // 60)`；`oldest_*` 取年龄
+  最大的那张，同龄按 id 升序取第一张；没有 ready 卡时 `oldest_card` /
+  `oldest_minutes` 都是 `null`，文本里是 `最老 —`。
+- **结论行**：最老 ready 年龄**严格大于** `1440` 分钟（24 小时）算积压；积压与
+  返工两个原因同时成立时都写进同一行，都没有则是
+  `结论: 正常（无 ready 积压，窗口内无返工）`。
+- **空库**（三张表都在、没有一行）：所有计数 0、`runs` 是 `{}`，文本仍是五行、
+  末行是 `结论: 正常…`，退出码 0。
+
+退出码：`0` 正常（空库也是 0）/ `2` 参数或环境错误（`--since-days` 非法、
+`--now` 越界、库不存在 / 不是合法 SQLite、缺 `tasks` / `task_runs` /
+`task_events` 任一张表、读表失败；rc2 时 stdout 为空、stderr 恰一行 `错误: …`）。
+
 ## 通用参数
 
-`list` / `summary` / `member` / `export` 四个子命令共享下面两个参数（`serve` /
+`list` / `summary` / `member` / `export` / `health` 五个子命令共享下面两个参数（`serve` /
 `branch-audit` / `merge-audit` / `merge-record` / `commit-audit` 各有自己的参数）：
 
 - `--db PATH` —— 看板库路径，默认
@@ -1643,6 +1720,9 @@ team-board tip-broadcast [--repo PATH] [--remote origin] [--main main] [--apply]
 （注意「数据源打不开」在这里是 2，不是基础组的 1）；详见上面「卡正文上限（2048B）」一节。
 `output-audit` 与 `body-audit` 同口径：`0` 无超限 / `1` **发现**超限的评论或 result /
 `2` 参数或环境错误；详见上面「输出上限稽核（output-audit）」一节。
+`health` 只有两档：`0` 正常（**空库也是 0**，各计数为 0）/ `2` 参数或环境错误
+（`--since-days` 非法、库不存在 / 不是合法 SQLite、缺 `tasks` / `task_runs` /
+`task_events` 任一张表）；详见上面「看板健康（health）」一节。
 `pr-review-head-audit` 同理：`1` 表示**该内容指纹上双问不齐**（缺一类 / 两类都缺 /
 标记都指向别的内容 = 内容变了没重跑 / head 对象取不到 / 算不出可比内容 —— 分支含二进制
 文件或相对 base 无差异）、`2` 表示参数或环境错误（`--head` 非 40/64 位小写十六进制、

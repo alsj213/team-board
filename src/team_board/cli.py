@@ -44,6 +44,14 @@
   ``sqlite3.Error`` → stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含
   ``--db`` 不存在、不是合法 SQLite、打不开、读 ``tasks`` 失败、stdout 编码表示不了中文）
 
+``health`` 子命令（只读：profile run 成本 / 返工 / ready 年龄）：
+- 0：正常输出（文本报告或 ``--json`` 单行 JSON）；空库同样是 0，各行计数为 0
+- 2：参数或环境错误（``--since-days`` 不是 ≥1 的 ASCII 十进制整数；
+  ``health.HealthError`` / ``db.BoardError`` / ``OSError`` / ``sqlite3.Error`` →
+  stderr 恰一行 ``错误: …``、stdout 空、不冒 traceback；含 ``--db`` 不存在、
+  不是合法 SQLite、缺 ``tasks`` / ``task_runs`` / ``task_events`` 任一张表、
+  读表失败、stdout 编码表示不了中文）
+
 ``gate`` 子命令（包装外部检查器：全量落盘 + stdout 只回摘要）：
 - 0 / 1 / 其他：**子命令的 rc 原样透传**（被信号杀记 ``128 + (-rc)``）
 - 2 有两个来源：(a) gate 自身参数/环境错误 (b) 子命令自己返回 2
@@ -211,6 +219,7 @@ from . import (
     evidence_store,
     flow,
     gatelog,
+    health,
     mergecard,
     mergeowner,
     merges,
@@ -313,13 +322,16 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**二十五个**子命令（个数以
+    """建 CLI 前端：prog=team-board，共**二十六个**子命令（个数以
     ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
     不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
-    与 README 的「共二十五个子命令」同源）。
+    与 README 的「共二十六个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
+    - ``health``：按 profile 汇总窗口内 run 数与分钟 + 返工 + ready 年龄
+      （0 成功 / 2 参数或环境错误），吃 ``--db`` / ``--now`` / ``--since-days``
+      / ``--json``；
     - ``branch-audit``：稽核卡分支提交归属与 checkout 偏移（0 无偏差 / 1 有偏差 /
       2 参数或环境错误），吃 ``--repo`` / ``--main-branch`` / ``--branch`` /
       ``--allow-file``；
@@ -396,6 +408,39 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "member":
             sub.add_argument("name", help="成员名（对应 tasks.assignee）")
+
+    health_cmd = subparsers.add_parser(
+        "health",
+        help="看板健康指标：profile run 成本 / 返工 / ready 年龄（0 成功 / 2 参数或环境错误）",
+    )
+    health_cmd.add_argument(
+        "--db",
+        default=DEFAULT_DB,
+        metavar="PATH",
+        help=f"看板 SQLite 路径（默认 {DEFAULT_DB}）",
+    )
+    health_cmd.add_argument(
+        "--now",
+        type=_parse_now,
+        default=None,
+        metavar="EPOCH",
+        help="基准时间（epoch 秒，默认当前时间）",
+    )
+    health_cmd.add_argument(
+        "--since-days",
+        default=None,
+        metavar="N",
+        help=(
+            "run / 返工的窗口天数（正整数，默认 "
+            f"{health.DEFAULT_WINDOW_DAYS}）；按 "
+            "task_runs.started_at >= now - N*86400 取数"
+        ),
+    )
+    health_cmd.add_argument(
+        "--json",
+        action="store_true",
+        help="输出单行 JSON（字段固定，见 README「看板健康」一节）",
+    )
 
     audit_cmd = subparsers.add_parser(
         "branch-audit",
@@ -1994,6 +2039,56 @@ def _run_body_audit(args: argparse.Namespace) -> int:
     return 1 if (summary.counts["over"] or summary.counts["red"]) else 0
 
 
+def _parse_since_days(raw: str | None) -> int:
+    """``health --since-days`` → 正整数（``None`` = 用 ``health.DEFAULT_WINDOW_DAYS``）。
+
+    只认 ASCII 十进制：``int()`` 会静默收下 ``" 7"``、``"+7"``、``"1_0"`` 和
+    ``"١٢٣"``（= 123），比文档写的「正整数」宽；``0`` 与负数也没有意义
+    （窗口为空 / 反向），一律拒成 rc2。坏值走 stderr 一行 ``错误: …`` 而不是
+    argparse 的 usage 两行（与 ``body-audit --cutoff`` 同一口径）。
+    """
+    if raw is None:
+        return health.DEFAULT_WINDOW_DAYS
+    if not raw.isascii() or not raw.isdigit():
+        raise ValueError(f"--since-days 应为正整数：{raw!r}")
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"--since-days 必须 >= 1：{value}")
+    return value
+
+
+def _run_health(args: argparse.Namespace) -> int:
+    """``health`` 子命令：参数/读失败一律 stderr 一行 ``错误: …`` + rc2。
+
+    只有两个码：0 成功（空库也是 0）、2 参数或环境错误。rc2 时 stdout
+    **一个字节都不写**（报告整块在库读成功之后才拼）。
+    """
+
+    try:
+        window_days = _parse_since_days(args.since_days)
+    except ValueError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    now = args.now if args.now is not None else int(time.time())
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        report = health.build(conn, now=now, window_days=window_days)
+    except (db.BoardError, health.HealthError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+    finally:
+        if conn is not None:
+            conn.close()
+
+    text = health.render_json(report) if args.json else health.render(report)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0
+
+
 def _run_gate(args: argparse.Namespace) -> int:
     """``gate`` 子命令：跑一条外部检查器，全量输出落盘、stdout 只回摘要。
 
@@ -3524,6 +3619,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "body-audit":
         return _run_body_audit(args)
+    if args.command == "health":
+        return _run_health(args)
     if args.command == "output-audit":
         return _run_output_audit(args)
 
