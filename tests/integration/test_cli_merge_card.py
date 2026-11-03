@@ -54,7 +54,7 @@ def fake_gh(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli,
         "_gh_pr_view",
-        lambda repo, slug, pr: {"state": "OPEN", "head": HEAD, "title": "CI 闸门"},
+        lambda repo, slug, pr: {"state": "OPEN", "head": HEAD, "title": "CI 闸门", "head_ref": f"wt/{IMPL}"},
     )
 
 
@@ -144,7 +144,7 @@ class TestPreconditions:
         monkeypatch.setattr(
             cli,
             "_gh_pr_view",
-            lambda repo, slug, pr: {"state": "MERGED", "head": HEAD, "title": "x"},
+            lambda repo, slug, pr: {"state": "MERGED", "head": HEAD, "title": "x", "head_ref": f"wt/{IMPL}"},
         )
         code, out, err = run(
             capsys, "merge-card", "--impl-card", IMPL, "--pr", str(PR), "--db", str(done_board)

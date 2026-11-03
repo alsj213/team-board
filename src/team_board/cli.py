@@ -2409,7 +2409,7 @@ def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
             "-R",
             slug,
             "--json",
-            "state,headRefOid,title",
+            "state,headRefOid,title,headRefName",
         ),
         repo,
     )
@@ -2429,6 +2429,7 @@ def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
         "state": str(payload.get("state", "")),
         "head": str(payload.get("headRefOid", "")),
         "title": str(payload.get("title", "")),
+        "head_ref": str(payload.get("headRefName", "")),
     }
 
 
@@ -2475,19 +2476,34 @@ def _sweep_merge_cards(args: argparse.Namespace) -> int:
 
     results: list[dict[str, object]] = []
     created = 0
+    seen: dict[int, str] = {}
     for task in tasks:
         if task.status != "done":
             continue
         if prclaim.needs_claim(task.title):
             continue
-        events = db.iter_card_events(
-            conn, task.id, ("impl_done",)
-        ) if conn is not None else []
+        try:
+            events = db.iter_card_events(conn, task.id, ("impl_done",))
+        except db.BoardError as exc:
+            results.append(
+                {"card": task.id, "status": "error", "reason": str(exc)}
+            )
+            continue
         latest = _latest_impl_pr(events)
         if latest is None:
             results.append({"card": task.id, "status": "skip", "reason": "无 impl_done"})
             continue
         pr, impl_head = latest
+        if pr in seen:
+            results.append(
+                {
+                    "card": task.id,
+                    "pr": pr,
+                    "status": "skip",
+                    "reason": f"已有合并卡 {seen[pr]}",
+                }
+            )
+            continue
         if any(
             prclaim.claims(body, pr) and prclaim.needs_claim(title)
             for _cid, _status, _assignee, title, body in pending
@@ -2504,6 +2520,17 @@ def _sweep_merge_cards(args: argparse.Namespace) -> int:
         if view["state"].strip().upper() != "OPEN":
             results.append(
                 {"card": task.id, "pr": pr, "status": "skip", "reason": "PR 非 OPEN"}
+            )
+            continue
+        expected_branch = f"wt/{task.id}"
+        if view["head_ref"] != expected_branch:
+            results.append(
+                {
+                    "card": task.id,
+                    "pr": pr,
+                    "status": "skip",
+                    "reason": f"PR headRefName {view['head_ref'] or '-'} != {expected_branch}",
+                }
             )
             continue
         if view["head"] != impl_head:
@@ -2544,6 +2571,7 @@ def _sweep_merge_cards(args: argparse.Namespace) -> int:
             )
             continue
         if args.dry_run:
+            seen[pr] = "<dry-run>"
             results.append(
                 {
                     "card": task.id,
@@ -2580,6 +2608,7 @@ def _sweep_merge_cards(args: argparse.Namespace) -> int:
                 {"card": task.id, "pr": pr, "status": "error", "reason": detail}
             )
             continue
+        seen[pr] = outcome.card_id or "<created>"
         results.append(
             {
                 "card": task.id,
@@ -2648,6 +2677,14 @@ def _run_merge_card(args: argparse.Namespace) -> int:
     except (train.TrainError, OSError) as exc:
         _write_stderr_error(str(exc))
         return 2
+
+    expected_branch = args.branch or f"wt/{args.impl_card}"
+    if view["head_ref"] != expected_branch:
+        _write_stderr_error(
+            f"PR #{args.pr} 的 headRefName 是 {view['head_ref'] or '-'}，"
+            f"不是 {expected_branch}；拒绝建合并卡"
+        )
+        return 1
 
     try:
         card_plan = mergecard.plan(
