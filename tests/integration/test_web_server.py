@@ -38,6 +38,7 @@ EXPECTED_SUBCOMMANDS = (
     "summary",
     "member",
     "export",
+    "health",
     "branch-audit",
     "merge-audit",
     "commit-audit",
@@ -84,6 +85,7 @@ CN_DIGITS = {
     23: "二十三",
     24: "二十四",
     25: "二十五",
+    26: "二十六",
 }
 
 
