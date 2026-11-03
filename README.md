@@ -1563,6 +1563,7 @@ QA-SPEC: qa
 ```bash
 team-board merge-card --impl-card t_xxxxxxxx --pr 90 [--repo PATH] [--db PATH] \
   [--branch wt/t_xxxxxxxx] [--title TEXT] [--dry-run] [--json]
+team-board merge-card --sweep [--limit N] [--repo PATH] [--db PATH] [--dry-run] [--json]
 ```
 
 - 实现卡状态必须是 `done`；PR 必须是 `OPEN`；
@@ -1575,6 +1576,9 @@ team-board merge-card --impl-card t_xxxxxxxx --pr 90 [--repo PATH] [--db PATH] \
   命令：以 `cd <repo> && PYTHONPATH=<repo>/src` 打头 + `python3 -m` 模块入口，与
   `merge-record` 打印的那一行同形（不写裸 `merge_guard` —— 本仓没有这个可执行文件，
   照抄只会 rc=127）。
+- `--sweep` 扫描所有 done 实现卡：取最新 `impl_done` 的 `(pr, head)`，PR 为 OPEN、
+  head 未漂移、且没有开放合并卡时自动建卡；`--limit` 限本次最多建几张（默认 5）。
+  这是 QA 关单后“自动建合并卡”的脚本入口，PM 不再手工建收口卡。
 
 退出码：0 已建/已存在，1 前置条件不满足，2 参数或环境错误（`gh` / `git`
 取不到数、repo 不是 git 仓库、库读不到都算这一类）。
