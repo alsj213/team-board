@@ -147,6 +147,12 @@ LEGACY_SUBJECT_RE = re.compile(
     r"^Merge pull request #(?P<pr>[0-9]+) from [^/]+/(?:wt/)?(?P<card>t_[0-9a-f]{8})$"
 )
 
+#: operator 维护分支（``ops/…``）的 GitHub 默认合并标题：没有卡/run，按
+#: ``maintenance`` 记录，不参与三字段判定（2026-11-03 PR #95 的例外口径）。
+OPS_SUBJECT_RE = re.compile(
+    r"^Merge pull request #(?P<pr>[1-9][0-9]*) from [^/]+/ops/"
+)
+
 #: trailer 行形态：``Key: value``（冒号后必须有一个空格）
 _TRAILER_LINE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*): (.*)$")
 
@@ -218,7 +224,7 @@ class MergeAuditError(Exception):
 
 @dataclass(frozen=True)
 class MergeRecord:
-    """一条合并提交的认账记录（``source`` 为 ``trailer`` 或 ``legacy``）。"""
+    """一条合并提交的认账记录（``source`` 为 ``trailer`` / ``legacy`` / ``maintenance``）。"""
 
     sha: str
     subject: str
@@ -429,6 +435,21 @@ def record_from_commit(
         problems.append(
             Problem(KIND_NOT_MERGE, sha, f"parents={len(parents)}，合并提交应至少 2 个父提交")
         )
+    if not problems and not scan.values:
+        maintenance = OPS_SUBJECT_RE.match(subject)
+        if maintenance is not None:
+            return (
+                MergeRecord(
+                    sha=sha,
+                    subject=subject,
+                    parents=tuple(parents),
+                    by=None,
+                    card=None,
+                    pr="#" + maintenance.group("pr"),
+                    source="maintenance",
+                ),
+                (),
+            )
     problems.extend(replace(problem, sha=sha) for problem in scan.problems)
     values, field_problems = _fields(scan, sha)
     problems.extend(field_problems)
@@ -1368,7 +1389,7 @@ def render_report(report: MergeReport) -> str:
     for index, record in enumerate(report.records, start=1):
         lines.append(
             f"  {index}. {_short(record.sha)} {record.card or '-'} "
-            f"{record.pr or '-'} by={record.by or '-'}"
+            f"{record.pr or '-'} by={record.by or ('maintenance' if record.source == 'maintenance' else '-')}"
         )
 
     lines.extend(_judgement_one_lines(report))
