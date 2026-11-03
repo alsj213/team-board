@@ -792,16 +792,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     merge_card_cmd.add_argument(
         "--impl-card",
-        required=True,
+        default=None,
         metavar="CARD",
-        help="实现卡号（t_ 开头 8 位小写十六进制）",
+        help="实现卡号（t_ 开头 8 位小写十六进制；与 --sweep 二选一）",
     )
     merge_card_cmd.add_argument(
         "--pr",
-        required=True,
+        default=None,
         type=int,
         metavar="N",
-        help="要合并的 PR 号",
+        help="要合并的 PR 号（与 --impl-card 同用；--sweep 时忽略）",
+    )
+    merge_card_cmd.add_argument(
+        "--sweep",
+        action="store_true",
+        help="扫描所有 done 实现卡，给尚无合并卡的 open PR 自动建合并卡",
+    )
+    merge_card_cmd.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        metavar="N",
+        help="--sweep 本次最多建几张（默认 5）",
     )
     merge_card_cmd.add_argument(
         "--repo",
@@ -2420,9 +2432,190 @@ def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
     }
 
 
+def _latest_impl_pr(events: list[tuple[str, str]]) -> tuple[int, str] | None:
+    """从 ``impl_done`` 事件里取最后一条合法的 ``(pr, head_sha)``。"""
+
+    latest: tuple[int, str] | None = None
+    for _kind, payload in events:
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        pr = data.get("pr")
+        head = data.get("head_sha")
+        if (
+            isinstance(pr, int)
+            and not isinstance(pr, bool)
+            and pr > 0
+            and isinstance(head, str)
+            and flow.HEAD_RE.fullmatch(head)
+        ):
+            latest = (pr, head)
+    return latest
+
+
+def _sweep_merge_cards(args: argparse.Namespace) -> int:
+    """扫描 done 实现卡，给尚无合并卡的 open PR 自动建合并卡。"""
+
+    if args.limit < 1:
+        _write_stderr_error(f"--limit 必须 >= 1: {args.limit}")
+        return 2
+
+    conn = None
+    try:
+        conn = db.connect(args.db)
+        tasks = db.load_tasks(conn)
+        pending = db.iter_pending_cards(conn)
+        slug = train.repo_slug(args.repo, "origin", train.default_run)
+    except (db.BoardError, train.TrainError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    results: list[dict[str, object]] = []
+    created = 0
+    for task in tasks:
+        if task.status != "done":
+            continue
+        if prclaim.needs_claim(task.title):
+            continue
+        events = db.iter_card_events(
+            conn, task.id, ("impl_done",)
+        ) if conn is not None else []
+        latest = _latest_impl_pr(events)
+        if latest is None:
+            results.append({"card": task.id, "status": "skip", "reason": "无 impl_done"})
+            continue
+        pr, impl_head = latest
+        if any(
+            prclaim.claims(body, pr) and prclaim.needs_claim(title)
+            for _cid, _status, _assignee, title, body in pending
+        ):
+            results.append(
+                {"card": task.id, "pr": pr, "status": "skip", "reason": "已有合并卡"}
+            )
+            continue
+        try:
+            view = _gh_pr_view(args.repo, slug, pr)
+        except train.TrainError as exc:
+            results.append({"card": task.id, "pr": pr, "status": "error", "reason": str(exc)})
+            continue
+        if view["state"].strip().upper() != "OPEN":
+            results.append(
+                {"card": task.id, "pr": pr, "status": "skip", "reason": "PR 非 OPEN"}
+            )
+            continue
+        if view["head"] != impl_head:
+            results.append(
+                {
+                    "card": task.id,
+                    "pr": pr,
+                    "status": "skip",
+                    "reason": f"PR head {view['head'][:12]} != impl_done {impl_head[:12]}",
+                }
+            )
+            continue
+        try:
+            card_plan = mergecard.plan(
+                impl_card=task.id,
+                impl_status=task.status,
+                impl_title=task.title,
+                pr=pr,
+                pr_state=view["state"],
+                head_oid=view["head"],
+                slug=slug,
+                pending_rows=pending,
+                repo=args.repo,
+            )
+        except (mergecard.MergeCardError, train.TrainError, OSError) as exc:
+            results.append(
+                {"card": task.id, "pr": pr, "status": "skip", "reason": str(exc)}
+            )
+            continue
+        if card_plan.existing is not None:
+            results.append(
+                {
+                    "card": task.id,
+                    "pr": pr,
+                    "status": "skip",
+                    "reason": f"已有合并卡 {card_plan.existing}",
+                }
+            )
+            continue
+        if args.dry_run:
+            results.append(
+                {
+                    "card": task.id,
+                    "pr": pr,
+                    "status": "dry-run",
+                    "reason": card_plan.title,
+                }
+            )
+            created += 1
+            if created >= args.limit:
+                break
+            continue
+
+        body_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", suffix=".md", delete=False
+            ) as handle:
+                handle.write(card_plan.body)
+                body_path = handle.name
+            outcome = mergecard.create_merge_card(card_plan, body_path=body_path)
+        except OSError as exc:
+            results.append(
+                {"card": task.id, "pr": pr, "status": "error", "reason": str(exc)}
+            )
+            continue
+        finally:
+            if body_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(body_path)
+        if not outcome.ok:
+            detail = outcome.stderr.strip() or outcome.stdout.strip() or "hermes create 无输出"
+            results.append(
+                {"card": task.id, "pr": pr, "status": "error", "reason": detail}
+            )
+            continue
+        results.append(
+            {
+                "card": task.id,
+                "pr": pr,
+                "status": "created",
+                "reason": outcome.card_id,
+            }
+        )
+        created += 1
+        if created >= args.limit:
+            break
+
+    if conn is not None:
+        conn.close()
+
+    if args.json:
+        text = json.dumps(results, ensure_ascii=False)
+    else:
+        lines = [f"merge-card sweep：建 {sum(1 for r in results if r['status'] == 'created')} 张"]
+        for item in results:
+            suffix = f" → {item['reason']}" if item.get("reason") else ""
+            lines.append(f"{item['card']} | PR #{item.get('pr', '-')} | {item['status']}{suffix}")
+        text = "\n".join(lines)
+    if not _write_stdout(text + "\n"):
+        return 2
+    return 0 if all(item["status"] != "error" for item in results) else 2
+
+
 def _run_merge_card(args: argparse.Namespace) -> int:
     """``merge-card``：实现卡 done 后建 repo 合并卡（不再让 worker 提前建卡）。"""
 
+    if args.sweep:
+        return _sweep_merge_cards(args)
+    if not args.impl_card or args.pr is None:
+        _write_stderr_error("--impl-card 与 --pr 必须同用（或用 --sweep）")
+        return 2
     if mergeowner.CARD_RE.fullmatch(args.impl_card) is None:
         _write_stderr_error(
             f"实现卡号形态非法: {args.impl_card!r}（应为 t_ 开头 8 位小写十六进制）"
