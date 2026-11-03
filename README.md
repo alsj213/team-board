@@ -1530,6 +1530,7 @@ spawn 前调用；有冲突的卡应串行，不要并行派工。
 
 ```bash
 team-board card-audit --card t_xxxxxxxx [--db PATH] [--json]
+team-board card-audit --sweep [--apply] [--limit N] [--db PATH] [--json]
 team-board handoff-check --card t_xxxxxxxx --head <40|64 hex> [--stage review|pm|merge] [--db PATH] [--json]
 ```
 
@@ -1542,7 +1543,10 @@ CONSUMER: <下游会执行的命令>
 QA-SPEC: qa
 ```
 
-合并卡（标题命中合并语义 **且** 正文首行 `PR-CLAIM: #<n>`）豁免实现卡契约；
+合并卡（标题命中合并语义 **且** 正文首行 `PR-CLAIM: #<n>`）豁免实现卡契约。
+`--sweep` 扫描 `ready` / `todo` 卡；带 `--apply` 时对缺契约的卡调用
+`hermes kanban block`（reason 以 `card-audit 机械拦截：` 开头），缺口派工。
+建议用 systemd timer 每 30 秒跑一次，作为 dispatcher 前的机械闸门。
 只带首行 `PR-CLAIM` 的实现卡照常受检（`kanban_claim_pr` 会给任何 PR 卡补这一行）。
 标题命中合并语义但首行没有认领行 → `[pr-claim-missing]` rc1。
 缺项 rc1，库/参数错误 rc2。
