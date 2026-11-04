@@ -40,7 +40,7 @@
 这一段贴进 `worker_context`（`t_c0f2c33e`），`bash scripts/install-card-template.sh --check`（PR #65，未合）
 按它判漂移（`t_eb47566b`）。
 
-含 PR 号的卡，关闭前还必须跑 `merge-owner-audit <卡号>`：`rc=0` 才许关；`UNOWNED` 先建收口卡（首行 `PR-CLAIM: #<n>`）或把 PR 合掉；`rc=2` 按错误修、不算通过。口径与降级日志见 [`docs/merge-owner.md`](merge-owner.md)。
+含 PR 号的卡，关闭前还必须跑 `merge-owner-audit <卡号>`：`rc=0` 才许关；`UNOWNED` **不要手工建收口卡**——实现卡 done 后由 `team-board merge-card --sweep` 自动建；确需手工时用 `team-board merge-card --impl-card <卡号> --pr <n>`；`rc=2` 按错误修、不算通过。口径与降级日志见 [`docs/merge-owner.md`](merge-owner.md)。
 
 <!-- FIXED:v3:BEGIN -->
 ## 完成契约

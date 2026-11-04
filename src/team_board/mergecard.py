@@ -239,6 +239,7 @@ def _render_body(
         f" --pr {pr} --branch {branch} --method merge --delete-branch"
         " --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID"
         f" --subject {shlex.quote(subject)} --body-file {body_file} --repo {repo_q}"
+        " --broadcast-tip"
     )
     return f"""PR-CLAIM: #{pr}
 TEMPLATE: card-template.md#v3

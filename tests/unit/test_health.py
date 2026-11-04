@@ -273,3 +273,67 @@ def test_build_does_not_modify_the_file(board: Path) -> None:
     before = hashlib.sha256(board.read_bytes()).hexdigest()
     build(board)
     assert hashlib.sha256(board.read_bytes()).hexdigest() == before
+
+
+def test_by_card_groups_runs_and_rework(board: Path) -> None:
+    """按卡明细：分钟降序、同分钟按次数、再按卡号；只含窗口内的卡。"""
+    conn = db.connect(board)
+    try:
+        report = health.build(conn, now=NOW, window_days=7, by_card=True)
+    finally:
+        conn.close()
+    assert report.cards is not None
+    by_card = {stat.card: stat for stat in report.cards}
+    assert by_card["t_a1"] == health.CardStat(
+        card="t_a1", runs=1, minutes=30, rework=0, profiles=("engineer",)
+    )
+    assert by_card["t_b1"] == health.CardStat(
+        card="t_b1", runs=0, minutes=0, rework=2, profiles=()
+    )
+    assert by_card["t_a7"] == health.CardStat(
+        card="t_a7", runs=1, minutes=1, rework=0, profiles=("",)
+    )
+    assert "t_a4" not in by_card  # 窗口外
+    assert "t_b3" not in by_card  # 返工在窗口外
+    assert [stat.card for stat in report.cards[:3]] == ["t_a1", "t_a2", "t_a9"]
+
+
+def test_by_card_is_off_by_default(board: Path) -> None:
+    """默认不计算 cards：既有相等断言和 JSON 键都不变。"""
+    report = build(board)
+    assert report.cards is None
+    assert "cards" not in json.loads(health.render_json(report))
+
+
+def test_by_card_text_and_json(board: Path) -> None:
+    conn = db.connect(board)
+    try:
+        report = health.build(conn, now=NOW, window_days=7, by_card=True)
+    finally:
+        conn.close()
+    lines = health.render(report).splitlines()
+    assert lines[6].startswith("cards: 11 张有成本/返工")
+    assert lines[7] == "  t_a1: 1 次 / 30 分钟 / 返工 0 次（engineer）"
+    assert "  t_b1: 0 次 / 0 分钟 / 返工 2 次（—）" in lines
+    payload = json.loads(health.render_json(report))
+    assert payload["cards"][0] == {
+        "card": "t_a1",
+        "runs": 1,
+        "minutes": 30,
+        "rework": 0,
+        "profiles": ["engineer"],
+    }
+    assert list(payload)[-1] == "generated_at"
+
+
+def test_by_card_empty_board(tmp_path: Path) -> None:
+    path = build_health_db(tmp_path / "empty.db", runs=(), events=(), tasks=())
+    conn = db.connect(path)
+    try:
+        report = health.build(conn, now=NOW, window_days=7, by_card=True)
+    finally:
+        conn.close()
+    assert report.cards == ()
+    lines = health.render(report).splitlines()
+    assert "cards: 0 张有成本/返工（按分钟降序）" in lines
+    assert json.loads(health.render_json(report))["cards"] == []

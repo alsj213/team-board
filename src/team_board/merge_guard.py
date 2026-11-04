@@ -2064,6 +2064,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--broadcast-tip",
+        action="store_true",
+        help=(
+            "合并成功且源分支删除后，best-effort 对其它落后卡分支执行"
+            " gh pr update-branch --rebase；广播失败只记一行，不影响合并 rc"
+        ),
+    )
+    parser.add_argument(
         "--card",
         default=None,
         metavar="CARD",
@@ -2123,6 +2131,8 @@ class Options:
     #: 证据闸门拒绝后是否**不**建卡、只打印计划行（``--no-create-card``；``--verify-only``
     #: 路径不跑证据闸门，故那里恒为 ``False``）
     no_create_card: bool = False
+    #: 合并成功后 best-effort 广播新 tip（失败只记一行，不改合并 rc）
+    broadcast_tip: bool = False
 
 
 def _parse(argv: list[str] | None) -> argparse.Namespace:
@@ -2175,6 +2185,7 @@ def validate(args: argparse.Namespace) -> Options:
         verify_only=bool(args.verify_only),
         accounting=accounting,
         no_create_card=bool(args.no_create_card),
+        broadcast_tip=bool(args.broadcast_tip),
     )
 
 
@@ -2499,6 +2510,26 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
     return lines, 1
 
 
+def _broadcast_tip_lines(opts: Options) -> list[str]:
+    """合并后的 tip 广播：只报结果，绝不把已完成的合并改成失败。"""
+
+    from . import tip as tipmod  # 只在合并成功后走这条可选路径
+
+    try:
+        report = tipmod.broadcast(
+            opts.repo, remote=opts.remote, main="main", apply=True, fetch=True
+        )
+    except Exception as exc:  # 合并已完成，广播失败不许回滚 rc
+        return [f"tip 广播: 跳过（{type(exc).__name__}: {exc}）"]
+    line = f"tip 广播: 更新 {len(report.updated)} 个落后 PR，失败 {len(report.failed)} 个"
+    if report.failed:
+        detail = "；".join(
+            f"#{pr.number} rc={pr.update_rc} {pr.update_detail}" for pr in report.failed
+        )
+        line += f"（{detail}）"
+    return [line]
+
+
 def _run_merge(opts: Options) -> tuple[list[str], int]:
     """分支存在预检 → gh 预检 → 合并 → 删除验证。"""
 
@@ -2666,6 +2697,8 @@ def _run_merge(opts: Options) -> tuple[list[str], int]:
             lines.append(
                 f"结论：合并完成，源分支 {opts.branch} 已从 {opts.remote} 删除"
             )
+            if opts.broadcast_tip:
+                lines.extend(_broadcast_tip_lines(opts))
             return lines, 0
         if result.outcome == OUT_PRESENT:
             lines.append("结论：合并成功但源分支仍在远端（合并不算完成）")

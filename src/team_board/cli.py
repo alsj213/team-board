@@ -437,6 +437,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     health_cmd.add_argument(
+        "--by-card",
+        action="store_true",
+        help="追加窗口内每张卡的 run 次数/分钟/返工明细（文本前 20，JSON 全量）",
+    )
+    health_cmd.add_argument(
         "--json",
         action="store_true",
         help="输出单行 JSON（字段固定，见 README「看板健康」一节）",
@@ -2075,7 +2080,9 @@ def _run_health(args: argparse.Namespace) -> int:
     conn = None
     try:
         conn = db.connect(args.db)
-        report = health.build(conn, now=now, window_days=window_days)
+        report = health.build(
+            conn, now=now, window_days=window_days, by_card=args.by_card
+        )
     except (db.BoardError, health.HealthError, OSError, sqlite3.Error) as exc:
         _write_stderr_error(str(exc))
         return 2
