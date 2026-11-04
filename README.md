@@ -567,7 +567,7 @@ python3 -m team_board.merge_guard \
   --subject <合并提交标题> --body-file <认账 body 文件> \
   [--repo PATH=. ] [--remote NAME=origin] [--db PATH=<默认看板库>] \
   [--timeout SEC=60] [--interval SEC=2] \
-  [--command-timeout SEC=60] [--verify-only]
+  [--command-timeout SEC=60] [--verify-only] [--broadcast-tip]
 ```
 
 - `--pr` / `--branch` / `--delete-branch` 三项**必填**。`--method` **只认 `merge`**，默认值就是
@@ -576,6 +576,10 @@ python3 -m team_board.merge_guard \
   直接 rc2，且**一个 gh 写操作都不发**，
   stderr 固定一行
   `错误: 合并命令缺少 --delete-branch（合并卡必须带；本工具不提供不带删除的合并路径）`。
+- `--broadcast-tip` —— 合并成功且源分支确认删除后，best-effort 对其它仍开着、落后
+  `origin/main` 的 `wt/t_*` PR 执行 `gh pr update-branch --rebase`。广播失败只在
+  合并结论后多打一行 `tip 广播: …`，**不改合并 rc**（合并已经发生，不能回滚）。
+  合并卡由 `merge-card --sweep` 生成时默认带这个开关。
 - **认账四参数（合并模式必填）**：`--card`（形如 `t_1234abcd`）、`--by`（必须是 `repo/runNNN`；合并权归 repo bot，别的 profile 在这里就 rc2）、
   `--subject`（单行非空白合并提交标题）、`--body-file`（含 `merged-by` / `merge-card` /
   `merge-pr` 三行 trailer 的文件，由 `team-board merge-record --body-out` 生成）—— 四者
@@ -1623,13 +1627,16 @@ team-board tip-broadcast [--repo PATH] [--remote origin] [--main main] [--apply]
 只读（`mode=ro` 一条都不写），文本最后一行固定是结论；给脚本用 `--json`。
 
 ```bash
-team-board health [--db PATH] [--now EPOCH] [--since-days N] [--json]
+team-board health [--db PATH] [--now EPOCH] [--since-days N] [--by-card] [--json]
 ```
 
 - `--since-days N` —— 窗口天数，**正整数**，默认 `7`；窗口按
   `task_runs.started_at >= now - N*86400`（左闭）取数，只影响 `runs` 与 `rework`；
   `0` / 负数 / 空串 / `+7` / `7.0` / `1_0` 一律退出码 2（stderr 一行
   `错误: --since-days …`），大正整数（全量历史）是合法输入。
+- `--by-card` —— 追加窗口内**每张卡**的 run 次数 / 分钟 / 返工次数 / profile 集合；
+  文本最多显示前 20 张（按分钟降序，超出显示「另有 N 张」），JSON 输出全量数组。
+  默认不计算，既有文本与 JSON 键顺序完全不变。
 - `--now` / `--db` —— 与其它只读子命令同义（见「通用参数」）。
 
 文本形态（首行标题、末行结论，profile 明细缩进两格）：
@@ -1643,7 +1650,16 @@ ready: 3 张（最老 t_c3，180 分钟）
 结论: 关注（窗口内返工 3 次）
 ```
 
-`--json` 是**单行**（无 indent / 无 sort_keys / `ensure_ascii=False`），键顺序固定：
+`--by-card` 的文本追加段（位置在 `rework` 之前）：
+
+```
+cards: 3 张有成本/返工（按分钟降序）
+  t_a1: 1 次 / 30 分钟 / 返工 0 次（engineer）
+  t_b1: 0 次 / 0 分钟 / 返工 2 次（—）
+```
+
+`--json` 是**单行**（无 indent / 无 sort_keys / `ensure_ascii=False`），键顺序固定；
+给 `--by-card` 时在 `ready` 与 `generated_at` 之间插入 `cards` 数组：
 
 ```json
 {"window_days": 7, "runs": {"engineer": {"count": 4, "minutes": 50}},

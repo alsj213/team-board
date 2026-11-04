@@ -1685,3 +1685,59 @@ def test_redact_url_never_leaves_token() -> None:
         redacted = mg.redact_url(url)
         assert secret not in redacted, (url, redacted)
         assert "***" in redacted, (url, redacted)
+
+
+def test_broadcast_tip_lines_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """合并后广播只回一行摘要，不改合并结果。"""
+    from types import SimpleNamespace
+
+    from team_board import tip as tipmod
+
+    updated = SimpleNamespace(number=7, update_rc=0, update_detail="")
+    report = tipmod.BroadcastReport(
+        tip="a" * 40,
+        prs=(),
+        dry_run=False,
+    )
+    monkeypatch.setattr(
+        tipmod,
+        "broadcast",
+        lambda *a, **k: SimpleNamespace(updated=(updated,), failed=()),
+    )
+    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
+    assert mg._broadcast_tip_lines(opts) == ["tip 广播: 更新 1 个落后 PR，失败 0 个"]
+    assert report.dry_run is False
+
+
+def test_broadcast_tip_lines_reports_failure_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单条 update 失败要带 PR 号与 rc，但仍只返回一行、不抛异常。"""
+    from types import SimpleNamespace
+
+    from team_board import tip as tipmod
+
+    failed = SimpleNamespace(number=8, update_rc=1, update_detail="conflict")
+    monkeypatch.setattr(
+        tipmod,
+        "broadcast",
+        lambda *a, **k: SimpleNamespace(updated=(), failed=(failed,)),
+    )
+    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
+    assert mg._broadcast_tip_lines(opts) == [
+        "tip 广播: 更新 0 个落后 PR，失败 1 个（#8 rc=1 conflict）"
+    ]
+
+
+def test_broadcast_tip_lines_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """广播抛错不许把已完成的合并变成失败。"""
+    from types import SimpleNamespace
+
+    from team_board import tip as tipmod
+
+    def boom(*_a, **_k):
+        raise tipmod.TipError("gh 挂了")
+
+    monkeypatch.setattr(tipmod, "broadcast", boom)
+    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
+    assert mg._broadcast_tip_lines(opts) == ["tip 广播: 跳过（TipError: gh 挂了）"]

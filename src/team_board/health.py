@@ -9,6 +9,10 @@
 - **窗口**：``now - window_days * 86400``（左闭）。``window_days`` 默认
   :data:`DEFAULT_WINDOW_DAYS`（7 天）。窗口只影响 ``runs`` 与 ``rework``；
   ``ready`` 永远描述 ``now`` 那一刻的快照，与窗口无关。
+- **cards（可选，``by_card=True``）**：窗口内每个 ``task_id`` 的 run 次数、
+  分钟（同样先求和再整除）、``changes_requested`` 次数与出现过的 profile；
+  只含窗口内有 run 或有返工的卡，按分钟降序、次数降序、卡号升序。默认不计算，
+  所以既有输出与 JSON 键完全不变。
 - **runs.count**：窗口内 ``task_runs.started_at >= 窗口起点`` 的 run 行数。
 - **runs.minutes**：同一 profile 的 run 秒数**先求和，再整除 60**（向下取整）。
   未结束的 run（``ended_at IS NULL``）算到 ``now``；``ended_at < started_at``
@@ -38,6 +42,7 @@ __all__ = [
     "DEFAULT_WINDOW_DAYS",
     "READY_BACKLOG_MINUTES",
     "REQUIRED_TABLES",
+    "CardStat",
     "HealthError",
     "HealthReport",
     "ReadyStat",
@@ -74,6 +79,17 @@ class RunStat:
 
 
 @dataclass(frozen=True)
+class CardStat:
+    """一张卡在窗口内的成本与返工；``profiles`` 升序去重。"""
+
+    card: str
+    runs: int
+    minutes: int
+    rework: int
+    profiles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReworkStat:
     """窗口内的返工：事件行数与涉及的不同卡数。"""
 
@@ -99,6 +115,7 @@ class HealthReport:
     rework: ReworkStat
     ready: ReadyStat
     generated_at: int
+    cards: tuple[CardStat, ...] | None = None
 
 
 def _require_tables(conn: sqlite3.Connection) -> None:
@@ -194,6 +211,7 @@ def build(
     *,
     now: int,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    by_card: bool = False,
 ) -> HealthReport:
     """算一次完整报告；只读，不改 ``conn`` 的配置。"""
     if window_days < 1:
@@ -207,6 +225,53 @@ def build(
         rework=_load_rework(conn, cutoff=cutoff),
         ready=_load_ready(conn, now=now),
         generated_at=now,
+        cards=_load_cards(conn, cutoff=cutoff, now=now) if by_card else None,
+    )
+
+
+def _load_cards(conn: sqlite3.Connection, *, cutoff: int, now: int) -> tuple[CardStat, ...]:
+    """窗口内按卡汇总：run 次数/分钟 + 返工次数 + profile 集合。"""
+    try:
+        run_rows = conn.execute(
+            "SELECT task_id, profile, started_at, ended_at FROM task_runs "
+            "WHERE started_at >= ?",
+            (cutoff,),
+        ).fetchall()
+        rework_rows = conn.execute(
+            "SELECT task_id, COUNT(*) FROM task_events "
+            "WHERE kind = 'changes_requested' AND created_at >= ? "
+            "GROUP BY task_id",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise HealthError(f"读取按卡明细失败: {exc}") from exc
+
+    counts: dict[str, int] = {}
+    seconds: dict[str, int] = {}
+    profiles: dict[str, set[str]] = {}
+    for task_id, profile, started_at, ended_at in run_rows:
+        card = str(task_id)
+        start = int(started_at)
+        end = now if ended_at is None else int(ended_at)
+        counts[card] = counts.get(card, 0) + 1
+        seconds[card] = seconds.get(card, 0) + max(0, end - start)
+        key = "" if profile is None else str(profile)
+        profiles.setdefault(card, set()).add(key)
+
+    rework = {str(task_id): int(n) for task_id, n in rework_rows}
+    cards = sorted(
+        set(counts) | set(rework),
+        key=lambda card: (-(seconds.get(card, 0) // 60), -counts.get(card, 0), card),
+    )
+    return tuple(
+        CardStat(
+            card=card,
+            runs=counts.get(card, 0),
+            minutes=seconds.get(card, 0) // 60,
+            rework=rework.get(card, 0),
+            profiles=tuple(sorted(profiles.get(card, set()))),
+        )
+        for card in cards
     )
 
 
@@ -253,6 +318,17 @@ def render(report: HealthReport) -> str:
     for profile, stat in report.runs:
         lines.append(f"  {profile or NO_PROFILE}: {stat.count} 次 / {stat.minutes} 分钟")
 
+    if report.cards is not None:
+        shown = report.cards[:20]
+        lines.append(f"cards: {len(report.cards)} 张有成本/返工（按分钟降序）")
+        for card_stat in shown:
+            who = ",".join(p or NO_PROFILE for p in card_stat.profiles) or "—"
+            lines.append(
+                f"  {card_stat.card}: {card_stat.runs} 次 / {card_stat.minutes} 分钟 / "
+                f"返工 {card_stat.rework} 次（{who}）"
+            )
+        if len(report.cards) > len(shown):
+            lines.append(f"  …另有 {len(report.cards) - len(shown)} 张未显示")
     lines.append(f"rework: {report.rework.cards} 张卡 / {report.rework.events} 次")
     if report.ready.oldest_card is None:
         lines.append(f"ready: {report.ready.count} 张（最老 —）")
@@ -283,6 +359,17 @@ def render_json(report: HealthReport) -> str:
             "oldest_card": report.ready.oldest_card,
             "oldest_minutes": report.ready.oldest_minutes,
         },
-        "generated_at": report.generated_at,
     }
+    if report.cards is not None:
+        payload["cards"] = [
+            {
+                "card": card_stat.card,
+                "runs": card_stat.runs,
+                "minutes": card_stat.minutes,
+                "rework": card_stat.rework,
+                "profiles": list(card_stat.profiles),
+            }
+            for card_stat in report.cards
+        ]
+    payload["generated_at"] = report.generated_at
     return json.dumps(payload, ensure_ascii=False)

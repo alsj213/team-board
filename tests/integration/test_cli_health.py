@@ -248,3 +248,43 @@ def test_health_never_writes_the_db(
     rc, _, _ = run(capsys, *args)
     assert rc == 0
     assert hashlib.sha256(board.read_bytes()).hexdigest() == before
+
+
+def test_by_card_flag_appends_details(
+    board: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, out, err = run(
+        capsys, "health", "--db", str(board), "--now", str(NOW), "--by-card"
+    )
+    assert rc == 0
+    assert err == ""
+    assert "cards: 11 张有成本/返工（按分钟降序）" in out
+    assert "  t_a1: 1 次 / 30 分钟 / 返工 0 次（engineer）" in out
+    assert out.splitlines()[-1] == "结论: 关注（窗口内返工 3 次）"
+
+
+def test_by_card_flag_json_keeps_generated_at_last(
+    board: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, out, err = run(
+        capsys,
+        "health",
+        "--db",
+        str(board),
+        "--now",
+        str(NOW),
+        "--by-card",
+        "--json",
+    )
+    assert rc == 0
+    assert err == ""
+    payload = json.loads(out)
+    assert list(payload) == [
+        "window_days",
+        "runs",
+        "rework",
+        "ready",
+        "cards",
+        "generated_at",
+    ]
+    assert payload["cards"][0]["card"] == "t_a1"
