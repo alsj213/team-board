@@ -1687,6 +1687,23 @@ def test_redact_url_never_leaves_token() -> None:
         assert "***" in redacted, (url, redacted)
 
 
+def _broadcast_opts() -> mg.Options:
+    """最小合法 Options；广播路径只读 repo/remote，其余字段只需通过类型检查。"""
+
+    return mg.Options(
+        pr=1,
+        branch="wt/t_00000001",
+        method="merge",
+        repo="/tmp/repo",
+        remote="origin",
+        db_path="/tmp/board.db",
+        timeout=60,
+        interval=2,
+        command_timeout=60,
+        verify_only=False,
+    )
+
+
 def test_broadcast_tip_lines_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """合并后广播只回一行摘要，不改合并结果。"""
     from types import SimpleNamespace
@@ -1704,8 +1721,9 @@ def test_broadcast_tip_lines_success(monkeypatch: pytest.MonkeyPatch) -> None:
         "broadcast",
         lambda *a, **k: SimpleNamespace(updated=(updated,), failed=()),
     )
-    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
-    assert mg._broadcast_tip_lines(opts) == ["tip 广播: 更新 1 个落后 PR，失败 0 个"]
+    assert mg._broadcast_tip_lines(_broadcast_opts()) == [
+        "tip 广播: 更新 1 个落后 PR，失败 0 个"
+    ]
     assert report.dry_run is False
 
 
@@ -1723,21 +1741,19 @@ def test_broadcast_tip_lines_reports_failure_without_raising(
         "broadcast",
         lambda *a, **k: SimpleNamespace(updated=(), failed=(failed,)),
     )
-    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
-    assert mg._broadcast_tip_lines(opts) == [
+    assert mg._broadcast_tip_lines(_broadcast_opts()) == [
         "tip 广播: 更新 0 个落后 PR，失败 1 个（#8 rc=1 conflict）"
     ]
 
 
 def test_broadcast_tip_lines_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     """广播抛错不许把已完成的合并变成失败。"""
-    from types import SimpleNamespace
-
     from team_board import tip as tipmod
 
     def boom(*_a, **_k):
         raise tipmod.TipError("gh 挂了")
 
     monkeypatch.setattr(tipmod, "broadcast", boom)
-    opts = SimpleNamespace(repo="/tmp/repo", remote="origin")
-    assert mg._broadcast_tip_lines(opts) == ["tip 广播: 跳过（TipError: gh 挂了）"]
+    assert mg._broadcast_tip_lines(_broadcast_opts()) == [
+        "tip 广播: 跳过（TipError: gh 挂了）"
+    ]
