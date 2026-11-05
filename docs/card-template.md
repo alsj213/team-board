@@ -40,7 +40,7 @@
 这一段贴进 `worker_context`（`t_c0f2c33e`），`bash scripts/install-card-template.sh --check`（PR #65，未合）
 按它判漂移（`t_eb47566b`）。
 
-含 PR 号的卡，关闭前还必须跑 `merge-owner-audit <卡号>`：`rc=0` 才许关；`UNOWNED` **不要手工建收口卡**——实现卡 done 后由 `team-board merge-card --sweep` 自动建；确需手工时用 `team-board merge-card --impl-card <卡号> --pr <n>`；`rc=2` 按错误修、不算通过。口径与降级日志见 [`docs/merge-owner.md`](merge-owner.md)。
+含 PR 号的卡，关闭前还必须跑 `merge-owner-audit <卡号>`：`rc=0` 才许关；`UNOWNED` **不要手工建收口卡**——实现卡 done 后由 `team-board merge-card --sweep` 自动建；确需手工时用 `team-board merge-card --impl-card <卡号> --pr <n>`；`rc=2` 按错误修、不算通过。口径与降级日志见 `docs/merge-owner.md`。
 
 <!-- FIXED:v3:BEGIN -->
 ## 完成契约
@@ -79,7 +79,7 @@
 ## 证据义务（devteam）
 
 - **完成/评审前必须在本 run 内写 evidence**；卡 done 后无法补写，没证据的 PR 不合。
-- engineer：`impl_done`（pr + head）；qa：`qa_pass` + 两条 `review`；pm：`tier`（评审时另加两条 review）。
+- engineer：`impl_done`（pr + head）；qa：`qa_pass` + 两条 `review`；pm：只写 `tier`（不再评审代码、不建合并卡）。
 - 先算内容指纹：`PYTHONPATH=/home/liu/project/team-board/src /home/liu/project/team-board/.venv/bin/python -m team_board.cli evidence patch --repo <worktree> --base origin/main --head $(git -C <worktree> rev-parse HEAD)`。
 - 写事件时带 `--card $HERMES_KANBAN_TASK --run-id $HERMES_KANBAN_RUN_ID`；`tier`/`qa_pass`/`review` 带 `--patch <40hex>`。
 - 写不出证据 → `kanban_block`，不要 `kanban_complete`。
