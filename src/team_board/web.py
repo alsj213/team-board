@@ -25,11 +25,13 @@ from .model import TITLE_MAX, Task
 #: 页面上的四列，顺序即渲染顺序（不再有第五列）
 COLUMNS = ("running", "queued", "blocked", "done")
 
-#: 状态 → 列。archived / triage / todo / review 不在表里 → 不进任何列
+#: 状态 → 列。todo 是等依赖/停泊的卡，仍进 queued；archived / triage / review
+#: 不在表里 → 不进任何列（review 由 review lane 单独处理）
 _STATUS_TO_COLUMN = {
     "running": "running",
     "ready": "queued",
     "scheduled": "queued",
+    "todo": "queued",
     "blocked": "blocked",
     "done": "done",
 }
