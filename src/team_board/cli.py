@@ -2928,7 +2928,7 @@ def _sweep_card_audit(args: argparse.Namespace) -> int:
             except db.BoardError as exc:
                 results.append({"card": task.id, "status": "error", "reason": str(exc)})
                 continue
-            report = flow.audit_card(task.id, title, body)
+            report = flow.audit_card(task.id, title, body, assignee=task.assignee)
             if report.ok:
                 continue
             seen += 1
@@ -3000,6 +3000,10 @@ def _run_card_audit(args: argparse.Namespace) -> int:
     try:
         conn = db.connect(args.db)
         _status, title, body = db.load_card_row(conn, args.card)
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (args.card,)
+        ).fetchone()
+        assignee = assignee_row[0] if assignee_row is not None else None
     except (db.BoardError, OSError, sqlite3.Error) as exc:
         _write_stderr_error(str(exc))
         return 2
@@ -3007,7 +3011,7 @@ def _run_card_audit(args: argparse.Namespace) -> int:
         if conn is not None:
             conn.close()
 
-    report = flow.audit_card(args.card, title, body)
+    report = flow.audit_card(args.card, title, body, assignee=assignee)
     text = flow.render_card_json(report) if args.json else flow.render_card(report)
     if not _write_stdout(text + "\n"):
         return 2

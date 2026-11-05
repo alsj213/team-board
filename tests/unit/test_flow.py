@@ -154,3 +154,22 @@ class TestAutoActionExemption:
         report = flow.audit_card(CARD, "合并 PR #100（自动收口卡）", "## 目标\n")
         assert report.kind == "merge"
         assert [f.code for f in report.findings] == ["pr-claim-missing"]
+
+
+class TestNonImplementationAssignee:
+    """pm/qa/ops 的卡不是实现卡，不适用 PATH-CLAIM 契约。"""
+
+    def test_pm_card_is_exempt(self) -> None:
+        report = flow.audit_card(CARD, "需求卡：给看板加 Bot 状态页", "## 问题\n", assignee="pm")
+        assert report.kind == "non-impl"
+        assert report.findings == ()
+
+    def test_engineer_card_still_requires_contract(self) -> None:
+        report = flow.audit_card(CARD, "实现卡", "## 目标\n", assignee="engineer")
+        assert report.kind == "impl"
+        assert [f.code for f in report.findings] == [
+            "path-claim-missing",
+            "test-plan-missing",
+            "consumer-missing",
+            "qa-spec-missing",
+        ]
