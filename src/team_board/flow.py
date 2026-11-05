@@ -87,7 +87,9 @@ class HandoffReport:
 AUTO_ACTION_SUFFIX = "（自动收口卡）"
 
 
-def audit_card(card_id: str, title: str, body: str) -> CardAuditReport:
+def audit_card(
+    card_id: str, title: str, body: str, *, assignee: str | None = None
+) -> CardAuditReport:
     """检查一张卡的机器可读契约。
 
     合并卡豁免**两条同时成立**（与 :func:`prclaim.audit_gaps` 同一口径，
@@ -115,6 +117,10 @@ def audit_card(card_id: str, title: str, body: str) -> CardAuditReport:
         # 复审 / rebase / 补证据动作卡由 pr_orphan_autoclose 生成，卡面只有
         # PR-CLAIM + 动作说明；它们不是实现卡，缺 PATH-CLAIM 等不代表卡坏。
         return CardAuditReport(card_id=card_id, kind="auto", findings=())
+    if assignee is not None and str(assignee) != "engineer":
+        # PATH-CLAIM / TEST-PLAN / CONSUMER / QA-SPEC 是实现卡契约；pm 的需求/拆卡卡、
+        # qa 的验收卡、ops 的巡检卡不应被它拦。
+        return CardAuditReport(card_id=card_id, kind="non-impl", findings=())
 
     findings: list[Finding] = []
     paths, issues = pathclaim.parse_body(body)

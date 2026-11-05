@@ -129,3 +129,16 @@ def test_auto_action_card_is_not_blocked(
     code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
     assert (code, err) == (0, "")
     assert "0 张异常" in out
+
+
+def test_pm_requirement_card_is_not_blocked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """pm 的需求/拆卡卡没有实现契约，不应被 card-audit 拦。"""
+    board = make_db(
+        tmp_path / "pm.db",
+        [("t_1234abcd", "ready", "pm", "需求卡：给看板加 Bot 状态页", "## 问题\n")],
+    )
+    code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
+    assert (code, err) == (0, "")
+    assert "0 张异常" in out
