@@ -131,13 +131,14 @@ def printed_command(out: str) -> str:
 
 
 def printed_argv(out: str) -> list[str]:
-    """把打印行拆成 ``merge_guard`` 的 argv：去掉 ``cd <repo> && `` 与 ``PYTHONPATH=…/src``。"""
+    """把打印行拆成 ``merge_guard`` 的 argv：跳过 ``cd <repo>`` 与 reviewmarkers 前缀。"""
 
     line = printed_command(out)
     assert line.startswith("cd "), line
-    before, sep, after = line.partition(" && ")
-    assert sep and before.startswith("cd "), line
-    parts = shlex.split(after)
+    segments = line.split(" && ")
+    merge_seg = next((s for s in segments if "team_board.merge_guard" in s), None)
+    assert merge_seg is not None, line
+    parts = shlex.split(merge_seg)
     assert parts[0].startswith("PYTHONPATH="), parts
     assert parts[1:4] == ["python3", "-m", "team_board.merge_guard"], parts
     return parts[4:]
@@ -171,11 +172,12 @@ def shim_python3(tmp_path: Path) -> Path:
 
 
 def run_line_in_bash(line: str, shim_dir: Path) -> tuple[int, list[str], str, str]:
-    """把打印行原样交给 ``bash -c`` 跑（``python3`` = 替身），返回 ``(rc, argv, out, err)``。
+    """把打印行原样交给 ``bash -c`` 跑（``python3`` = 替身），返回 ``(rc, merge_argv, out, err)``。
 
-    判据是**严格**的：替身的 stdout 只许是「一条 ``CALL`` + 每行 ``ARG …``」。注入成功时
-    shell 会额外跑 ``echo …``，多出来的输出落在这里 ⇒ 断言直接炸；命令被拆断则替身收到的
-    argv 少一截、``--branch`` 不再逐字还原。
+    判据是**严格**的：替身的 stdout 只许是「两次 ``CALL`` + 每行 ``ARG …``」（第一次
+    ``reviewmarkers``，第二次 ``merge_guard``）。注入成功时 shell 会额外跑 ``echo …``，
+    多出来的输出落在这里 ⇒ 断言直接炸；命令被拆断则替身收到的 argv 少一截、
+    ``--branch`` 不再逐字还原。
     """
 
     bash = shutil.which("bash")
@@ -187,11 +189,19 @@ def run_line_in_bash(line: str, shim_dir: Path) -> tuple[int, list[str], str, st
         [bash, "-c", line], capture_output=True, text=True, env=env, check=False
     )
 
-    lines = proc.stdout.splitlines()
-    assert lines[:1] == ["CALL"], (proc.returncode, proc.stdout, proc.stderr)
-    for extra in lines[1:]:
-        assert extra.startswith("ARG "), (proc.stdout, proc.stderr)
-    return proc.returncode, [ln[4:] for ln in lines[1:]], proc.stdout, proc.stderr
+    chunks = proc.stdout.split("CALL\n")
+    assert chunks[:1] == [""], (proc.returncode, proc.stdout, proc.stderr)
+    calls: list[list[str]] = []
+    for chunk in chunks[1:]:
+        args: list[str] = []
+        for row in chunk.splitlines():
+            assert row.startswith("ARG "), (proc.stdout, proc.stderr)
+            args.append(row[4:])
+        calls.append(args)
+    assert len(calls) == 2, (proc.stdout, proc.stderr)
+    assert calls[0][:2] == ["-m", "team_board.reviewmarkers"], calls
+    assert calls[1][:2] == ["-m", "team_board.merge_guard"], calls
+    return proc.returncode, calls[1], proc.stdout, proc.stderr
 
 
 @pytest.fixture()
@@ -226,15 +236,17 @@ def test_generate_prints_body_then_comment_block(
     assert lines[6].startswith("# 卡面认账块：")
     assert f"merge-audit --card {CARD} --require" in lines[6]
     assert lines[7] == (
-        "# 合并命令（本工具不执行；R12 ① 唯一入口 = merge_guard，缺 --delete-branch 会被拒）："
+        "# 合并命令（本工具不执行；先刷新 review-markers，再走 R12 ① 唯一入口 merge_guard）："
     )
     repo = os.path.realpath(str(tmp_path))
     body = os.path.realpath(str(body_path))
     assert lines[8] == (
-        f"cd {repo} && PYTHONPATH={repo}/src python3 -m team_board.merge_guard"
+        f"cd {repo} && PYTHONPATH={repo}/src python3 -m team_board.reviewmarkers"
+        f" --pr {PR} --wait 240"
+        f" && PYTHONPATH={repo}/src python3 -m team_board.merge_guard"
         f" --pr {PR} --branch {BRANCH} --method merge --delete-branch"
         f" --card {CARD} --by {BY} --subject {shlex.quote(DEFAULT_TITLE)}"
-        f" --body-file {body} --repo {repo}"
+        f" --body-file {body} --repo {repo} --broadcast-tip"
     )
     assert lines[9] == f"# body 文件：{body}（已写入）"
     # 本工具只打印、不执行；旧的裸 gh pr merge 形态不许再出现
@@ -300,6 +312,7 @@ def test_printed_command_is_merge_guard_and_runnable(
         "--subject", DEFAULT_TITLE,
         "--body-file", body,
         "--repo", repo,
+        "--broadcast-tip",
     ]
     # 「钉到提交」由 merge_guard 自己从预检的 headRefOid 拼，不进模板
     assert "--match-head-commit" not in argv
@@ -384,7 +397,7 @@ def test_branch_with_shell_metachars_stays_one_command(
     assert "\n" not in line  # 一条命令 = 一行
     tokens = shlex.split(line)
     # 全行只有「cd … && …」那一个分隔符；注入的 ';' / '$' 必须被吃进引号、不能成为独立 token
-    assert tokens.count("&&") == 1, tokens
+    assert tokens.count("&&") == 2, tokens
     for operator in (";", "|", "||", "&", ">", ">>", "(", ")"):
         assert operator not in tokens, tokens
     argv = printed_argv(out)
@@ -427,7 +440,7 @@ def test_repo_with_space_is_quoted_and_roundtrips(
         f"cd {shlex.quote(real)} && PYTHONPATH={shlex.quote(real + '/src')} "
     ), line
     tokens = shlex.split(line)
-    assert tokens.count("&&") == 1, tokens
+    assert tokens.count("&&") == 2, tokens
     # PYTHONPATH 的整条路径是一个 token（含空格也不能被拆开），且逐字还原
     assert f"PYTHONPATH={real}/src" in tokens, tokens
     argv = printed_argv(out)

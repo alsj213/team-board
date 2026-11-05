@@ -1776,12 +1776,14 @@ def _record_generate(
 ) -> int:
     """生成模式：打印「body 段 + 空行 + 4 行注释段」，并把 body 写进 ``--body-out``。
 
-    注释段 4 行 = 3 行 ``# `` 注释 + 1 行**可直接照抄执行**的 ``merge_guard`` 合并命令
-    （该行刻意不加 ``# ``，否则复制出来就不能直接执行）。命令形态对齐 R12 ①：唯一入口
-    是 ``merge_guard``，``--method merge`` + ``--delete-branch`` 齐；“钉到提交”的
-    ``--match-head-commit`` **不写进这一行**（由 merge_guard 自己从预检的
-    ``headRefOid`` 拼），手写进去只会让命令多一个必填项。本函数**不执行**任何 git/gh
-    命令。
+    注释段 4 行 = 3 行 ``# `` 注释 + 1 行**可直接照抄执行**的合并命令（该行刻意不加
+    ``# ``，否则复制出来就不能直接执行）。命令先跑 ``reviewmarkers`` 定点重跑
+    ``review-markers`` required check，再进 ``merge_guard``：该 check 在 PR 首次 push
+    时必然失败（qa 的双问评论不触发 workflow），不重跑就会让 CI 全绿闸门死锁
+    （2026-11-06 实测）。命令形态对齐 R12 ①：唯一入口是 ``merge_guard``，
+    ``--method merge`` + ``--delete-branch`` 齐；“钉到提交”的 ``--match-head-commit``
+    **不写进这一行**（由 merge_guard 自己从预检的 ``headRefOid`` 拼），手写进去只会让
+    命令多一个必填项。本函数**不执行**任何 git/gh 命令。
 
     ``--subject`` / ``--branch`` / ``--body-file`` / ``--repo``（含 ``cd`` 与
     ``PYTHONPATH`` 两处拼接）**全部**过 :func:`shlex.quote`：标题里带 ``"`` / ``$`` /
@@ -1803,19 +1805,22 @@ def _record_generate(
     repo_path = os.path.realpath(repo)
     _write_body_file(body_path, body)
     repo_q = shlex.quote(repo_path)
+    src_q = shlex.quote(repo_path + "/src")
     command = (
-        f"cd {repo_q} && PYTHONPATH={shlex.quote(repo_path + '/src')}"
-        " python3 -m team_board.merge_guard"
+        f"cd {repo_q} && PYTHONPATH={src_q}"
+        f" python3 -m team_board.reviewmarkers --pr {pr} --wait 240"
+        f" && PYTHONPATH={src_q} python3 -m team_board.merge_guard"
         f" --pr {pr} --branch {shlex.quote(branch)} --method merge --delete-branch"
         f" --card {card} --by {by} {_subject_argument(title)}"
         f" --body-file {shlex.quote(body_path)} --repo {repo_q}"
+        " --broadcast-tip"
     )
     lines = [
         body.rstrip("\n"),
         "",
         f"# 卡面认账块：上面 body 段的三行原样贴卡；"
         f"合并完成后用 merge-audit --card {card} --require 回读合并提交 sha 补一行",
-        "# 合并命令（本工具不执行；R12 ① 唯一入口 = merge_guard，缺 --delete-branch 会被拒）：",
+        "# 合并命令（本工具不执行；先刷新 review-markers，再走 R12 ① 唯一入口 merge_guard）：",
         command,
         f"# body 文件：{body_path}（已写入）",
     ]

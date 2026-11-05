@@ -223,6 +223,10 @@ def _render_body(
     ``cd <repo> && PYTHONPATH=<repo>/src python3 -m team_board.merge_guard …``，
     ``--body-file`` 恒为绝对路径（``merge_guard`` 拒相对路径）。路径与标题一律过
     :func:`shlex.quote`（仓库路径含空格、标题含 ``'`` ``$`` 时照抄仍是一条命令）。
+
+    合并命令前面串一步 ``reviewmarkers``：``review-markers`` required check 在 PR
+    首次 push 时必然失败（qa 的双问评论不会触发 workflow），qa PASS 后需要定点重跑
+    那个 job 才会变绿；否则 ``merge_guard`` 的 CI 全绿闸门会死锁（2026-11-06 实测）。
     """
 
     subject = f"Merge PR #{pr}（{impl_card}）：{_title_suffix(impl_title)}"
@@ -235,7 +239,9 @@ def _render_body(
         f" --pr {pr} --branch {branch} --body-out {body_file}"
     )
     merge = (
-        f"cd {repo_q} && PYTHONPATH={src_q} python3 -m team_board.merge_guard"
+        f"cd {repo_q} && PYTHONPATH={src_q} python3 -m team_board.reviewmarkers"
+        f" --pr {pr} --wait 240"
+        f" && PYTHONPATH={src_q} python3 -m team_board.merge_guard"
         f" --pr {pr} --branch {branch} --method merge --delete-branch"
         " --card $HERMES_KANBAN_TASK --by repo/run$HERMES_KANBAN_RUN_ID"
         f" --subject {shlex.quote(subject)} --body-file {body_file} --repo {repo_q}"
@@ -254,7 +260,7 @@ TEMPLATE: card-template.md#v3
 {record}
 ```
 
-- 第 2 步 合并（R12 唯一入口，缺 --delete-branch 会被拒）：
+- 第 2 步 刷新 required check 并合并（先定点重跑 review-markers，再走 R12 唯一入口；缺 --delete-branch 会被拒）：
 
 ```
 {merge}
