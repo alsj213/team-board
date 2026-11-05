@@ -186,13 +186,14 @@ def test_api_board_200_shape_and_grouping(
 
     all_ids = {card["id"] for cards in columns.values() for card in cards}
     assert "t_archived_old" not in all_ids
-    # 75 分钟降序在前；archived/todo/review 一张都不出现
+    # 75 分钟降序在前；archived/review 不进列；todo 进 queued
     assert [card["id"] for card in columns["running"]]
     assert next(card["id"] for card in columns["running"]) == "t_running_stale"
     assert all_ids == {
         "t_running_stale",
         "t_running_fresh",
         "t_null_start",
+        "t_long_title",
         "t_blocked_one",
         "t_done_today",
         "t_done_yesterday",

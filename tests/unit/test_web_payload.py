@@ -9,7 +9,7 @@ fixture 口径（now=FIXTURE_NOW=2026-10-28 12:00 CST）：
     done_today      完成于 2026-10-28 11:55
     done_yesterday  完成于 2026-10-27 12:00
     null_start      ready（queued 列）
-    long_title      todo（title 长于 TITLE_MAX，且不进任何列）
+    long_title      todo（title 长于 TITLE_MAX；todo 进 queued）
     archived_old    archived（不进任何列）
 """
 
@@ -67,7 +67,7 @@ def test_board_payload_columns(board: Board) -> None:
     assert list(columns) == ["running", "queued", "blocked", "done"]
     # 列内按耗时降序：stale(75) 在 fresh(10) 之前
     assert columns["running"] == [ids["running_stale"], ids["running_fresh"]]
-    assert columns["queued"] == [ids["null_start"]]
+    assert columns["queued"] == [ids["null_start"], ids["long_title"]]
     assert columns["blocked"] == [ids["blocked_one"]]
     # done 列按 completed_at 降序：done_today（11:55 完成）在 done_yesterday
     # （昨天 12:00 完成）之前 —— 与耗时无关，最新完成排第一
@@ -77,7 +77,7 @@ def test_board_payload_columns(board: Board) -> None:
     )
 
     in_columns = {task_id for value in columns.values() for task_id in value}
-    for name in ("archived_old", "long_title", "review_stale", "review_fresh"):
+    for name in ("archived_old", "review_stale", "review_fresh"):
         assert ids[name] not in in_columns
 
     # 每张卡都是 6 键、duration_minutes 是 int、completed_at 是 int|None
