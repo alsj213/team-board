@@ -86,6 +86,48 @@ jobs:
             python -m team_board.cli branch-audit --branch main --allow-file "$ALLOW_FILE"
           fi
 
+  review-markers:
+    name: review-markers (双问绑定)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require QA review markers for card branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$HEAD_REF" != wt/t_* ]]; then
+            echo "非卡分支（$HEAD_REF），跳过双问 required check"
+            exit 0
+          fi
+          git fetch -q origin "$HEAD_SHA" || true
+          PYTHONPATH=src python -m team_board.cli pr-review-head-audit \
+            --pr "$PR_NUMBER" --head "$HEAD_SHA" --repo . --base origin/main
+          bodies=$(mktemp)
+          gh api "repos/alsj213/team-board/issues/$PR_NUMBER/comments" \
+            --paginate --jq '.[].body' > "$bodies"
+          pass=$(grep -c '^REVIEW-VERDICT: pass$' "$bodies" || true)
+          block=$(grep -c '^REVIEW-VERDICT: block$' "$bodies" || true)
+          echo "REVIEW-VERDICT pass=$pass block=$block"
+          if [ "$pass" -lt 2 ] || [ "$block" -ne 0 ]; then
+            echo "::error::PR 必须有两类双问的 REVIEW-VERDICT: pass（defect + regression），且不得有 block"
+            exit 1
+          fi
+
   ruff:
     name: ruff (3.12)
     runs-on: ubuntu-latest
