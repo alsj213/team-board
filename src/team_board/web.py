@@ -1,6 +1,6 @@
 """Web 层：payload 装配（纯函数）+ 只读 HTTP 服务。
 
-上半部分是纯函数：三个 payload 构造函数与一个 HTML 常量函数，不读环境、
+上半部分是纯函数：四个 payload 构造函数与一个 HTML 常量函数，不读环境、
 不打印、不碰数据库。下半部分（``BoardRequestHandler`` / ``make_server``）是
 HTTP 适配：每个请求现开一条 ``mode=ro`` 连接、用完即关，只提供 GET，
 任何写接口都不存在。
@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import commands, db, fmt
+from . import bots, commands, db, fmt
 from .model import TITLE_MAX, Task
 
 #: 页面上的四列，顺序即渲染顺序（不再有第五列）
@@ -68,7 +68,7 @@ def _check_time_range(tasks: list[Task]) -> None:
     13 位毫秒（``1793160000000``）这类脏值落在起点上是**静默**夹成 0 分钟
     （``Task.duration_minutes`` 的 ``max(0, …)``），落在 ``completed_at`` 上
     却在 ``summary_stats`` 里抛 ``ValueError`` —— 同一类脏数据两种行为。
-    这里统一成前者也报错：起点与终点都校验，两个接口口径一致，不再返回一个
+    这里统一成前者也报错：起点与终点都校验，三个接口口径一致，不再返回一个
     看起来正常的 0 分钟。
     """
     for task in tasks:
@@ -416,7 +416,7 @@ def index_html() -> str:
 
 
 class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
-    """只读看板的 HTTP 入口：GET /、/api/board、/api/summary，其余一律拒绝。
+    """只读看板的 HTTP 入口：GET /、/api/board、/api/summary、/api/bots，其余一律拒绝。
 
     - 路由只看 ``urlsplit(self.path).path``：查询串被忽略，``/api/board?x=1``
       等同 ``/api/board``；
@@ -537,7 +537,7 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        if path not in ("/api/board", "/api/summary"):
+        if path not in ("/api/board", "/api/summary", "/api/bots"):
             self._send_json(404, {"error": "not found"})
             return
 
@@ -546,7 +546,12 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             conn = db.connect(server.board_db_path)
             tasks = db.load_tasks(conn)
-            if path == "/api/board":
+            if path == "/api/bots":
+                # 名册与时间戳无关（bots_payload 不含时间字段），但脏时间戳
+                # 仍要与其他接口同口径报 500，不在这里静默放过。
+                _check_time_range(tasks)
+                payload = bots.bots_payload(tasks)
+            elif path == "/api/board":
                 payload = board_payload(tasks, now)
             else:
                 # 不查 task_events：summary_payload 用不上 rework（见其 docstring），
