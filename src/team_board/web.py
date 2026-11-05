@@ -38,6 +38,10 @@ _STATUS_TO_COLUMN = {
 #: 全仓只有这一处可改（改常量页面就跟着变，不存在第二份字面量）。
 REFRESH_MS = 5000
 
+#: 每页卡片数。``index_html`` 里的 ``const PAGE_SIZE`` 由它渲染 —— 与
+#: ``REFRESH_MS`` 同口径：全仓只有一个来源，Python 侧的分页断言也用它。
+PAGE_SIZE = 20
+
 #: 500 响应体允许出现的稳定错误类别 → 一句话原因。
 #: 原因里**不含**绝对路径、表名、SQLite 原文，也不含 ``str(exc)``；
 #: 细节只写 stderr（一行，含请求方法与路径）。
@@ -78,11 +82,13 @@ def _check_time_range(tasks: list[Task]) -> None:
 
 
 def card_payload(task: Task, now: int) -> dict:
-    """一张卡的 JSON 形状：键顺序固定，类型固定 ``str, str, str, int, str``。
+    """一张卡的 JSON 形状：键顺序固定，类型固定 ``str, str, str, int, str, int|None``。
 
     字段口径与 ``commands.render_export`` 完全一致：``assignee`` / ``status`` /
     ``title`` 为 None 时输出空串（不套列表用的「—」），``title`` 不截断，
     ``duration_minutes`` 一律来自 ``Task.duration_minutes(now)``。
+    ``completed_at`` 是原始完成时间（epoch 秒），未完成的卡为 ``None``；它是
+    done 列排序的唯一依据（见 ``board_payload``），前端不再自己反转顺序。
     """
     return {
         "id": task.id,
@@ -90,7 +96,20 @@ def card_payload(task: Task, now: int) -> dict:
         "status": task.status or "",
         "duration_minutes": task.duration_minutes(now),
         "title": task.title or "",
+        "completed_at": task.completed_at,
     }
+
+
+def _done_sort_key(task: Task) -> tuple[int, int, str]:
+    """done 列的排序键，配 ``sorted(..., reverse=True)`` 使用。
+
+    - ``(0|1, completed_at, id)`` 反转后：有完成时间的卡排在 ``completed_at``
+      为 NULL 的脏数据之前（脏数据不抢第 1 页首条）；
+    - ``completed_at`` 降序 = 最新完成排第一；
+    - 同值按 id 降序。
+    """
+    completed = task.completed_at
+    return (0 if completed is None else 1, completed or 0, task.id)
 
 
 def board_payload(tasks: list[Task], now: int) -> dict:
@@ -98,7 +117,10 @@ def board_payload(tasks: list[Task], now: int) -> dict:
 
     - 分组只看 ``_STATUS_TO_COLUMN``；不在表里的卡（archived / triage / todo /
       review）不进任何列，也不新建第五列；
-    - 列内排序统一 ``(-duration_minutes(now), id)`` 升序；
+    - 列内排序：``done`` 列按 ``completed_at`` 降序（同值按 id 降序，
+      ``completed_at`` 为 NULL 的排最后），其余三列沿用
+      ``(-duration_minutes(now), id)`` 升序；done 列的顺序由后端给定，前端
+      不再 ``reverse()``；
     - ``columns`` 的键顺序恒为 ``COLUMNS``；空列是 ``[]``；
     - 卡上的时间戳越界（13 位毫秒等）→ ``PayloadError``（HTTP 层收口成 500），
       不静默按 0 分钟出数。
@@ -113,9 +135,12 @@ def board_payload(tasks: list[Task], now: int) -> dict:
 
     columns = {}
     for name in COLUMNS:
-        ordered = sorted(
-            grouped[name], key=lambda task: (-task.duration_minutes(now), task.id)
-        )
+        if name == "done":
+            ordered = sorted(grouped[name], key=_done_sort_key, reverse=True)
+        else:
+            ordered = sorted(
+                grouped[name], key=lambda task: (-task.duration_minutes(now), task.id)
+            )
         columns[name] = [card_payload(task, now) for task in ordered]
     return {"columns": columns}
 
@@ -233,7 +258,7 @@ _PAGE_TEMPLATE = string.Template(
 <script>
 const REFRESH_MS = ${REFRESH_MS};
 const COLUMN_NAMES = ["running", "queued", "blocked", "done"];
-const PAGE_SIZE = 20;
+const PAGE_SIZE = ${PAGE_SIZE};
 const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };
 let timer = null;
 
@@ -271,9 +296,9 @@ function renderBoard(data) {
   for (const name of COLUMN_NAMES) {
     const slot = document.querySelector('section[data-col="' + name + '"] .cards');
     if (!slot) { continue; }
-    let cards = data.columns[name] || [];
-    // done 列最新完成排第一（后端按时间升序返回，这里只在展示层反转，不改 API）
-    if (name === "done") { cards = cards.slice().reverse(); }
+    const cards = data.columns[name] || [];
+    // 顺序完全由后端给：done 列 = completed_at 降序（最新完成在第一页第一条）。
+    // 这里再翻一次顺序就会变成「最旧在前」，所以前端只切页、不动顺序。
     const pages = Math.max(1, Math.ceil(cards.length / PAGE_SIZE));
     if (pageIndex[name] > pages - 1) { pageIndex[name] = pages - 1; }
     const start = pageIndex[name] * PAGE_SIZE;
@@ -382,9 +407,10 @@ def index_html() -> str:
     - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
     - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML；
     - ``const REFRESH_MS`` 由模块常量 ``REFRESH_MS`` 渲染（模板占位
-      ``${REFRESH_MS}``）：页面里没有第二份字面量，改常量页面就跟着变。
+      ``${REFRESH_MS}``），``const PAGE_SIZE`` 由 ``PAGE_SIZE`` 渲染：
+      页面里没有第二份字面量，改常量页面就跟着变。
     """
-    return _PAGE_TEMPLATE.substitute(REFRESH_MS=REFRESH_MS)
+    return _PAGE_TEMPLATE.substitute(REFRESH_MS=REFRESH_MS, PAGE_SIZE=PAGE_SIZE)
 
 
 class BoardRequestHandler(http.server.BaseHTTPRequestHandler):

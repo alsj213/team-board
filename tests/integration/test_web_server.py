@@ -164,11 +164,25 @@ def test_api_board_200_shape_and_grouping(
                 "status",
                 "duration_minutes",
                 "title",
+                "completed_at",
             }
             assert isinstance(card["duration_minutes"], int)
+            # 旧字段仍在，且 completed_at 是 int|None（未完成的卡为 null）
+            assert card["completed_at"] is None or isinstance(
+                card["completed_at"], int
+            )
 
     assert "t_running_stale" in [card["id"] for card in columns["running"]]
     assert "t_null_start" in [card["id"] for card in columns["queued"]]
+
+    # done 列按 completed_at 降序：done_today（5 分钟前完成）在 done_yesterday
+    # （1440 分钟前完成）之前 —— 不再按 duration_minutes
+    done_ids = [card["id"] for card in columns["done"]]
+    assert done_ids == ["t_done_today", "t_done_yesterday"]
+    done_cards = {card["id"]: card for card in columns["done"]}
+    assert done_cards["t_done_today"]["completed_at"] > (
+        done_cards["t_done_yesterday"]["completed_at"]
+    )
 
     all_ids = {card["id"] for cards in columns.values() for card in cards}
     assert "t_archived_old" not in all_ids
