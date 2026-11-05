@@ -205,6 +205,15 @@ _PAGE_TEMPLATE = string.Template(
   .card .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #57606a; }
   .card .title { font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
   .card .meta { font-size: 11px; color: #6e7781; margin-top: 3px; }
+  .pager {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    font-size: 11px; color: #57606a; margin: 2px 0 8px;
+  }
+  .pager button {
+    font: inherit; padding: 2px 8px; border: 1px solid #d8dee4; background: #f6f8fa;
+    border-radius: 4px; cursor: pointer; color: #24292f;
+  }
+  .pager button:disabled { color: #b0b7bf; cursor: default; }
   @media (max-width: 720px) { #main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -224,6 +233,8 @@ _PAGE_TEMPLATE = string.Template(
 <script>
 const REFRESH_MS = ${REFRESH_MS};
 const COLUMN_NAMES = ["running", "queued", "blocked", "done"];
+const PAGE_SIZE = 20;
+const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };
 let timer = null;
 
 function make(tag, className, value) {
@@ -260,9 +271,29 @@ function renderBoard(data) {
   for (const name of COLUMN_NAMES) {
     const slot = document.querySelector('section[data-col="' + name + '"] .cards');
     if (!slot) { continue; }
-    const cards = data.columns[name] || [];
-    slot.replaceChildren.apply(slot, cards.map(renderCard));
+    let cards = data.columns[name] || [];
+    // done 列最新完成排第一（后端按时间升序返回，这里只在展示层反转，不改 API）
+    if (name === "done") { cards = cards.slice().reverse(); }
+    const pages = Math.max(1, Math.ceil(cards.length / PAGE_SIZE));
+    if (pageIndex[name] > pages - 1) { pageIndex[name] = pages - 1; }
+    const start = pageIndex[name] * PAGE_SIZE;
+    const pageCards = cards.slice(start, start + PAGE_SIZE);
+    const nodes = pageCards.map(renderCard);
+    if (cards.length > PAGE_SIZE) { nodes.push(renderPager(name, pageIndex[name], pages, cards.length)); }
+    slot.replaceChildren.apply(slot, nodes);
   }
+}
+
+function renderPager(name, page, pages, total) {
+  const bar = make("div", "pager");
+  const prev = make("button", "", "上一页");
+  prev.disabled = page <= 0;
+  prev.addEventListener("click", function () { pageIndex[name] = page - 1; refresh(); });
+  const next = make("button", "", "下一页");
+  next.disabled = page >= pages - 1;
+  next.addEventListener("click", function () { pageIndex[name] = page + 1; refresh(); });
+  bar.append(prev, make("span", "", "第 " + (page + 1) + "/" + pages + " 页 · 共 " + total + " 张"), next);
+  return bar;
 }
 
 function showError(text) {
