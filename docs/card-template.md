@@ -79,7 +79,7 @@
 ## 证据义务（devteam）
 
 - **完成/评审前必须在本 run 内写 evidence**；卡 done 后无法补写，没证据的 PR 不合。
-- engineer：`impl_done`（pr + head）；qa：`qa_pass` + 两条 `review`；pm：只写 `tier`（不再评审代码、不建合并卡）。
+- engineer：`impl_done`（pr + head）；qa：`qa_pass` + 两条 `review`，PR 评论带 `REVIEW-VERDICT: pass|block`；pm：只写 `tier`（不再评审代码、不建合并卡）。
 - 先算内容指纹：`PYTHONPATH=/home/liu/project/team-board/src /home/liu/project/team-board/.venv/bin/python -m team_board.cli evidence patch --repo <worktree> --base origin/main --head $(git -C <worktree> rev-parse HEAD)`。
 - 写事件时带 `--card $HERMES_KANBAN_TASK --run-id $HERMES_KANBAN_RUN_ID`；`tier`/`qa_pass`/`review` 带 `--patch <40hex>`。
 - 写不出证据 → `kanban_block`，不要 `kanban_complete`。
