@@ -28,7 +28,7 @@ from tests.fixtures.make_board import FIXTURE_NOW, build_board
 DAY = datetime.date(2026, 10, 28)
 SNAPSHOT = "2026-10-28 12:00"
 
-CARD_KEYS = ["id", "assignee", "status", "duration_minutes", "title"]
+CARD_KEYS = ["id", "assignee", "status", "duration_minutes", "title", "completed_at"]
 
 Board = tuple[list[Task], dict[str, int], dict[str, str]]
 
@@ -69,18 +69,98 @@ def test_board_payload_columns(board: Board) -> None:
     assert columns["running"] == [ids["running_stale"], ids["running_fresh"]]
     assert columns["queued"] == [ids["null_start"]]
     assert columns["blocked"] == [ids["blocked_one"]]
-    # done 列同样按耗时降序：done_yesterday 60 分（started→completed）> done_today 25 分
-    assert columns["done"] == [ids["done_yesterday"], ids["done_today"]]
+    # done 列按 completed_at 降序：done_today（11:55 完成）在 done_yesterday
+    # （昨天 12:00 完成）之前 —— 与耗时无关，最新完成排第一
+    assert columns["done"] == [ids["done_today"], ids["done_yesterday"]]
+    assert payload["columns"]["done"][0]["completed_at"] > (
+        payload["columns"]["done"][1]["completed_at"]
+    )
 
     in_columns = {task_id for value in columns.values() for task_id in value}
     for name in ("archived_old", "long_title", "review_stale", "review_fresh"):
         assert ids[name] not in in_columns
 
-    # 每张卡都是 5 键、duration_minutes 是 int
+    # 每张卡都是 6 键、duration_minutes 是 int、completed_at 是 int|None
     for cards in payload["columns"].values():
         for card in cards:
             assert list(card) == CARD_KEYS
             assert isinstance(card["duration_minutes"], int)
+            assert card["completed_at"] is None or isinstance(card["completed_at"], int)
+
+
+# --- 1b. done 列：completed_at 降序 + 分页 ---------------------------------
+
+
+def _done_task(index: int, *, completed_off: int, ident: str | None = None) -> Task:
+    """造一张 done 卡；``completed_off`` 是相对 ``FIXTURE_NOW`` 的秒偏移（越小越新）。"""
+    return Task(
+        id=ident or f"t_done_{index:02d}",
+        title=f"完成 {index}",
+        assignee="engineer",
+        status="done",
+        created_at=FIXTURE_NOW - 7200,
+        started_at=FIXTURE_NOW - 3600,
+        completed_at=FIXTURE_NOW - completed_off,
+    )
+
+
+def test_done_column_45_cards_pages_20_20_5_latest_first() -> None:
+    """45 张 done（completed_at 各不相同）→ 第 1/3 页 20/20/5，第 1 页首条最新。
+
+    分页本身在 ``index_html`` 的 JS 里，页大小在 Python 侧只有 ``web.PAGE_SIZE``
+    一个来源（模板 ``${PAGE_SIZE}`` 渲染）；这里按同一常量切页，钉住「后端顺序
+    + 页大小」两件事 —— 前端拿到 payload 后只做 slice，不再 reverse。
+    """
+    tasks = [_done_task(index, completed_off=index * 60) for index in range(45)]
+    cards = web.board_payload(tasks, FIXTURE_NOW)["columns"]["done"]
+
+    assert len(cards) == 45
+    assert [card["completed_at"] for card in cards] == sorted(
+        (card["completed_at"] for card in cards), reverse=True
+    )
+    # 第 0 张是最近完成的那张（偏移 0），最久的落最后
+    assert cards[0]["id"] == "t_done_00"
+    assert cards[-1]["id"] == "t_done_44"
+
+    pages = [
+        cards[start : start + web.PAGE_SIZE]
+        for start in range(0, len(cards), web.PAGE_SIZE)
+    ]
+    assert [len(page) for page in pages] == [20, 20, 5]
+    # 页与页之间不重不漏，且第 1 页整体比第 2 页新、第 2 页整体比第 3 页新
+    assert [card["id"] for page in pages for card in page] == [
+        card["id"] for card in cards
+    ]
+    assert pages[0][-1]["completed_at"] > pages[1][0]["completed_at"]
+    assert pages[1][-1]["completed_at"] > pages[2][0]["completed_at"]
+
+
+def test_done_column_tie_breaks_by_id_desc_and_nulls_last() -> None:
+    """completed_at 同值按 id 降序；completed_at 为 NULL 的脏卡排最后。"""
+    same = FIXTURE_NOW - 600
+    tasks = [
+        _done_task(1, completed_off=600, ident="t_done_a"),
+        _done_task(2, completed_off=600, ident="t_done_b"),
+        Task(
+            id="t_done_dirty",
+            title="dirty",
+            assignee="pm",
+            status="done",
+            created_at=FIXTURE_NOW - 7200,
+            started_at=FIXTURE_NOW - 3600,
+            completed_at=None,
+        ),
+        _done_task(4, completed_off=60, ident="t_done_new"),
+    ]
+    assert tasks[0].completed_at == tasks[1].completed_at == same
+
+    cards = web.board_payload(tasks, FIXTURE_NOW)["columns"]["done"]
+    assert [card["id"] for card in cards] == [
+        "t_done_new",
+        "t_done_b",
+        "t_done_a",
+        "t_done_dirty",
+    ]
 
 
 # --- 2. card_payload 的键顺序、类型、不截断 ---------------------------------
@@ -101,6 +181,8 @@ def test_card_payload_keys_and_types(board: Board) -> None:
     # title 不截断：原样返回
     assert card["title"] == long_task.title
     assert card["duration_minutes"] == long_task.duration_minutes(FIXTURE_NOW)
+    # long_title 是 todo，没完成 → completed_at 为 null（不是 0、不是空串）
+    assert card["completed_at"] is None
 
 
 def test_card_payload_none_fields_become_empty_string() -> None:
@@ -119,6 +201,7 @@ def test_card_payload_none_fields_become_empty_string() -> None:
     assert card["status"] == ""
     assert card["title"] == ""
     assert card["duration_minutes"] == 10
+    assert card["completed_at"] is None
 
 
 # --- 3. 空 tasks -----------------------------------------------------------
@@ -254,6 +337,9 @@ def test_index_html_is_self_contained() -> None:
     assert '<link rel="stylesheet"' not in html
     # 数据渲染只走 textContent / replaceChildren，不拼 innerHTML
     assert "innerHTML" not in html
+    # done 列的顺序由后端给（completed_at 降序），前端不再反转
+    assert "reverse()" not in html
+    assert "const PAGE_SIZE = 20;" in html
     assert "<style>" in html and "<script>" in html
     assert "clearInterval" in html and "setInterval" in html
 
@@ -274,6 +360,44 @@ def test_index_html_refresh_ms_has_single_source(
     assert "const REFRESH_MS = 5000;" not in html
     # 渲染完不再有模板占位符残留
     assert "${" not in html
+
+
+def test_index_html_page_size_has_single_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """页大小也只有一个来源：改 ``web.PAGE_SIZE``，HTML 里的 ``const`` 跟着变。
+
+    与 ``REFRESH_MS`` 同口径；Python 侧的分页断言用同一个常量，所以前端
+    「每页 20」和后端测试里的切页不会各说各的。
+    """
+    assert web.PAGE_SIZE == 20
+    assert "const PAGE_SIZE = 20;" in web.index_html()
+
+    monkeypatch.setattr(web, "PAGE_SIZE", 7)
+    html = web.index_html()
+    assert "const PAGE_SIZE = 7;" in html
+    assert "const PAGE_SIZE = 20;" not in html
+    assert "${" not in html
+
+
+def test_index_html_keeps_page_index_across_refresh() -> None:
+    """自动刷新只重渲染：页码状态不被重建，失败时保留上一帧。"""
+    html = web.index_html()
+
+    # 页码是模块级单例，只声明一次；renderBoard 只读 pageIndex[name]
+    assert html.count("const pageIndex = {") == 1
+    assert (
+        "const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };"
+        in html
+    )
+    # 渲染/刷新路径里没有把页码重置回 0（只有翻页按钮改页码）
+    assert "pageIndex[name] = 0" not in html
+    assert "pageIndex =" not in html.replace("const pageIndex =", "")
+    # 刷新失败 / 网络失败都 return 在渲染之前 → 上一帧不动
+    assert "，保留上一帧" in html
+    assert html.index("showError(\"刷新失败（HTTP \"") < html.index(
+        "renderSummary(summary)"
+    )
 
 
 # --- 6. 越界时间戳：不再静默算成 0 分钟 --------------------------------
