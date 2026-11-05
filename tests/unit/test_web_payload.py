@@ -380,6 +380,26 @@ def test_index_html_page_size_has_single_source(
     assert "${" not in html
 
 
+def test_index_html_keeps_page_index_across_refresh() -> None:
+    """自动刷新只重渲染：页码状态不被重建，失败时保留上一帧。"""
+    html = web.index_html()
+
+    # 页码是模块级单例，只声明一次；renderBoard 只读 pageIndex[name]
+    assert html.count("const pageIndex = {") == 1
+    assert (
+        "const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };"
+        in html
+    )
+    # 渲染/刷新路径里没有把页码重置回 0（只有翻页按钮改页码）
+    assert "pageIndex[name] = 0" not in html
+    assert "pageIndex =" not in html.replace("const pageIndex =", "")
+    # 刷新失败 / 网络失败都 return 在渲染之前 → 上一帧不动
+    assert "，保留上一帧" in html
+    assert html.index("showError(\"刷新失败（HTTP \"") < html.index(
+        "renderSummary(summary)"
+    )
+
+
 # --- 6. 越界时间戳：不再静默算成 0 分钟 --------------------------------
 
 
