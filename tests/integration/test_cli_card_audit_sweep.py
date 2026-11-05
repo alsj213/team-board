@@ -116,3 +116,16 @@ class TestSweep:
         code, out, err = run(capsys, "card-audit", "--sweep", "--limit", "0", "--db", str(board))
         assert (code, out) == (2, "")
         assert "limit" in err
+
+
+def test_auto_action_card_is_not_blocked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """自动复审卡只有 PR-CLAIM，不应被 card-audit 机械 block。"""
+    board = make_db(
+        tmp_path / "auto.db",
+        [("t_1234abcd", "ready", "pm", "复审 PR #100：x（自动收口卡）", "PR-CLAIM: #100\n")],
+    )
+    code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
+    assert (code, err) == (0, "")
+    assert "0 张异常" in out

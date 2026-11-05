@@ -138,3 +138,19 @@ class TestHandoff:
 
         with pytest.raises(ValueError, match="stage"):
             flow.check_handoff(CARD, HEAD, "nope", impl_heads=(HEAD,), rework_count=0)
+
+
+class TestAutoActionExemption:
+    """自动收口动作卡（复审 / rebase / 补证据）不走实现卡契约闸门。"""
+
+    def test_review_card_is_exempt(self) -> None:
+        report = flow.audit_card(
+            CARD, "复审 PR #100：x（自动收口卡）", "PR-CLAIM: #100\n\n## 目标\n只评审。\n"
+        )
+        assert report.kind == "auto"
+        assert report.findings == ()
+
+    def test_merge_auto_card_still_requires_pr_claim(self) -> None:
+        report = flow.audit_card(CARD, "合并 PR #100（自动收口卡）", "## 目标\n")
+        assert report.kind == "merge"
+        assert [f.code for f in report.findings] == ["pr-claim-missing"]

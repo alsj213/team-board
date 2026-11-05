@@ -83,6 +83,10 @@ class HandoffReport:
         return not self.findings
 
 
+#: 自动收口脚本创建的动作卡统一后缀；它们没有实现契约，不能按实现卡闸门拦。
+AUTO_ACTION_SUFFIX = "（自动收口卡）"
+
+
 def audit_card(card_id: str, title: str, body: str) -> CardAuditReport:
     """检查一张卡的机器可读契约。
 
@@ -107,6 +111,10 @@ def audit_card(card_id: str, title: str, body: str) -> CardAuditReport:
                 ),
             ),
         )
+    if str(title).endswith(AUTO_ACTION_SUFFIX):
+        # 复审 / rebase / 补证据动作卡由 pr_orphan_autoclose 生成，卡面只有
+        # PR-CLAIM + 动作说明；它们不是实现卡，缺 PATH-CLAIM 等不代表卡坏。
+        return CardAuditReport(card_id=card_id, kind="auto", findings=())
 
     findings: list[Finding] = []
     paths, issues = pathclaim.parse_body(body)
