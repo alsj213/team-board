@@ -211,11 +211,32 @@ _PAGE_TEMPLATE = string.Template(
     font-size: 13px; color: #444d56; margin: 10px 0 16px;
   }
   #summary .anomaly { color: #b35900; font-weight: 600; }
+  /* hidden 属性必须赢过后面的 display 规则（将来给容器加 display 也不会顶掉它） */
+  [hidden] { display: none !important; }
   #error {
     display: none; margin: 0 0 14px; padding: 6px 10px; border-radius: 6px;
     font-size: 13px; background: #ffebe9; border: 1px solid #ffc1bc; color: #b31d28;
   }
   #error.visible { display: block; }
+  #bots-error {
+    display: none; margin: 0 0 14px; padding: 6px 10px; border-radius: 6px;
+    font-size: 13px; background: #ffebe9; border: 1px solid #ffc1bc; color: #b31d28;
+  }
+  #bots-error.visible { display: block; }
+  .tabs { display: flex; gap: 6px; margin: 12px 0 14px; }
+  .tabs button {
+    font: inherit; font-size: 13px; padding: 4px 12px; border: 1px solid #d8dee4;
+    border-bottom: 2px solid transparent; background: #f6f8fa; color: #24292f;
+    border-radius: 6px 6px 0 0; cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] {
+    background: #fff; border-bottom-color: #0969da; color: #0969da; font-weight: 600;
+  }
+  #bots-table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; }
+  #bots-table th, #bots-table td {
+    border: 1px solid #d8dee4; padding: 5px 8px; text-align: left;
+  }
+  #bots-table th { background: #f6f8fa; font-size: 12px; color: #57606a; }
   #main {
     display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px; align-items: start;
@@ -249,6 +270,11 @@ _PAGE_TEMPLATE = string.Template(
   <h1>team-board</h1>
   <label><input type="checkbox" id="autorefresh" checked> 自动刷新</label>
 </header>
+<nav class="tabs" role="tablist">
+  <button type="button" role="tab" id="tab-cards" data-view="cards" aria-selected="true" aria-controls="view-cards">卡片</button>
+  <button type="button" role="tab" id="tab-bots" data-view="bots" aria-selected="false" aria-controls="view-bots">Bot 状态</button>
+</nav>
+<div id="view-cards">
 <div id="summary"></div>
 <div id="error" role="alert"></div>
 <main id="main">
@@ -257,12 +283,29 @@ _PAGE_TEMPLATE = string.Template(
   <section class="col" data-col="blocked"><h2>blocked</h2><div class="cards"></div></section>
   <section class="col" data-col="done"><h2>done</h2><div class="cards"></div></section>
 </main>
+</div>
+<section id="view-bots" hidden>
+  <div id="bots-error" role="alert"></div>
+  <table id="bots-table">
+    <thead><tr><th>Bot</th><th>状态</th><th>在跑</th></tr></thead>
+    <tbody id="bots-body"></tbody>
+  </table>
+</section>
 <script>
 const REFRESH_MS = ${REFRESH_MS};
 const COLUMN_NAMES = ["running", "queued", "blocked", "done"];
 const PAGE_SIZE = ${PAGE_SIZE};
 const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };
 let timer = null;
+
+// 标签页切换只切 hidden 与 aria-selected，不重建 DOM、不重置页码、不动定时器、
+// 也不重新 fetch —— 所以来回切换既不丢状态也不发请求。
+function showView(name) {
+  document.getElementById("view-cards").hidden = name !== "cards";
+  document.getElementById("view-bots").hidden = name !== "bots";
+  document.getElementById("tab-cards").setAttribute("aria-selected", name === "cards" ? "true" : "false");
+  document.getElementById("tab-bots").setAttribute("aria-selected", name === "bots" ? "true" : "false");
+}
 
 function make(tag, className, value) {
   const node = document.createElement(tag);
@@ -335,6 +378,56 @@ function clearError() {
   box.className = "";
 }
 
+function showBotsError(text) {
+  const box = document.getElementById("bots-error");
+  box.textContent = text;
+  box.className = "visible";
+}
+
+function clearBotsError() {
+  const box = document.getElementById("bots-error");
+  box.textContent = "";
+  box.className = "";
+}
+
+function renderBots(data) {
+  const body = document.getElementById("bots-body");
+  const rows = (data.bots || []).map(function (row) {
+    const tr = document.createElement("tr");
+    tr.append(
+      make("td", "", row.name),
+      make("td", "", row.status === "working" ? "工作中" : "空闲"),
+      make("td", "", String(row.running))
+    );
+    return tr;
+  });
+  body.replaceChildren.apply(body, rows);
+}
+
+// bot 状态与卡片视图各走各的接口、各写各的错误行：/api/bots 失败时不动 #error，
+// 也不清 #bots-body（保留上一帧）。
+async function refreshBots() {
+  try {
+    const response = await fetch("/api/bots");
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = await response.json();
+        if (body && body.error) { detail = "：" + body.error; }
+      } catch (parseErr) {
+        detail = "";
+      }
+      showBotsError("Bot 状态刷新失败（HTTP " + response.status + "）" + detail + "，保留上一帧");
+      return;
+    }
+    const data = await response.json();
+    renderBots(data);
+    clearBotsError();
+  } catch (err) {
+    showBotsError("Bot 状态刷新失败（" + err + "），保留上一帧");
+  }
+}
+
 async function refresh() {
   try {
     const responses = await Promise.all([
@@ -371,7 +464,11 @@ async function refresh() {
 function start() {
   if (timer !== null) { return; }
   refresh();
-  timer = setInterval(refresh, REFRESH_MS);
+  refreshBots();
+  timer = setInterval(function () {
+    refresh();
+    refreshBots();
+  }, REFRESH_MS);
 }
 
 function stop() {
@@ -390,6 +487,9 @@ toggle.addEventListener("change", function () {
   }
 });
 
+document.getElementById("tab-cards").addEventListener("click", function () { showView("cards"); });
+document.getElementById("tab-bots").addEventListener("click", function () { showView("bots"); });
+
 start();
 </script>
 </body>
@@ -405,6 +505,12 @@ def index_html() -> str:
     - ``#summary`` 相邻的 ``#error`` 是刷新失败提示行：只在有接口不满足
       ``response.ok`` 时出现，文案带 HTTP 状态码；刷新失败**不清空**上一帧，
       成功一次后自动消失；
+    - 卡片视图之外还有「Bot 状态」标签页：``nav.tabs[role=tablist]`` 两个
+      ``button[role=tab]``（``#tab-cards`` / ``#tab-bots``）切 ``#view-cards``
+      与 ``#view-bots`` 的 ``hidden``；切换只改属性，不重建 DOM、不复位页码、
+      不重启定时器，所以来回切不丢状态。默认仍是卡片视图（``#view-bots``
+      带 ``hidden``），``#bots-error`` 与 ``#bots-body`` 各自独立，``/api/bots``
+      失败只写 ``#bots-error`` 并保留上一帧；
     - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
     - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
     - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML；
