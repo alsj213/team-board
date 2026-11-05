@@ -119,6 +119,9 @@ class TestBodyCommands:
         assert " python3 -m team_board.merge_guard" in merge
         assert "--delete-branch" in merge
         assert "--method merge" in merge
+        # required check 在首次 push 时必然红，合并前必须先定点重跑（2026-11-06 死锁）
+        assert " python3 -m team_board.reviewmarkers" in merge
+        assert merge.index("team_board.reviewmarkers") < merge.index("team_board.merge_guard")
 
     def test_no_bare_merge_guard(self) -> None:
         for line in plan().body.splitlines():
