@@ -143,6 +143,43 @@ class TestSweep:
         assert code == 0
         assert "!= impl_done" in out
 
+    def test_pure_rebase_head_is_accepted(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """impl_done head 被纯 rebase 换掉但 patch 相同 → 仍建卡（2026-11-06 E1）。"""
+
+        board = done_board(tmp_path)
+        captured: dict[str, Any] = {}
+
+        def fake_view(repo: str, slug: str, pr: int) -> dict[str, str]:
+            return {
+                "state": "OPEN",
+                "head": OTHER_HEAD,
+                "title": "x",
+                "head_ref": f"wt/{CARD}",
+            }
+
+        def fake_create(plan: mergecard.MergeCardPlan, *, body_path: str):
+            captured["plan"] = plan
+            return mergecard.CreateResult(
+                plan=plan, rc=0, card_id="t_deadbeef", stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(cli, "_gh_pr_view", fake_view)
+        monkeypatch.setattr(
+            cli, "_same_patch", lambda repo, old, new: (True, "c" * 40)
+        )
+        monkeypatch.setattr(mergecard, "create_merge_card", fake_create)
+        code, out, err = run(
+            capsys, "merge-card", "--sweep", "--db", str(board), "--repo", str(tmp_path)
+        )
+        assert (code, err) == (0, "")
+        assert "created" in out
+        assert OTHER_HEAD in captured["plan"].body
+
     def test_no_impl_done_skips(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         board = make_db(
             tmp_path / "none.db",
