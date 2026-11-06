@@ -95,15 +95,18 @@ team-board serve
 
 - 顶部一行统计（完成 / 在跑 / 阻塞 / 异常），下面四列 `running` / `queued` /
   `blocked` / `done`，卡上显示卡号、负责人、耗时（分）、标题。
+- 页面分两个标签页：**卡片**（默认，行为与改动前完全一致）与 **Bot 状态**。
+  切换只改视图的 `hidden`，不重建 DOM、不复位当前页码、不停也不重启自动刷新
+  定时器 —— 所以来回切换不丢页码与自动刷新状态；两个视图的错误行各自独立。
 - 每 5 秒自动刷新，右上角开关可关闭自动刷新（关掉后只能手动重载页面）。
   间隔只有一处来源：`web.py` 的 `REFRESH_MS`，页面里的 `const REFRESH_MS`
   由它渲染（改常量页面就跟着变）。
 - 刷新失败（任一接口非 2xx 或网络层失败）时**保留上一帧**，在统计行下方显示
   一行 `刷新失败（HTTP <状态码>）：<原因>，保留上一帧`，成功一次后自动消失。
-- 纯前端 `fetch` 两个 JSON 接口，无 CDN、无第三方 JS/CSS、无构建步骤，
+- 纯前端 `fetch` 三个 JSON 接口，无 CDN、无第三方 JS/CSS、无构建步骤，
   页面内容全部由服务端内联的单个 HTML 提供。
 
-两个接口：
+三个接口：
 
 ```
 GET /api/board
@@ -116,7 +119,15 @@ GET /api/summary
 {"snapshot": "2026-10-28 21:25", "date": "2026-10-28", "completed": 1, "running": 2,
  "blocked": 1, "anomaly": 2,
  "anomalies": [{"status": "running", "minutes": 75, "threshold": 60, "id": "t_a", "title": "…"}]}
+
+GET /api/bots
+{"bots": [{"name": "engineer", "status": "working", "running": 2},
+          {"name": "qa", "status": "idle", "running": 0}]}
 ```
+
+`/api/bots` 每行的键顺序固定 `name` / `status` / `running`；顺序是 **working 在前、
+同类再按 `name` 码位升序**（不用 locale，换机器结果不变）。它的错误口径与另两个
+接口一致：脏时间戳同样 500 `data_invalid`，库不可用同样 500 `source_unavailable`。
 
 实际响应是**单行 JSON**（无 indent、无 sort_keys），`ensure_ascii=False`（中文原样，
 不转义成 `\uXXXX`）；键顺序与上面逐字一致。`/api/summary` 与 `team-board summary`
@@ -130,6 +141,16 @@ GET /api/summary
   `done` ← `done`。
 - **`archived` / `triage` / `todo` / `review` 的卡不出现在任何一列**（`review`
   只在 `/api/summary` 的异常清单里以超时条目的形式出现）。
+
+### Bot 状态
+
+- 名册口径：来源是 `tasks.assignee` 出现过的全部名字，**含 archived 卡**（只看
+  未归档卡会让只剩归档卡的 bot 从名册里消失）；NULL / 空串 / 纯空白跳过；
+  `nobody` 精确等值跳过（`Nobody` 是另一个名字，仍算 bot）。名册只来自看板库，
+  **不读 `bots.tsv`**。
+- 判定是算出来的、不接受外部写入：该名字存在 `status == "running"` 的卡 =
+  工作中（`working`），否则空闲（`idle`）；`running` 是该名字的 running 卡数。
+- 只读：`GET /api/bots` 与另两个接口一样没有任何写接口，也不改 schema。
 
 只读与安全边界：
 
@@ -169,7 +190,7 @@ fixture 库隔久了再打开，越界卡会变多 —— 这是真实时钟的�
 
 卡上用于耗时口径的两个时间戳（起点 `started_at`，缺省回退 `created_at`；终点
 `completed_at`）必须是 `datetime.fromtimestamp` 能表示的 epoch 秒：13 位毫秒
-这类脏值在 Web 两个接口上一律 500 `data_invalid`（**不再**静默算成 0 分钟）；
+这类脏值在 Web 三个接口上一律 500 `data_invalid`（**不再**静默算成 0 分钟）；
 命令行子命令不做这个校验，耗时仍按「口径」段的规则夹到下限 0。
 
 ## 分支稽核（branch-audit）
