@@ -2583,6 +2583,28 @@ def _latest_impl_pr(events: list[tuple[str, str]]) -> tuple[int, str] | None:
     return latest
 
 
+def _same_patch(repo: str, old_head: str, new_head: str) -> tuple[bool, str]:
+    """纯 rebase 判定：两个 head 对 ``origin/main`` 的内容指纹是否相同。
+
+    ``impl_done`` 事件（旧格式）只带 ``head_sha``，不带宽内容指纹；卡分支被纯 rebase
+    后 head 会变，但 patch 不变。合并卡 sweep 因此不能只比 head —— 否则每次合法
+    rebase 都会被判「PR head != impl_done」而跳过（2026-11-06 E1 实测）。
+    """
+
+    try:
+        old_fp = reviewhead.fingerprint_of_commit(repo, "origin/main", old_head)
+        new_fp = reviewhead.fingerprint(repo, "origin/main", new_head)
+    except (reviewhead.PatchIdError, reviewhead.UnrelatedHistoryError) as exc:
+        return False, f"算 patch 指纹失败：{exc}"
+    if old_fp is None:
+        return False, "旧 head 取不到对象，无法证明纯 rebase"
+    if old_fp.kind != "patch" or new_fp.kind != "patch":
+        return False, f"不是 patch（old={old_fp.kind} new={new_fp.kind}）"
+    if old_fp.value is None or old_fp.value != new_fp.value:
+        return False, f"patch {old_fp.value} != {new_fp.value}"
+    return True, old_fp.value
+
+
 def _sweep_merge_cards(args: argparse.Namespace) -> int:
     """扫描 done 实现卡，给尚无合并卡的 open PR 自动建合并卡。"""
 
@@ -2660,15 +2682,20 @@ def _sweep_merge_cards(args: argparse.Namespace) -> int:
             )
             continue
         if view["head"] != impl_head:
-            results.append(
-                {
-                    "card": task.id,
-                    "pr": pr,
-                    "status": "skip",
-                    "reason": f"PR head {view['head'][:12]} != impl_done {impl_head[:12]}",
-                }
-            )
-            continue
+            same, detail = _same_patch(args.repo, impl_head, view["head"])
+            if not same:
+                results.append(
+                    {
+                        "card": task.id,
+                        "pr": pr,
+                        "status": "skip",
+                        "reason": (
+                            f"PR head {view['head'][:12]} != impl_done {impl_head[:12]}；"
+                            f"纯 rebase 也判不了：{detail}"
+                        ),
+                    }
+                )
+                continue
         try:
             card_plan = mergecard.plan(
                 impl_card=task.id,
