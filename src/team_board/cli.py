@@ -312,6 +312,23 @@ def _parse_port(value: str) -> int:
     return port
 
 
+def _parse_limit(value: str) -> int:
+    """``list --limit``：纯 ASCII 十进制数字且 1 <= n <= 200，否则 rc2。
+
+    同 ``--port`` 的口径复用 :data:`_PORT_DIGITS`：``int()`` 会静默接受空白、
+    正号、下划线和阿拉伯-印度数字，这里全部拒绝。允许前导零（``007`` → 7）。
+    1-200 的校验只在这一层做，``commands.render_list`` 不再校验（避免两份口径）。
+    """
+    if not isinstance(value, str) or _PORT_DIGITS.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"--limit 应为 1-200 的 ASCII 十进制整数: {value!r}"
+        )
+    limit = int(value)
+    if not 1 <= limit <= 200:
+        raise argparse.ArgumentTypeError(f"--limit 超出 1-200: {value!r}")
+    return limit
+
+
 def _parse_bind(value: str) -> str:
     """``serve --bind``：只接受本机地址，其它（含 ``0.0.0.0``、空串、IPv6 字面量）rc2。"""
     if value not in _LOCAL_BINDS:
@@ -398,6 +415,14 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="EPOCH",
             help="基准时间（epoch 秒，默认当前时间）",
         )
+        if name == "list":
+            sub.add_argument(
+                "--limit",
+                type=_parse_limit,
+                default=None,
+                metavar="N",
+                help="只打印前 N 张卡（1-200，默认全部）",
+            )
         if name == "summary":
             sub.add_argument(
                 "--date",
@@ -3714,7 +3739,7 @@ def main(argv: list[str] | None = None) -> int:
         conn = db.connect(args.db)
         tasks = db.load_tasks(conn)
         if args.command == "list":
-            text = commands.render_list(tasks, now)
+            text = commands.render_list(tasks, now, limit=args.limit)
         elif args.command == "summary":
             rework = db.load_rework_counts(conn)
             day = (

@@ -48,13 +48,17 @@ def _visible_sorted(tasks: list[Task], now: int) -> list[Task]:
     )
 
 
-def render_list(tasks: list[Task], now: int) -> str:
+def render_list(tasks: list[Task], now: int, limit: int | None = None) -> str:
     """看板总览表：卡号 / 负责人 / 状态 / 耗时(分) / 标题。
 
     - 只含 status != archived 的卡；
     - 排序：状态按 STATUS_ORDER 下标升序 → 同状态内耗时降序 → id 升序；
     - 耗时列右对齐；标题按 TITLE_MAX 截断；
-    - 一张可显示的卡都没有时返回单行 EMPTY_BOARD（不带表头）。
+    - 一张可显示的卡都没有时返回单行 EMPTY_BOARD（不带表头）；
+    - ``limit``（1-200 的校验归 CLI 的 ``--limit``，这里不重复校验）只截
+      数据行，表头与分隔行不截；列宽按**全量**可见卡计算，所以带不带
+      ``--limit`` 的同名数据行逐字节一致（否则前 N 行会随列宽收窄而变形，
+      破坏「N >= 可见卡数 时输出逐字不变」）。
     """
     order = _visible_sorted(tasks, now)
     if not order:
@@ -71,7 +75,11 @@ def render_list(tasks: list[Task], now: int) -> str:
         ]
         for task in order
     ]
-    return fmt.format_table(headers, rows, right_align=(3,))
+    text = fmt.format_table(headers, rows, right_align=(3,))
+    if limit is None:
+        return text
+    # 表头 1 行 + 分隔行 1 行恒在，其后才是数据行
+    return "\n".join(text.split("\n")[: 2 + limit])
 
 
 def render_export(tasks: list[Task], now: int) -> str:

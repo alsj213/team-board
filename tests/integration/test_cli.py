@@ -259,3 +259,189 @@ def test_double_null_timestamps_exits_one_without_traceback(
     assert "缺少 created_at/started_at" in run.stderr
     assert "Traceback" not in run.stderr
     assert "TypeError" not in run.stderr
+
+
+# --------------------------------------------------------------------------
+# list --limit N（1-200）：只截数据行，不改排序，不传时输出逐字不变
+# --------------------------------------------------------------------------
+
+LIMIT_REJECTED = [
+    "0",
+    "-1",
+    "201",
+    "abc",
+    " 5",
+    "5 ",
+    "+5",
+    "1_0",
+    "١٢٣",
+    "1.0",
+    "1793160000000",
+    "99999999999999999999",
+    "",
+]
+
+
+def _run_list(
+    capsys: pytest.CaptureFixture[str],
+    path: Path,
+    *extra: str,
+) -> tuple[int, list[str], str]:
+    rc = cli.main(["list", "--db", str(path), "--now", str(FIXTURE_NOW), *extra])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    return rc, captured.out.splitlines(), captured.out
+
+
+def test_list_limit_three_prints_two_plus_three_lines(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    _, full_lines, _full_out = _run_list(capsys, path)
+    rc, lines, _ = _run_list(capsys, path, "--limit", "3")
+    assert rc == 0
+    assert len(lines) == 2 + 3
+    assert lines[0] == full_lines[0]  # 表头不截
+    assert lines[1] == full_lines[1]  # 分隔行不截
+    assert lines[2:] == full_lines[2:5]  # 排序不变，只取前 3
+
+
+def test_list_limit_one_keeps_header(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    rc, lines, _ = _run_list(capsys, path, "--limit", "1")
+    assert rc == 0
+    assert len(lines) == 3
+    assert lines[0].startswith("卡号")
+
+
+def test_list_limit_200_is_byte_identical(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    _, _, full_out = _run_list(capsys, path)
+    rc, _, limited_out = _run_list(capsys, path, "--limit", "200")
+    assert rc == 0
+    assert limited_out == full_out
+
+
+def test_list_limit_equal_to_card_count_is_byte_identical(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    _, _, full_out = _run_list(capsys, path)
+    rc, _, limited_out = _run_list(capsys, path, "--limit", "9")
+    assert rc == 0
+    assert limited_out == full_out
+
+
+def test_list_limit_leading_zero_means_seven(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``007`` 是合法 ASCII 数字 → int 值 7（不是 3）。"""
+    path, _ = board
+    rc, lines, _ = _run_list(capsys, path, "--limit", "007")
+    assert rc == 0
+    assert len(lines) == 2 + 7
+
+
+def test_list_limit_equals_form(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    rc, lines, _ = _run_list(capsys, path, "--limit=3")
+    assert rc == 0
+    assert len(lines) == 2 + 3
+
+
+def test_list_limit_repeated_last_wins(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    rc, lines, _ = _run_list(capsys, path, "--limit", "3", "--limit", "5")
+    assert rc == 0
+    assert len(lines) == 2 + 5
+
+
+@pytest.mark.parametrize("value", LIMIT_REJECTED)
+def test_list_limit_rejects_bad_values(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    path, _ = board
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            ["list", "--db", str(path), "--now", str(FIXTURE_NOW), "--limit", value]
+        )
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert captured.out == ""
+    assert "--limit" in captured.err
+
+
+def test_list_limit_missing_value_exits_two(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["list", "--db", str(path), "--now", str(FIXTURE_NOW), "--limit"])
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "expected one argument" in captured.err
+
+
+def test_list_help_exposes_limit_metavar(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["list", "--help"])
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 0
+    assert "--limit N" in captured.out
+
+
+@pytest.mark.parametrize("sub", ["summary", "export"])
+def test_limit_only_belongs_to_list(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str], sub: str
+) -> None:
+    path, _ = board
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([sub, "--db", str(path), "--now", str(FIXTURE_NOW), "--limit", "3"])
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "--limit" in captured.err
+
+
+def test_limit_not_accepted_by_member(
+    board: tuple[Path, dict[str, str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, _ = board
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "member",
+                "engineer",
+                "--db",
+                str(path),
+                "--now",
+                str(FIXTURE_NOW),
+                "--limit",
+                "3",
+            ]
+        )
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "--limit" in captured.err
+
+
+def test_list_limit_does_not_mask_missing_db(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """缺库仍走「错误: …」+ rc1，--limit 不掩盖数据源错误。"""
+    missing = tmp_path / "no-such.db"
+    rc = cli.main(
+        ["list", "--db", str(missing), "--now", str(FIXTURE_NOW), "--limit", "3"]
+    )
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err.startswith("错误: ")

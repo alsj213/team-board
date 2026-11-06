@@ -256,3 +256,82 @@ def test_null_status_renders_blank_cell_and_sorts_last() -> None:
     assert clean.id in text
     assert lines[-1].startswith(dirty.id)
     assert lines[-1].split() == [dirty.id, "pm", "90", "null_start"]
+
+
+@pytest.fixture()
+def loaded(tmp_path: Path) -> list[Task]:
+    path = tmp_path / "limit.db"
+    build_board(path, now=FIXTURE_NOW)
+    return _load(path)
+
+
+def test_limit_keeps_header_and_separator(loaded: list[Task]) -> None:
+    """limit 只截数据行：表头 + 分隔行恒在，总行数 = 2 + min(N, 可见卡数)。"""
+    full = commands.render_list(loaded, FIXTURE_NOW)
+    limited = commands.render_list(loaded, FIXTURE_NOW, limit=3)
+    full_lines = full.splitlines()
+    lines = limited.splitlines()
+    assert len(lines) == 2 + 3
+    assert lines[0] == full_lines[0]
+    assert lines[1] == full_lines[1]
+    assert lines[2:] == full_lines[2:5]
+
+
+def test_limit_one_keeps_two_header_lines(loaded: list[Task]) -> None:
+    full = commands.render_list(loaded, FIXTURE_NOW).splitlines()
+    lines = commands.render_list(loaded, FIXTURE_NOW, limit=1).splitlines()
+    assert len(lines) == 2 + 1
+    assert lines[0] == full[0]
+    assert lines[1] == full[1]
+    assert lines[2] == full[2]  # 首行仍是 long_title（todo 排最前），表宽不变
+
+
+def test_limit_order_unchanged(loaded: list[Task]) -> None:
+    """--limit 不参与排序：前 N 行与不传 limit 的前 N 行逐字一致。"""
+    full = commands.render_list(loaded, FIXTURE_NOW).splitlines()
+    for n in (1, 2, 5, 7):
+        limited = commands.render_list(loaded, FIXTURE_NOW, limit=n).splitlines()
+        assert limited[2:] == full[2 : 2 + n]
+
+
+def test_limit_at_or_above_visible_count_is_identical(loaded: list[Task]) -> None:
+    full = commands.render_list(loaded, FIXTURE_NOW)
+    assert len(EXPECTED) == 9
+    assert commands.render_list(loaded, FIXTURE_NOW, limit=len(EXPECTED)) == full
+    assert commands.render_list(loaded, FIXTURE_NOW, limit=200) == full
+
+
+def test_limit_none_matches_default(loaded: list[Task]) -> None:
+    assert commands.render_list(loaded, FIXTURE_NOW, limit=None) == commands.render_list(
+        loaded, FIXTURE_NOW
+    )
+
+
+def test_limit_on_empty_board_stays_single_line(tmp_path: Path) -> None:
+    """空板（无卡）即便带 limit 也仍是单行 EMPTY_BOARD、无表头。"""
+    path = tmp_path / "empty_limit.db"
+    build_board(path, now=FIXTURE_NOW)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DELETE FROM tasks")
+        conn.commit()
+    finally:
+        conn.close()
+    text = commands.render_list(_load(path), FIXTURE_NOW, limit=3)
+    assert text == EMPTY_BOARD
+    assert "卡号" not in text
+
+
+def test_limit_on_only_archived_board_stays_empty() -> None:
+    """全 archived：limit 不改变单行 EMPTY_BOARD 的结论。"""
+    task = Task(
+        id="t_old",
+        title="old",
+        assignee="pm",
+        status="archived",
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+    )
+    assert commands.render_list([task], FIXTURE_NOW, limit=1) == EMPTY_BOARD
+    assert commands.render_list([], FIXTURE_NOW, limit=200) == EMPTY_BOARD
