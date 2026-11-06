@@ -16,7 +16,7 @@
 ## 用法
 
 ```
-team-board list
+team-board list [--limit N]
 team-board summary [--date 2026-10-28]
 team-board member engineer
 team-board export
