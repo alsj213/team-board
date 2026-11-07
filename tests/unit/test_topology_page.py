@@ -26,13 +26,6 @@ _BOTS_OPEN = '<section id="view-bots" hidden>'
 _TOPOLOGY_BODY = ("function renderTopology(data)", "async function refreshTopology()")
 _REFRESH_BODY = ("async function refreshTopology()", "async function refresh()")
 
-#: 节点内的三行文字（display / 在跑数 / 首张 running 卡 id）
-_NODE_SPANS = (
-    'make("span", "name", node.display)',
-    'make("span", "state", running > 0 ? "在跑 " + running : "空闲")',
-    'make("span", "card", card)',
-)
-
 
 def _page() -> str:
     return web.index_html()
@@ -69,13 +62,15 @@ def test_markup_position() -> None:
 
 
 def test_node_markup() -> None:
-    """节点：running>0 才 active，否则 idle（CSS opacity .45）；内含 .name/.state/.card。"""
+    """节点：running>0 才 active，否则 idle（CSS opacity .45）；节点内只剩 .name。"""
     html = _page()
     body = _render_body(html)
 
     assert 'make("div", running > 0 ? "topo-node active" : "topo-node idle")' in body
-    for span in _NODE_SPANS:
-        assert span in body
+    assert 'make("span", "name", node.display)' in body
+    # 团队关系图只画人：节点里没有在跑数、也没有卡 id
+    assert 'make("span", "state"' not in body
+    assert 'make("span", "card"' not in body
     assert "box.dataset.name = node.name" in body
     assert "box.style.left = spot.left" in body
     assert "box.style.top = spot.top" in body
@@ -86,51 +81,58 @@ def test_node_markup() -> None:
     style = _style(html)
     assert ".topo-node.active {" in style
     assert ".topo-node.idle { opacity: .45; }" in style
+    assert ".topo-node .state" not in style
+    assert ".topo-node .card {" not in style
 
 
 def test_edge_markup() -> None:
-    """边：.topo-edge + data-cards + transform: rotate + 中点 ×N 标签 + 末端箭头。"""
+    """边：.topo-edge + transform: rotate + 末端箭头；关系图不标卡数。"""
     html = _page()
     body = _render_body(html)
 
     assert 'make("div", "topo-edge")' in body
-    assert "line.dataset.cards = String(edge.cards)" in body
     assert '"transform: rotate(" + deg + "deg);"' in body
-    assert 'make("span", "topo-edge-label", "×" + edge.cards)' in body
     assert "Math.atan2(dy, dx) * 180 / Math.PI" in body
-    assert 'line.append(label, make("span", "topo-edge-head"))' in body
+    assert 'line.append(make("span", "topo-edge-head"))' in body
+    # 边上不标计数：没有中点标签、没有 data-cards、页面里没有 ×
+    assert 'make("span", "topo-edge-label"' not in body
+    assert "dataset.cards" not in body
+    assert "×" not in html
     # 边先入画布（垫在节点下面），节点后入
     assert "lines.concat(boxes)" in body
 
     style = _style(html)
     assert ".topo-edge {" in style
     assert "transform-origin: 0 0" in style
+    assert ".topo-edge-label" not in style
 
 
-def test_running_list() -> None:
-    """在跑卡清单：每项「display · 卡 id 标题」，按 (display, id) 升序排序。"""
-    body = _render_body(_page())
+def test_no_card_list() -> None:
+    """页面不列运行卡：无清单容器、无 running_cards、无卡 id 拼接、无 +N 计数。"""
+    html = _page()
+    body = _render_body(html)
 
-    assert 'document.getElementById("topology-cards")' in body
-    assert 'card.display + " · " + card.id + tail' in body
-    assert 'const tail = card.title ? " " + card.title : ""' in body
-    assert "pairs.sort(" in body
-    assert "a.display < b.display ? -1 : 1" in body
-    assert "a.id < b.id ? -1 : 1" in body
-    # 排序在收集之后统一做（后端给的顺序不作数）
-    assert body.index("pairs.sort(") > body.index("pairs.push(")
-    # 空清单也必须落到一次清空（不是留着上一帧）
-    assert "list.replaceChildren.apply(list, pairs.map(" in body
+    # 清单容器与它的 CSS / 失败路径注释一律不在（整页范围）
+    assert "topology-cards" not in html
+    # 节点与边都不读 running_cards
+    assert "running_cards" not in html
+    # 不拼「卡 id + 标题」与「+N」
+    assert "cards[0].id" not in body
+    assert "(running - 1)" not in body
+    assert "card.display" not in body
+    # 清单的收集 / 排序 / 落地三处都不在渲染函数里
+    assert "pairs.push(" not in body
+    assert "pairs.sort(" not in body
+    assert "replaceChildren.apply(list" not in body
 
 
 def test_empty_state() -> None:
-    """空看板：亮占位行、清空图与清单、直接返回（不抛异常）。"""
+    """空看板：亮占位行、清空画布、直接返回（不抛异常）。"""
     body = _render_body(_page())
     branch = body[body.index("if (nodes.length === 0) {"): body.index("empty.hidden = true;")]
 
     assert "empty.hidden = false" in branch
     assert "graph.replaceChildren()" in branch
-    assert "list.replaceChildren()" in branch
     assert "return;" in branch
     assert "throw" not in body
     # 节点非空立刻把占位行收起来，不能两帧都留着
@@ -151,14 +153,13 @@ def test_all_idle() -> None:
 
 
 def test_required_snippets() -> None:
-    """整页含契约要求的片段：五段 DOM、布局常量、函数名、fetch 与两类节点。"""
+    """整页含契约要求的片段：拓扑段的 DOM、布局常量、函数名、fetch 与两类节点。"""
     html = _page()
 
     for needle in (
         '<h2>团队拓扑</h2>',
         'id="topology-empty"',
         'id="topology-graph"',
-        'id="topology-cards"',
         'role="img" aria-label="团队派发拓扑图"',
         "暂无派发记录",
         'fetch("/api/topology")',
