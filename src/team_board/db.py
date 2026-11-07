@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import bodylimit
 from .model import DEFAULT_DB, Task
+from .topology import TopoCard
 
 
 class BoardError(Exception):
@@ -72,6 +73,40 @@ def load_tasks(conn: sqlite3.Connection) -> list[Task]:
             )
         )
     return tasks
+
+
+def load_topo_cards(conn: sqlite3.Connection) -> list[TopoCard]:
+    """拓扑图用的卡：``(id, title, assignee, status, created_by)``，按 (created_at, id) 升序。
+
+    与 :func:`load_tasks` 是**两条独立的消费者口径**，签名互不影响：拓扑不需要时间
+    字段，但需要 ``created_by``——该列在真实库里存在（tasks 第 7 列），却不在既有的
+    七列取数清单里，所以这里单写一条 SQL，既有取数函数一个字不动。
+
+    - 全部卡（含 archived），按 ``(created_at, id)`` 升序；
+    - ``title`` / ``assignee`` / ``status`` / ``created_by`` 的 NULL 一律归成空串，
+      聚合层不必再判空；
+    - 缺 ``created_by`` 列的库（``tests/fixtures/make_board.py`` 生成的 7 列库）
+      会抛 ``sqlite3.OperationalError``，这里包成 :class:`BoardError`（沿用本模块
+      ``读取 … 失败: …`` 文案），由调用方渲染成 500 ``source_unavailable``；
+    - 只读：SQL 不带任何写操作，连接本身仍是 ``mode=ro``。
+    """
+    # SQL 逐字写在契约里（无外部输入，不是注入面）：三列口径由 E2 的 /api/topology 共用
+    sql = "SELECT id, title, assignee, status, created_by FROM tasks ORDER BY created_at, id"
+    try:
+        rows = conn.execute(sql).fetchall()
+    except sqlite3.Error as exc:
+        raise BoardError(f"读取 tasks.created_by 失败: {exc}") from exc
+
+    return [
+        TopoCard(
+            id=str(row[0]),
+            title="" if row[1] is None else str(row[1]),
+            assignee="" if row[2] is None else str(row[2]),
+            status="" if row[3] is None else str(row[3]),
+            created_by="" if row[4] is None else str(row[4]),
+        )
+        for row in rows
+    ]
 
 
 _BODY_COLUMNS = "id, status, assignee, body"
