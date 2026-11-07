@@ -1705,44 +1705,40 @@ def _broadcast_opts() -> mg.Options:
 
 
 def test_broadcast_tip_lines_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    """合并后广播只回一行摘要，不改合并结果。"""
+    """合并后只报告落后 PR，绝不调用 apply（平台 rebase 会污染 committer）。"""
     from types import SimpleNamespace
 
     from team_board import tip as tipmod
 
-    updated = SimpleNamespace(number=7, update_rc=0, update_detail="")
-    report = tipmod.BroadcastReport(
-        tip="a" * 40,
-        prs=(),
-        dry_run=False,
-    )
-    monkeypatch.setattr(
-        tipmod,
-        "broadcast",
-        lambda *a, **k: SimpleNamespace(updated=(updated,), failed=()),
-    )
+    behind = SimpleNamespace(number=7, update_rc=None, update_detail="")
+    seen: dict[str, object] = {}
+
+    def fake_broadcast(*_a, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(behind=(behind,), errors=())
+
+    monkeypatch.setattr(tipmod, "broadcast", fake_broadcast)
     assert mg._broadcast_tip_lines(_broadcast_opts()) == [
-        "tip 广播: 更新 1 个落后 PR，失败 0 个"
+        "tip 广播: 落后 1 个 PR（仅报告，不改分支）"
     ]
-    assert report.dry_run is False
+    assert seen["apply"] is False
 
 
-def test_broadcast_tip_lines_reports_failure_without_raising(
+def test_broadcast_tip_lines_reports_errors_without_raising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """单条 update 失败要带 PR 号与 rc，但仍只返回一行、不抛异常。"""
+    """取数错误要带一条原文，但仍只返回一行、不抛异常。"""
     from types import SimpleNamespace
 
     from team_board import tip as tipmod
 
-    failed = SimpleNamespace(number=8, update_rc=1, update_detail="conflict")
     monkeypatch.setattr(
         tipmod,
         "broadcast",
-        lambda *a, **k: SimpleNamespace(updated=(), failed=(failed,)),
+        lambda *a, **k: SimpleNamespace(behind=(), errors=("gh 挂了",)),
     )
     assert mg._broadcast_tip_lines(_broadcast_opts()) == [
-        "tip 广播: 更新 0 个落后 PR，失败 1 个（#8 rc=1 conflict）"
+        "tip 广播: 落后 0 个 PR（仅报告，不改分支）；取数错误 1 条（gh 挂了）"
     ]
 
 
