@@ -3,7 +3,8 @@
 用例名即验收判据的 ``-k`` 过滤器（``topo_card_fields`` / ``role_tables`` /
 ``node_union`` / ``nobody`` / ``blank_assignee`` / ``self_cards`` /
 ``running_count`` / ``running_cards`` / ``level_cycle`` / ``unknown_bot`` /
-``ordering`` / ``empty_payload`` / ``deterministic``），改名会直接让判据跑空
+``ordering`` / ``empty_payload`` / ``deterministic`` / ``unknown_root_chain`` /
+``edgeless`` / ``unknown_cycle`` / ``known_anchor``），改名会直接让判据跑空
 （pytest -k 无匹配 → rc 5）。
 
 卡一律用 :func:`_card` 现造，不读库、不冻结时钟 —— 本层是纯函数。
@@ -391,6 +392,106 @@ def test_deterministic_across_input_permutations() -> None:
     mixed = json.dumps(topology_payload(shuffled), ensure_ascii=False)
 
     assert forward == backward == mixed
+
+
+# --------------------------------------------------------------------------- #
+# E1b 未知名链根：无入边 → 0 级，下游逐跳 +1（口径 A）
+# --------------------------------------------------------------------------- #
+
+
+def test_unknown_root_chain_levels_cascade_from_zero() -> None:
+    """链根 researcher 无入边 → 0 级；helper 1 / helper2 2 / helper3 3 逐跳 +1。"""
+    cards = [
+        _card("t_1", assignee="helper", created_by="researcher"),
+        _card("t_2", assignee="helper2", created_by="helper"),
+        _card("t_3", assignee="helper3", created_by="helper2"),
+    ]
+
+    payload = topology_payload(cards)
+    by_name = _by_name(payload)
+
+    assert by_name["researcher"]["level"] == 0
+    assert by_name["helper"]["level"] == 1
+    assert by_name["helper2"]["level"] == 2
+    assert by_name["helper3"]["level"] == 3
+    # 节点按 (level, name) 排：链根在前、逐跳往后
+    assert _names(payload) == ["researcher", "helper", "helper2", "helper3"]
+
+
+def test_edgeless_unknown_nodes_stay_level_zero() -> None:
+    """无边的未知名（含 ``created_by=""`` / ``"   "``）仍 0 级、不成边（E1-13 不回归）。"""
+    cards = [
+        _card("t_1", assignee="alpha", created_by=""),
+        _card("t_2", assignee="beta", created_by="   "),
+    ]
+
+    payload = topology_payload(cards)
+    by_name = _by_name(payload)
+
+    assert _edges(payload) == []
+    assert by_name["alpha"]["level"] == 0
+    assert by_name["beta"]["level"] == 0
+
+
+def test_unknown_cycle_stays_level_zero() -> None:
+    """纯未知环 x↔y：没有链根可依托 → 两节点均 0 级，且同输入两次 payload 相同。"""
+    cards = [
+        _card("t_x", assignee="x", created_by="y"),
+        _card("t_y", assignee="y", created_by="x"),
+    ]
+
+    first = topology_payload(cards)
+    by_name = _by_name(first)
+
+    assert by_name["x"]["level"] == 0
+    assert by_name["y"]["level"] == 0
+    assert json.dumps(first, ensure_ascii=False) == json.dumps(
+        topology_payload(cards), ensure_ascii=False
+    )
+
+
+def test_known_anchor_cascade_unchanged() -> None:
+    """带已知锚点的级联不变：pm 2 → helper 3；user 0 → researcher 1 → helper 2。"""
+    anchored = _by_name(topology_payload([_card("t_1", assignee="helper", created_by="pm")]))
+    assert anchored["pm"]["level"] == ROLE_LEVEL["pm"] == 2
+    assert anchored["helper"]["level"] == 3
+
+    chained = _by_name(
+        topology_payload(
+            [
+                _card("t_2", assignee="researcher", created_by="user"),
+                _card("t_3", assignee="helper", created_by="researcher"),
+            ]
+        )
+    )
+    assert chained["user"]["level"] == 0
+    assert chained["researcher"]["level"] == 1
+    assert chained["helper"]["level"] == 2
+
+
+def test_deterministic_mixed_unknown_graph_permutations() -> None:
+    """未知链 + 未知环 + 无边点 + 自环混在一份卡里：正序 / 逆序 / 乱序 payload 全等。"""
+    cards = [
+        _card("t_1", assignee="helper", created_by="researcher"),
+        _card("t_2", assignee="helper2", created_by="helper"),
+        _card("t_3", assignee="x", created_by="y"),
+        _card("t_4", assignee="y", created_by="x"),
+        _card("t_5", assignee="alpha", created_by=""),
+        _card("t_6", assignee="loop", created_by="loop"),
+    ]
+
+    shuffled = list(cards)
+    random.Random(7).shuffle(shuffled)
+
+    forward = json.dumps(topology_payload(list(cards)), ensure_ascii=False)
+    backward = json.dumps(topology_payload(list(reversed(cards))), ensure_ascii=False)
+    mixed = json.dumps(topology_payload(shuffled), ensure_ascii=False)
+
+    assert forward == backward == mixed
+    # 定级与输入顺序无关：乱序下未知链仍逐跳定级，未知环仍 0
+    by_name = _by_name(topology_payload(shuffled))
+    assert [by_name[name]["level"] for name in ("researcher", "helper", "helper2")] == [0, 1, 2]
+    assert by_name["x"]["level"] == by_name["y"]["level"] == 0
 
 
 # --------------------------------------------------------------------------- #

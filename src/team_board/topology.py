@@ -19,8 +19,8 @@
 4. ``running_cards``：该名下 running 卡按 ``id`` 码位升序，``title`` 走
    ``fmt.truncate(title or "", model.TITLE_MAX)``。
 5. ``level``：已知名取 :data:`ROLE_LEVEL`；未知名 = 1 + max(已定级且有边指向它的
-   来源)，无入边 → 0；按名字码位升序逐轮 relax、最多 ``len(nodes)`` 轮，仍定不下来
-   → 0（有环也不死循环）。
+   来源)，无入边者先按 0 级参与计算（链根，之后下游逐跳 +1）；按名字码位升序逐轮
+   relax、最多 ``len(nodes)`` 轮，仍定不下来 → 0（有环也不死循环）。
 6. ``display``：已知名取 :data:`ROLE_DISPLAY`；未知名原样输出 ``name``。
 7. 排序：``nodes`` 按 ``(level, name)`` 升序、``edges`` 按 ``(from, to)`` 升序；
    无自环时 ``self_cards == 0``。
@@ -96,12 +96,18 @@ def _node_name(value: str | None) -> str:
 def _resolve_levels(names: list[str], sources: dict[str, set[str]]) -> dict[str, int]:
     """定级：已知名查表，未知名按入边逐轮 relax（最多 ``len(names)`` 轮）。
 
-    ``sources[child]`` 是所有向 ``child`` 派过卡的上游名。未知名只有在存在
-    「已定级」的上游时才拿到 ``1 + max(上游 level)``；一轮下来没有任何进展就停，
+    ``sources[child]`` 是所有向 ``child`` 派过卡的上游名。未知名里**没有入边**的那些
+    是链根，先把它们记成 0 级参与计算，下游才能逐跳 +1；其余未知名只有在存在
+    「已定级」的上游时才拿到 ``1 + max(上游 level)``。一轮下来没有任何进展就停，
     因此成环也不会死循环，定不下来的一律落到 0。
     """
     levels: dict[str, int] = {name: ROLE_LEVEL[name] for name in names if name in ROLE_LEVEL}
     pending = [name for name in names if name not in levels]
+
+    # 链根：无入边的未知名先按 0 级参与计算（否则下游永远等不到已定级来源）
+    for name in pending:
+        if not sources.get(name):
+            levels[name] = 0
 
     for _ in range(len(names)):
         progressed = False
