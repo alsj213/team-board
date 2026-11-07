@@ -237,6 +237,43 @@ _PAGE_TEMPLATE = string.Template(
     border: 1px solid #d8dee4; padding: 5px 8px; text-align: left;
   }
   #bots-table th { background: #f6f8fa; font-size: 12px; color: #57606a; }
+  /* 团队拓扑：盒子 = 节点，细盒 + rotate = 线，末端三角 = 箭头（全程不用 SVG） */
+  #topology { margin-top: 18px; }
+  #topology h2 {
+    font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: #57606a; margin: 0 0 10px;
+  }
+  #topology-empty { margin: 0 0 10px; font-size: 13px; color: #57606a; }
+  #topology-graph { position: relative; }
+  .topo-node {
+    position: absolute; box-sizing: border-box; padding: 5px 8px; overflow: hidden;
+    border: 1px solid #d8dee4; border-radius: 8px; background: #fff; font-size: 12px;
+    display: flex; flex-direction: column; justify-content: center; gap: 1px;
+  }
+  .topo-node.active { border-color: #0969da; background: #ddf4ff; }
+  .topo-node.idle { opacity: .45; }
+  .topo-node .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .topo-node.active .name { font-weight: 700; color: #0b3d75; }
+  .topo-node .state { font-size: 11px; color: #57606a; }
+  .topo-node .card {
+    margin: 0; padding: 0; border: 0; border-radius: 0; font-size: 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #6e7781;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .topo-edge {
+    position: absolute; height: 0; transform-origin: 0 0; border-top: 1px dashed #9aa4ad;
+  }
+  .topo-edge-head {
+    position: absolute; right: -1px; top: -4px; width: 0; height: 0;
+    border-left: 6px solid #9aa4ad; border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+  }
+  .topo-edge-label {
+    position: absolute; top: -15px; transform-origin: 50% 50%; white-space: nowrap;
+    padding: 0 3px; background: #f6f7f9; font-size: 10px; color: #57606a;
+  }
+  #topology-cards { list-style: none; margin: 12px 0 0; padding: 0; font-size: 12px; color: #444d56; }
+  #topology-cards li { padding: 1px 0; }
   #main {
     display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 12px; align-items: start;
@@ -290,11 +327,18 @@ _PAGE_TEMPLATE = string.Template(
     <thead><tr><th>Bot</th><th>状态</th><th>在跑</th></tr></thead>
     <tbody id="bots-body"></tbody>
   </table>
+  <section id="topology">
+    <h2>团队拓扑</h2>
+    <p id="topology-empty" hidden>暂无派发记录</p>
+    <div id="topology-graph" role="img" aria-label="团队派发拓扑图"></div>
+    <ul id="topology-cards"></ul>
+  </section>
 </section>
 <script>
 const REFRESH_MS = ${REFRESH_MS};
 const COLUMN_NAMES = ["running", "queued", "blocked", "done"];
 const PAGE_SIZE = ${PAGE_SIZE};
+const TOPO_LAYOUT = { nodeW: 148, nodeH: 52, gapX: 28, gapY: 86, padX: 16, padY: 12 };
 const pageIndex = { running: 0, queued: 0, blocked: 0, done: 0 };
 let timer = null;
 
@@ -428,6 +472,151 @@ async function refreshBots() {
   }
 }
 
+// ---- 团队拓扑（只读）----
+// 节点 = 看板出现过的人（按 level 分层），边 = created_by 到 assignee 的卡数。
+// 全用 DOM API 画：节点是圆角盒，线是细盒 + transform: rotate，末端小三角当箭头。
+// 不用 SVG（SVG 必须带 xmlns 网址，会撞页面「零外部引用」那条断言）；
+// 节点上不挂任何 click / drag 监听，也不调任何写接口。
+function renderTopology(data) {
+  const graph = document.getElementById("topology-graph");
+  const empty = document.getElementById("topology-empty");
+  const list = document.getElementById("topology-cards");
+  const nodes = data.nodes || [];
+  const edges = data.edges || [];
+
+  // 空看板：亮占位行、清空画布与清单，不抛异常
+  if (nodes.length === 0) {
+    empty.hidden = false;
+    graph.replaceChildren();
+    list.replaceChildren();
+    return;
+  }
+  empty.hidden = true;
+
+  // 按 level 分行：同层横排、每行整体居中；画布宽高由最宽一行与行数算出
+  const rows = [];
+  nodes.forEach(function (node) {
+    if (!rows[node.level]) { rows[node.level] = []; }
+    rows[node.level].push(node);
+  });
+  let columns = 1;
+  rows.forEach(function (row) {
+    if (row && row.length > columns) { columns = row.length; }
+  });
+  const width = TOPO_LAYOUT.padX * 2 + columns * TOPO_LAYOUT.nodeW +
+    (columns - 1) * TOPO_LAYOUT.gapX;
+  const height = TOPO_LAYOUT.padY * 2 + rows.length * TOPO_LAYOUT.nodeH +
+    (rows.length - 1) * TOPO_LAYOUT.gapY;
+  graph.style.width = width + "px";
+  graph.style.height = height + "px";
+
+  const spots = {};
+  rows.forEach(function (row, level) {
+    if (!row) { return; }
+    const rowWidth = row.length * TOPO_LAYOUT.nodeW + (row.length - 1) * TOPO_LAYOUT.gapX;
+    const left0 = (width - rowWidth) / 2;
+    row.forEach(function (node, index) {
+      spots[node.name] = {
+        left: left0 + index * (TOPO_LAYOUT.nodeW + TOPO_LAYOUT.gapX),
+        top: TOPO_LAYOUT.padY + level * (TOPO_LAYOUT.nodeH + TOPO_LAYOUT.gapY)
+      };
+    });
+  });
+
+  // 边先入（垫在节点下面）：父节点底边中点 → 子节点顶边中点，长度与角度现算
+  const lines = [];
+  edges.forEach(function (edge) {
+    const from = spots[edge.from];
+    const to = spots[edge.to];
+    if (!from || !to) { return; }
+    const x1 = from.left + TOPO_LAYOUT.nodeW / 2;
+    const y1 = from.top + TOPO_LAYOUT.nodeH;
+    const dx = to.left + TOPO_LAYOUT.nodeW / 2 - x1;
+    const dy = to.top - y1;
+    const length = Math.sqrt(dx * dx + dy * dy);
+    const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+    const line = make("div", "topo-edge");
+    line.dataset.cards = String(edge.cards);
+    line.style.cssText = "transform: rotate(" + deg + "deg);";
+    line.style.left = x1 + "px";
+    line.style.top = y1 + "px";
+    line.style.width = length + "px";
+    const label = make("span", "topo-edge-label", "×" + edge.cards);
+    label.style.left = length / 2 + "px";
+    // 标签跟着线转，再反向转回来保持正读
+    label.style.transform = "translate(-50%, 0) rotate(" + (-deg) + "deg)";
+    line.append(label, make("span", "topo-edge-head"));
+    lines.push(line);
+  });
+
+  // 节点：running > 0 → active（在跑 N），否则 idle（CSS opacity .45）
+  const boxes = nodes.map(function (node) {
+    const spot = spots[node.name];
+    const running = node.running || 0;
+    const box = make("div", running > 0 ? "topo-node active" : "topo-node idle");
+    box.dataset.name = node.name;
+    box.style.left = spot.left + "px";
+    box.style.top = spot.top + "px";
+    box.style.width = TOPO_LAYOUT.nodeW + "px";
+    box.style.height = TOPO_LAYOUT.nodeH + "px";
+    const cards = node.running_cards || [];
+    let card = "";
+    if (cards.length > 0) {
+      card = cards[0].id;
+      if (running > 1) { card = card + " +" + (running - 1); }
+    }
+    box.append(
+      make("span", "name", node.display),
+      make("span", "state", running > 0 ? "在跑 " + running : "空闲"),
+      make("span", "card", card)
+    );
+    return box;
+  });
+  graph.replaceChildren.apply(graph, lines.concat(boxes));
+
+  // 在跑卡清单：按 (display, id) 升序，形如「display · 卡 id 标题」
+  const pairs = [];
+  nodes.forEach(function (node) {
+    (node.running_cards || []).forEach(function (card) {
+      pairs.push({ display: node.display, id: card.id, title: card.title || "" });
+    });
+  });
+  pairs.sort(function (a, b) {
+    if (a.display !== b.display) { return a.display < b.display ? -1 : 1; }
+    if (a.id === b.id) { return 0; }
+    return a.id < b.id ? -1 : 1;
+  });
+  list.replaceChildren.apply(list, pairs.map(function (card) {
+    const tail = card.title ? " " + card.title : "";
+    return make("li", "", card.display + " · " + card.id + tail);
+  }));
+}
+
+// 拓扑另走一条刷新路径：失败只复用 #bots-error 那一行并点名「拓扑」，
+// 不动 #bots-body、也不清 #topology-graph 与 #topology-cards —— 保留上一帧。
+async function refreshTopology() {
+  // 失败只写错误行、直接返回：上一帧的节点、边与在跑清单都留着。
+  try {
+    const response = await fetch("/api/topology");
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = await response.json();
+        if (body && body.error) { detail = "：" + body.error; }
+      } catch (parseErr) {
+        detail = "";
+      }
+      showBotsError("拓扑刷新失败（HTTP " + response.status + "）" + detail + "，保留上一帧");
+      return;
+    }
+    const data = await response.json();
+    renderTopology(data);
+    clearBotsError();
+  } catch (err) {
+    showBotsError("拓扑刷新失败（" + err + "），保留上一帧");
+  }
+}
+
 async function refresh() {
   try {
     const responses = await Promise.all([
@@ -465,9 +654,11 @@ function start() {
   if (timer !== null) { return; }
   refresh();
   refreshBots();
+  refreshTopology();
   timer = setInterval(function () {
     refresh();
     refreshBots();
+    refreshTopology();
   }, REFRESH_MS);
 }
 
@@ -511,6 +702,10 @@ def index_html() -> str:
       不重启定时器，所以来回切不丢状态。默认仍是卡片视图（``#view-bots``
       带 ``hidden``），``#bots-error`` 与 ``#bots-body`` 各自独立，``/api/bots``
       失败只写 ``#bots-error`` 并保留上一帧；
+    - ``#view-bots`` 里 ``#bots-table`` 之后是只读拓扑图 ``#topology``：节点按
+      ``level`` 分层排布、边是 ``created_by`` → ``assignee`` 的卡数、有 running
+      卡的节点高亮并显示卡 id；只用 ``/api/topology``，失败同样复用
+      ``#bots-error`` 并保留上一帧，节点上不挂任何交互监听；
     - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
     - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
     - 所有渲染走 ``textContent`` / ``replaceChildren``，绝不把数据拼进 innerHTML；
