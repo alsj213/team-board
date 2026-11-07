@@ -2511,22 +2511,24 @@ def _run_verify_only(opts: Options) -> tuple[list[str], int]:
 
 
 def _broadcast_tip_lines(opts: Options) -> list[str]:
-    """合并后的 tip 广播：只报结果，绝不把已完成的合并改成失败。"""
+    """合并后的 tip 报告：**只读**，绝不改其它卡分支，也绝不把合并改成失败。
+
+    为什么不再 apply：``gh pr update-branch --rebase`` 会把 committer 写成 token
+    所有者，``commit-identity`` 必红（2026-11-06 E1、2026-11-07 E2 两次实测）。
+    卡分支的 rebase 只能由 bot 在身份 worktree 里做，再用 ``rebasepush`` 机械代推。
+    """
 
     from . import tip as tipmod  # 只在合并成功后走这条可选路径
 
     try:
         report = tipmod.broadcast(
-            opts.repo, remote=opts.remote, main="main", apply=True, fetch=True
+            opts.repo, remote=opts.remote, main="main", apply=False, fetch=True
         )
     except Exception as exc:  # 合并已完成，广播失败不许回滚 rc
         return [f"tip 广播: 跳过（{type(exc).__name__}: {exc}）"]
-    line = f"tip 广播: 更新 {len(report.updated)} 个落后 PR，失败 {len(report.failed)} 个"
-    if report.failed:
-        detail = "；".join(
-            f"#{pr.number} rc={pr.update_rc} {pr.update_detail}" for pr in report.failed
-        )
-        line += f"（{detail}）"
+    line = f"tip 广播: 落后 {len(report.behind)} 个 PR（仅报告，不改分支）"
+    if report.errors:
+        line += f"；取数错误 {len(report.errors)} 条（{report.errors[0]}）"
     return [line]
 
 
