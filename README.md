@@ -151,9 +151,10 @@ GET /api/bots
 - 判定是算出来的、不接受外部写入：该名字存在 `status == "running"` 的卡 =
   工作中（`working`），否则空闲（`idle`）；`running` 是该名字的 running 卡数。
 - 只读：`GET /api/bots` 与另两个接口一样没有任何写接口，也不改 schema。
-- 拓扑图（只读）：节点 = 看板出现过的人，边 = `created_by` → `assignee` 的卡数；
-  节点亮 = 该名字有 running 卡（没亮的置灰）；纵坐标是角色层级常量 `ROLE_LEVEL`，
-  边与卡数来自数据、不写死。
+- 拓扑图（只读）：只画团队关系——节点 = 看板出现过的人，边 = `created_by` →
+  `assignee` 的派发关系（边上不标卡数）；节点亮 = 该名字有 running 卡（没亮的置灰），
+  运行态只有 active/idle；页面上不列卡 id、不列运行卡清单；纵坐标是角色层级常量
+  `ROLE_LEVEL`。
 
 只读与安全边界：
 
