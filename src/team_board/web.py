@@ -19,7 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import bots, commands, db, fmt
+from . import bots, commands, db, fmt, topology
 from .model import TITLE_MAX, Task
 
 #: 页面上的四列，顺序即渲染顺序（不再有第五列）
@@ -643,8 +643,22 @@ class BoardRequestHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        if path not in ("/api/board", "/api/summary", "/api/bots"):
+        if path not in ("/api/board", "/api/summary", "/api/bots", "/api/topology"):
             self._send_json(404, {"error": "not found"})
+            return
+
+        if path == "/api/topology":
+            # 拓扑先判：只吃 ``created_by``，走独立取数 ``load_topo_cards``，
+            # 不碰 ``load_tasks`` 的七列口径与时间戳校验（拓扑与时间无关）。
+            # 其余三个接口原样走 ``load_tasks``，响应逐字节不变。
+            conn = None
+            try:
+                conn = db.connect(server.board_db_path)
+                payload = topology.topology_payload(db.load_topo_cards(conn))
+                self._send_json(200, payload)
+            finally:
+                if conn is not None:
+                    conn.close()
             return
 
         now = server.board_clock()
