@@ -313,12 +313,27 @@ def parse_created_id(stdout: str) -> str | None:
     return match.group(0) if match else None
 
 
-def _default_runner(argv: Sequence[str]) -> Any:
-    """默认执行器：捕获 stdout/stderr，``--json`` 才能被解析（2026-11-03 dogfood）。"""
+#: ``hermes kanban create`` 的单次上限；sweep 是 systemd oneshot，不能被
+#: 卡住的子进程拖进 stop-sigterm 超时（2026-11-08 实测）。
+CREATE_TIMEOUT = 30
 
-    return subprocess.run(  # nosec B603 - argv 是常量元组，不经 shell
-        tuple(argv), capture_output=True, text=True, check=False
-    )
+
+def _default_runner(argv: Sequence[str]) -> Any:
+    """默认执行器：捕获 stdout/stderr，``--json`` 才能被解析（2026-11-03 dogfood）。
+
+    子进程超时折成 rc=124 的 CompletedProcess，让 sweep 记一条 error 后继续，
+    而不是让 systemd 等一个挂起的 ``hermes`` 子进程。
+    """
+
+    try:
+        return subprocess.run(  # nosec B603 - argv 是常量元组，不经 shell
+            tuple(argv), capture_output=True, text=True, check=False,
+            timeout=CREATE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            tuple(argv), 124, "", f"hermes create 超时 {CREATE_TIMEOUT}s"
+        )
 
 
 def create_merge_card(
