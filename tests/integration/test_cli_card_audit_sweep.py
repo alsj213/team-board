@@ -102,6 +102,19 @@ class TestSweep:
         ]
         assert "t_bbbbbbbb | blocked" in out
 
+    def test_running_card_claim_blocks_ready_card_even_when_ready_is_earlier(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [
+            ("t_aaaaaaaa", "ready", "engineer", "先建但还没跑", GOOD),
+            ("t_bbbbbbbb", "running", "engineer", "后建但已在跑", GOOD),
+        ]
+        board = make_db(tmp_path / "running-overlap.db", rows)
+        code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
+        assert (code, err) == (1, "")
+        assert "t_aaaaaaaa | invalid | path-claim-conflict" in out
+        assert "t_bbbbbbbb" not in out
+
     def test_disjoint_path_claims_pass(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

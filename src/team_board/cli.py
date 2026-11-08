@@ -2979,21 +2979,24 @@ def _sweep_card_audit(args: argparse.Namespace) -> int:
         _write_stderr_error(f"--limit 必须 >= 1: {args.limit}")
         return 2
     conn = None
-    candidates: list[tuple[model.Task, str, str, flow.CardAuditReport]] = []
+    rows: list[tuple[model.Task, str, str]] = []
+    candidates: list[tuple[model.Task, flow.CardAuditReport]] = []
     results: list[dict[str, object]] = []
     try:
         conn = db.connect(args.db)
         tasks = db.load_tasks(conn)
         for task in tasks:
-            if task.status not in {"ready", "todo"}:
+            if task.status in {"done", "archived"}:
                 continue
             try:
                 _status, title, body = db.load_card_row(conn, task.id)
             except db.BoardError as exc:
                 results.append({"card": task.id, "status": "error", "reason": str(exc)})
                 continue
-            report = flow.audit_card(task.id, title, body, assignee=task.assignee)
-            candidates.append((task, title, body, report))
+            rows.append((task, title, body))
+            if task.status in {"ready", "todo"}:
+                report = flow.audit_card(task.id, title, body, assignee=task.assignee)
+                candidates.append((task, report))
     except (db.BoardError, OSError, sqlite3.Error) as exc:
         _write_stderr_error(str(exc))
         return 2
@@ -3002,25 +3005,28 @@ def _sweep_card_audit(args: argparse.Namespace) -> int:
             conn.close()
 
     claims, _ = pathclaim.parse_rows(
-        [
-            (task.id, task.status, task.assignee, body)
-            for task, _title, body, report in candidates
-            if report.kind == "impl"
-        ]
+        [(task.id, task.status, task.assignee, body) for task, _title, body in rows]
     )
     conflicts = pathclaim.audit(claims).conflicts
     order = {
         task.id: (task.created_at or 0, task.id)
-        for task, _title, _body, _report in candidates
+        for task, _title, _body in rows
     }
+    active_ids = frozenset(
+        task.id for task, _title, _body in rows if task.status not in {"ready", "todo"}
+    )
 
     seen = 0
-    for task, _title, _body, report in candidates:
+    for task, report in candidates:
         if seen >= args.limit:
             break
         findings = list(report.findings)
         if report.kind == "impl":
-            findings.extend(flow.later_card_overlap_findings(task.id, conflicts, order))
+            findings.extend(
+                flow.later_card_overlap_findings(
+                    task.id, conflicts, order, active_ids
+                )
+            )
         if not findings:
             continue
         seen += 1

@@ -161,22 +161,29 @@ def later_card_overlap_findings(
     card_id: str,
     conflicts: tuple[pathclaim.Conflict, ...],
     order: dict[str, tuple[int, str]],
+    active_ids: frozenset[str] = frozenset(),
 ) -> tuple[Finding, ...]:
-    """返回本卡的路径认领冲突 findings；每对冲突一条，只给创建顺序较晚的卡。"""
+    """返回本卡的路径认领冲突 findings；每对冲突一条。
+
+    与 ``active_ids`` 里已开始或已占用的卡冲突时，本卡直接让路。与同样在排队的
+    卡冲突时，只给创建顺序较晚的卡，避免一次冲突把两张卡都停掉。
+    """
 
     findings: list[Finding] = []
     for conflict in conflicts:
         if card_id not in conflict.cards:
             continue
         other = conflict.card_b if conflict.card_a == card_id else conflict.card_a
-        if order.get(card_id, (0, "")) <= order.get(other, (0, "")):
+        if other not in active_ids and order.get(card_id, (0, "")) <= order.get(
+            other, (0, "")
+        ):
             continue
         findings.append(
             Finding(
                 "path-claim-conflict",
                 f"PATH-CLAIM 与 {other} 重叠："
                 f"{conflict.path_a} ↔ {conflict.path_b}；"
-                "按创建顺序后到先让，改路径或等前一张卡结单",
+                "改路径或等对方结单",
             )
         )
     return tuple(findings)
