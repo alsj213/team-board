@@ -2544,26 +2544,41 @@ def _run_path_claim_check(args: argparse.Namespace) -> int:
     return pathclaim.exit_code(report)
 
 
-def _gh_pr_view(repo: str, slug: str, pr: int) -> dict[str, str]:
+#: ``gh pr view`` 的单次上限；``merge-card --sweep`` 是 systemd oneshot，
+#: 不能让一个网络挂起的 gh 子进程把服务拖进 stop-sigterm 超时。
+GH_PR_VIEW_TIMEOUT = 30
+
+
+def _gh_pr_view(repo: str, slug: str, pr: int, *, timeout: int = GH_PR_VIEW_TIMEOUT) -> dict[str, str]:
     """``gh pr view`` 取 state/headRefOid/title；失败抛 :class:`train.TrainError`（rc2）。
 
     gh 挂掉 / 输出不是 JSON 属于**环境错误**（help 与 README 都写「2 参数或环境错误」），
-    不能折成 rc1 —— rc1 是「前置条件不满足」专用码。
+    不能折成 rc1 —— rc1 是「前置条件不满足」专用码。``timeout`` 防止 sweep 被
+    GitHub 网络挂起卡死（2026-11-08 实测：服务卡在 stop-sigterm）。
     """
 
-    proc = train.default_run(
-        (
-            "gh",
-            "pr",
-            "view",
-            str(pr),
-            "-R",
-            slug,
-            "--json",
-            "state,headRefOid,title,headRefName",
-        ),
-        repo,
-    )
+    try:
+        proc = subprocess.run(  # nosec B603 - argv 常量元组，不经 shell
+            (
+                "gh",
+                "pr",
+                "view",
+                str(pr),
+                "-R",
+                slug,
+                "--json",
+                "state,headRefOid,title,headRefName",
+            ),
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise train.TrainError(f"gh pr view #{pr} 超时 {timeout}s") from exc
+    except OSError as exc:
+        raise train.TrainError(f"gh pr view #{pr} 启动失败：{exc}") from exc
     if proc.returncode != 0:
         raise train.TrainError(
             f"gh pr view #{pr} 失败（rc={proc.returncode}）：{proc.stderr.strip()}"
