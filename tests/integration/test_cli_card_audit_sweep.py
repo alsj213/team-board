@@ -57,6 +57,66 @@ class TestSweep:
         assert "t_1234abcd | invalid" in out
         assert "path-claim-missing" in out
 
+    def test_overlapping_path_claims_block_only_the_later_card(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rows = [
+            ("t_aaaaaaaa", "ready", "engineer", "先建卡", GOOD),
+            ("t_bbbbbbbb", "ready", "engineer", "后建卡", GOOD),
+        ]
+        board = make_db(tmp_path / "overlap.db", rows)
+        code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
+        assert (code, err) == (1, "")
+        assert "t_bbbbbbbb | invalid | path-claim-conflict" in out
+        assert "t_aaaaaaaa" not in out
+
+    def test_overlapping_path_claims_apply_blocks_only_the_later_card(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = [
+            ("t_aaaaaaaa", "ready", "engineer", "先建卡", GOOD),
+            ("t_bbbbbbbb", "ready", "engineer", "后建卡", GOOD),
+        ]
+        board = make_db(tmp_path / "overlap-apply.db", rows)
+        calls: list[tuple[str, ...]] = []
+
+        class Proc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(argv: tuple[str, ...], **kwargs: Any) -> Proc:
+            calls.append(tuple(argv))
+            return Proc()
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        code, out, err = run(
+            capsys, "card-audit", "--sweep", "--apply", "--db", str(board)
+        )
+        assert (code, err) == (0, "")
+        assert calls == [
+            (
+                "hermes", "kanban", "--board", "devteam", "block", "t_bbbbbbbb",
+                "card-audit 机械拦截：path-claim-conflict",
+            )
+        ]
+        assert "t_bbbbbbbb | blocked" in out
+
+    def test_disjoint_path_claims_pass(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        other = GOOD.replace("src/a.py", "src/b.py")
+        board = make_db(
+            tmp_path / "disjoint.db",
+            [
+                ("t_aaaaaaaa", "ready", "engineer", "A", GOOD),
+                ("t_bbbbbbbb", "ready", "engineer", "B", other),
+            ],
+        )
+        code, out, err = run(capsys, "card-audit", "--sweep", "--db", str(board))
+        assert (code, err) == (0, "")
+        assert "0 张异常" in out
+
     def test_merge_card_is_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         board = make_db(
             tmp_path / "merge.db",

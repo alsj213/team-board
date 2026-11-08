@@ -223,6 +223,7 @@ from . import (
     mergecard,
     mergeowner,
     merges,
+    model,
     outputaudit,
     pathclaim,
     prclaim,
@@ -2974,64 +2975,80 @@ def _run_merge_card(args: argparse.Namespace) -> int:
 
 
 def _sweep_card_audit(args: argparse.Namespace) -> int:
-    """扫描 ready/todo 卡，报告或 block 缺卡面契约的卡（派工前机械闸门）。"""
-
     if args.limit < 1:
         _write_stderr_error(f"--limit 必须 >= 1: {args.limit}")
         return 2
     conn = None
+    candidates: list[tuple[model.Task, str, str, flow.CardAuditReport]] = []
+    results: list[dict[str, object]] = []
     try:
         conn = db.connect(args.db)
         tasks = db.load_tasks(conn)
-    except (db.BoardError, OSError, sqlite3.Error) as exc:
-        _write_stderr_error(str(exc))
-        return 2
-
-    results: list[dict[str, object]] = []
-    seen = 0
-    try:
         for task in tasks:
             if task.status not in {"ready", "todo"}:
                 continue
-            if seen >= args.limit:
-                break
             try:
                 _status, title, body = db.load_card_row(conn, task.id)
             except db.BoardError as exc:
                 results.append({"card": task.id, "status": "error", "reason": str(exc)})
                 continue
             report = flow.audit_card(task.id, title, body, assignee=task.assignee)
-            if report.ok:
-                continue
-            seen += 1
-            codes = ",".join(item.code for item in report.findings)
-            if not args.apply:
-                results.append(
-                    {"card": task.id, "status": "invalid", "reason": codes,
-                     "findings": [item.message for item in report.findings]}
-                )
-                continue
-            proc = subprocess.run(  # nosec B603 - argv 常量元组，不经 shell
-                (
-                    "hermes", "kanban", "--board", "devteam", "block", task.id,
-                    f"card-audit 机械拦截：{'；'.join(item.code for item in report.findings)}",
-                ),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if proc.returncode != 0:
-                results.append(
-                    {"card": task.id, "status": "error", "reason": codes,
-                     "detail": (proc.stderr or proc.stdout).strip()}
-                )
-            else:
-                results.append(
-                    {"card": task.id, "status": "blocked", "reason": codes}
-                )
+            candidates.append((task, title, body, report))
+    except (db.BoardError, OSError, sqlite3.Error) as exc:
+        _write_stderr_error(str(exc))
+        return 2
     finally:
         if conn is not None:
             conn.close()
+
+    claims, _ = pathclaim.parse_rows(
+        [
+            (task.id, task.status, task.assignee, body)
+            for task, _title, body, report in candidates
+            if report.kind == "impl"
+        ]
+    )
+    conflicts = pathclaim.audit(claims).conflicts
+    order = {
+        task.id: (task.created_at or 0, task.id)
+        for task, _title, _body, _report in candidates
+    }
+
+    seen = 0
+    for task, _title, _body, report in candidates:
+        if seen >= args.limit:
+            break
+        findings = list(report.findings)
+        if report.kind == "impl":
+            findings.extend(flow.later_card_overlap_findings(task.id, conflicts, order))
+        if not findings:
+            continue
+        seen += 1
+        codes = ",".join(item.code for item in findings)
+        if not args.apply:
+            results.append(
+                {"card": task.id, "status": "invalid", "reason": codes,
+                 "findings": [item.message for item in findings]}
+            )
+            continue
+        proc = subprocess.run(  # nosec B603 - argv 常量元组，不经 shell
+            (
+                "hermes", "kanban", "--board", "devteam", "block", task.id,
+                f"card-audit 机械拦截：{'；'.join(item.code for item in findings)}",
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            results.append(
+                {"card": task.id, "status": "error", "reason": codes,
+                 "detail": (proc.stderr or proc.stdout).strip()}
+            )
+        else:
+            results.append(
+                {"card": task.id, "status": "blocked", "reason": codes}
+            )
 
     errors = [item for item in results if item["status"] == "error"]
     if errors:

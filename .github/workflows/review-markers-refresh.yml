@@ -1,0 +1,37 @@
+name: refresh review markers
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: write
+
+jobs:
+  refresh:
+    if: github.event.issue.pull_request != null && github.event.comment != null && contains(github.event.comment.body, 'REVIEW-VERDICT')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Refresh the required check on the PR head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr="${{ github.event.issue.number }}"
+          branch=$(gh pr view "$pr" --json headRefName --jq '.headRefName')
+          if [[ "$branch" != wt/t_* ]]; then
+            echo "非卡分支（$branch），跳过双问 required check 刷新"
+            exit 0
+          fi
+          PYTHONPATH=src python -m team_board.reviewmarkers --pr "$pr" --wait 240

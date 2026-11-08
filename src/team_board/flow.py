@@ -25,6 +25,7 @@ __all__ = [
     "HandoffReport",
     "audit_card",
     "check_handoff",
+    "later_card_overlap_findings",
     "render_card",
     "render_card_json",
     "render_handoff",
@@ -154,6 +155,31 @@ def audit_card(
             Finding("qa-spec-missing", "缺顶格 QA-SPEC: qa（内核建卡也会拒）")
         )
     return CardAuditReport(card_id=card_id, kind="impl", findings=tuple(findings))
+
+
+def later_card_overlap_findings(
+    card_id: str,
+    conflicts: tuple[pathclaim.Conflict, ...],
+    order: dict[str, tuple[int, str]],
+) -> tuple[Finding, ...]:
+    """返回本卡的路径认领冲突 findings；每对冲突一条，只给创建顺序较晚的卡。"""
+
+    findings: list[Finding] = []
+    for conflict in conflicts:
+        if card_id not in conflict.cards:
+            continue
+        other = conflict.card_b if conflict.card_a == card_id else conflict.card_a
+        if order.get(card_id, (0, "")) <= order.get(other, (0, "")):
+            continue
+        findings.append(
+            Finding(
+                "path-claim-conflict",
+                f"PATH-CLAIM 与 {other} 重叠："
+                f"{conflict.path_a} ↔ {conflict.path_b}；"
+                "按创建顺序后到先让，改路径或等前一张卡结单",
+            )
+        )
+    return tuple(findings)
 
 
 def check_handoff(
