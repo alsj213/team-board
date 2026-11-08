@@ -146,7 +146,7 @@ def collect(conn: Any) -> tuple[Candidate, ...]:
         if _pr_from_body(body) is None:
             continue
         events = conn.execute(
-            "SELECT payload FROM task_events "
+            "SELECT payload FROM task_events "  # nosec B608 - 占位符是常量
             f"WHERE task_id = ? AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
             (card, *BLOCKED_KEYS),
         ).fetchall()

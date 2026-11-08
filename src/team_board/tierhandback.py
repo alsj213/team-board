@@ -129,7 +129,7 @@ def collect(conn: sqlite3.Connection) -> tuple[Candidate, ...]:
         if QA_SPEC not in (body or ""):
             continue
         latest = conn.execute(
-            "SELECT e.kind, e.payload, e.run_id, r.profile "
+            "SELECT e.kind, e.payload, e.run_id, r.profile "  # nosec B608 - 占位符是常量
             "  FROM task_events e LEFT JOIN task_runs r ON r.id = e.run_id "
             f" WHERE e.task_id = ? AND e.kind IN ({placeholders}) "
             " ORDER BY e.id DESC LIMIT 1",

@@ -61,10 +61,10 @@ def make_board(
         )
         for run_id, profile in (runs or {}).items():
             conn.execute("INSERT INTO task_runs VALUES (?, ?, ?)", (run_id, CARD, profile))
-        for index, (kind, payload, run_id) in enumerate(events or [], start=1):
+        for index, (kind, payload, event_run_id) in enumerate(events or [], start=1):
             conn.execute(
                 "INSERT INTO task_events VALUES (?, ?, ?, ?, ?)",
-                (index, CARD, kind, payload, run_id),
+                (index, CARD, kind, payload, event_run_id),
             )
         conn.commit()
     finally:
@@ -108,12 +108,13 @@ class TestCollect:
             conn.close()
 
     def test_skips_active_run_or_wrong_owner(self, tmp_path: Path) -> None:
-        for index, kwargs in enumerate((
+        cases: tuple[dict[str, Any], ...] = (
             {"current_run_id": 9},
             {"assignee": "qa"},
             {"status": "running"},
             {"body": "没有签署行\n"},
-        )):
+        )
+        for index, kwargs in enumerate(cases):
             board = make_board(
                 tmp_path / f"b{index}.db",
                 events=[("tier", tier_payload(), 2)],
