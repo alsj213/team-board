@@ -1,33 +1,32 @@
 """团队拓扑聚合：把 ``created_by → assignee`` 的派发关系算成节点/边 payload。
 
-看板网页的「团队拓扑」只消费这一层：谁在图里、谁向谁派过几张卡、谁的层级在哪。
+看板网页的「团队拓扑」只消费这一层：谁在图里、谁向谁派过卡、谁在哪一层。
 数据来源是 ``tasks`` 表出现过的全部名字（**含 archived 卡**），口径与
 ``bots.py`` 名册同源，但图里同时保留 ``created_by`` 一侧——只开卡不接卡的人
 （例如只拆卡的 ``user``）也必须在图上有一个位置。
+
+这是**关系模型，不是历史统计**：边只回答“谁把卡派给谁”，payload 不带卡数、
+不带运行卡清单，也不带卡号。运行态只留一个 ``active: bool``（当前是否有
+running 卡），用于节点是否亮起；计数归独立的统计接口。
 
 口径（逐条都是判据）：
 
 1. 节点集 = 全部卡的 ``assignee`` ∪ ``created_by``；``NULL`` / 空串 / 纯空白跳过
    （``strip() == ""``），``bots.NON_BOT_ASSIGNEES`` 里的哨兵跳过——**精确等值**，
    ``Nobody`` 与 ``nobody`` 不是一回事，前者仍成节点。两侧同口径。
-2. 边集 = (``created_by`` → ``assignee``) 聚合，``cards`` 是卡数；任一侧被第 1 条
-   跳过则该行不成边；自环（``created_by == assignee``）不进边集，只累加到该节点的
-   ``self_cards``。
-3. ``status`` / ``running`` 与 ``bots.bots_payload`` 同口径：该名下有
-   ``status == "running"`` 的卡 → ``bots.STATUS_WORKING``，``running`` 是 running
-   卡数；否则 ``bots.STATUS_IDLE`` / 0。
-4. ``running_cards``：该名下 running 卡按 ``id`` 码位升序，``title`` 走
-   ``fmt.truncate(title or "", model.TITLE_MAX)``。
-5. ``level``：已知名取 :data:`ROLE_LEVEL`；未知名 = 1 + max(已定级且有边指向它的
+2. 边集 = (``created_by`` → ``assignee``) 去重；任一侧被第 1 条跳过则不成边；
+   自环（``created_by == assignee``）不进边集。**边不带 cards 计数。**
+3. ``active``：该名下有 ``status == "running"`` 的卡 → True，否则 False；不输出
+   running 卡数、卡号或标题。
+4. ``level``：已知名取 :data:`ROLE_LEVEL`；未知名 = 1 + max(已定级且有边指向它的
    来源)，无入边者先按 0 级参与计算（链根，之后下游逐跳 +1）；按名字码位升序逐轮
    relax、最多 ``len(nodes)`` 轮，仍定不下来 → 0（有环也不死循环）。
-6. ``display``：已知名取 :data:`ROLE_DISPLAY`；未知名原样输出 ``name``。
-7. 排序：``nodes`` 按 ``(level, name)`` 升序、``edges`` 按 ``(from, to)`` 升序；
-   无自环时 ``self_cards == 0``。
-8. 空输入 → ``{"nodes": [], "edges": []}``。
-9. 同一份卡任意顺序输入 → 逐字节同一 payload（排序与定级都在聚合之后统一做）。
-10. 纯函数：不读时钟 / 环境变量 / 文件 / 数据库，签名里也没有时间参数——同一份
-    ``TopoCard`` 列表永远得到同一个 payload，测试不必冻结时钟。
+5. ``display``：已知名取 :data:`ROLE_DISPLAY`；未知名原样输出 ``name``。
+6. 排序：``nodes`` 按 ``(level, name)`` 升序、``edges`` 按 ``(from, to)`` 升序。
+7. 空输入 → ``{"nodes": [], "edges": []}``。
+8. 同一份卡任意顺序输入 → 逐字节同一 payload（排序与定级都在聚合之后统一做）。
+9. 纯函数：不读时钟 / 环境变量 / 文件 / 数据库，签名里也没有时间参数——同一份
+   ``TopoCard`` 列表永远得到同一个 payload，测试不必冻结时钟。
 """
 
 from __future__ import annotations
@@ -36,8 +35,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import bots
-from .fmt import truncate
-from .model import TITLE_MAX
 
 #: 角色层级（越小越高）：纵坐标常量，只在这里定义一份
 ROLE_LEVEL: dict[str, int] = {
@@ -129,14 +126,13 @@ def _resolve_levels(names: list[str], sources: dict[str, set[str]]) -> dict[str,
 def topology_payload(cards: list[TopoCard]) -> dict[str, Any]:
     """把 ``cards`` 聚合成 ``{"nodes": [...], "edges": [...]}``（规则见模块 docstring）。
 
-    - 一次遍历同时登记节点、自环计数、running 数与未去重的边计数；
+    - 一次遍历登记节点、活跃状态与去重后的边；
     - 排序与定级在聚合之后统一做，所以 payload 与 ``cards`` 的输入顺序无关；
-    - 名字原样输出（不 strip、不折叠大小写），payload 里看到的就是库里存的那个。
+    - 名字原样输出（不 strip、不折叠大小写），payload 里看到的就是库里存的那个；
+    - 不输出任何计数/卡号/卡标题——这是团队关系，不是历史报表。
     """
-    self_cards: dict[str, int] = {}
-    running: dict[str, int] = {}
-    running_cards: dict[str, list[TopoCard]] = {}
-    edge_counts: dict[tuple[str, str], int] = {}
+    active: set[str] = set()
+    edges: set[tuple[str, str]] = set()
     sources: dict[str, set[str]] = {}
     names: set[str] = set()
 
@@ -148,43 +144,28 @@ def topology_payload(cards: list[TopoCard]) -> dict[str, Any]:
         if creator:
             names.add(creator)
 
-        if creator and assignee:
-            if creator == assignee:
-                self_cards[creator] = self_cards.get(creator, 0) + 1
-            else:
-                key = (creator, assignee)
-                edge_counts[key] = edge_counts.get(key, 0) + 1
-                sources.setdefault(assignee, set()).add(creator)
+        if creator and assignee and creator != assignee:
+            edges.add((creator, assignee))
+            sources.setdefault(assignee, set()).add(creator)
 
         if assignee and card.status == _RUNNING_STATUS:
-            running[assignee] = running.get(assignee, 0) + 1
-            running_cards.setdefault(assignee, []).append(card)
+            active.add(assignee)
 
     ordered_names = sorted(names)
     levels = _resolve_levels(ordered_names, sources)
 
-    nodes: list[dict[str, Any]] = []
-    for name in ordered_names:
-        count = running.get(name, 0)
-        cards_of_name = sorted(running_cards.get(name, []), key=lambda card: card.id)
-        nodes.append(
-            {
-                "name": name,
-                "display": ROLE_DISPLAY.get(name, name),
-                "level": levels[name],
-                "status": bots.STATUS_WORKING if count else bots.STATUS_IDLE,
-                "running": count,
-                "self_cards": self_cards.get(name, 0),
-                "running_cards": [
-                    {"id": card.id, "title": truncate(card.title or "", TITLE_MAX)}
-                    for card in cards_of_name
-                ],
-            }
-        )
+    nodes: list[dict[str, Any]] = [
+        {
+            "name": name,
+            "display": ROLE_DISPLAY.get(name, name),
+            "level": levels[name],
+            "active": name in active,
+        }
+        for name in ordered_names
+    ]
     nodes.sort(key=lambda node: (node["level"], node["name"]))
 
-    edges: list[dict[str, Any]] = [
-        {"from": src, "to": dst, "cards": count}
-        for (src, dst), count in sorted(edge_counts.items())
-    ]
-    return {"nodes": nodes, "edges": edges}
+    return {
+        "nodes": nodes,
+        "edges": [{"from": src, "to": dst} for src, dst in sorted(edges)],
+    }

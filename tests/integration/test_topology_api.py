@@ -176,19 +176,9 @@ def test_schema_keys_and_order(topo_board: Path) -> None:
     assert list(payload) == ["nodes", "edges"]
     assert payload["nodes"] and payload["edges"]
     for node in payload["nodes"]:
-        assert list(node) == [
-            "name",
-            "display",
-            "level",
-            "status",
-            "running",
-            "self_cards",
-            "running_cards",
-        ]
-        for card in node["running_cards"]:
-            assert list(card) == ["id", "title"]
+        assert list(node) == ["name", "display", "level", "active"]
     for edge in payload["edges"]:
-        assert list(edge) == ["from", "to", "cards"]
+        assert list(edge) == ["from", "to"]
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +198,7 @@ def test_only_topo_columns(tmp_path: Path) -> None:
         bots_status, _, bots_body = _http(base, "/api/bots")
 
     assert status == 200
-    assert json.loads(body)["edges"] == [{"from": "user", "to": "pm", "cards": 1}]
+    assert json.loads(body)["edges"] == [{"from": "user", "to": "pm"}]
     assert bots_status == 500
     assert json.loads(bots_body)["error"].startswith("source_unavailable: ")
 

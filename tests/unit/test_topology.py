@@ -1,11 +1,10 @@
 """``topology.py`` 的单元测试：字段形状、角色表、节点/边口径、定级、排序、纯函数。
 
 用例名即验收判据的 ``-k`` 过滤器（``topo_card_fields`` / ``role_tables`` /
-``node_union`` / ``nobody`` / ``blank_assignee`` / ``self_cards`` /
-``running_count`` / ``running_cards`` / ``level_cycle`` / ``unknown_bot`` /
-``ordering`` / ``empty_payload`` / ``deterministic`` / ``unknown_root_chain`` /
-``edgeless`` / ``unknown_cycle`` / ``known_anchor``），改名会直接让判据跑空
-（pytest -k 无匹配 → rc 5）。
+``node_union`` / ``nobody`` / ``blank_assignee`` / ``self_loops`` / ``active`` /
+``history`` / ``level_cycle`` / ``unknown_bot`` / ``ordering`` / ``empty_payload``
+/ ``deterministic`` / ``unknown_root_chain`` / ``edgeless`` / ``unknown_cycle`` /
+``known_anchor``），改名会直接让判据跑空（pytest -k 无匹配 → rc 5）。
 
 卡一律用 :func:`_card` 现造，不读库、不冻结时钟 —— 本层是纯函数。
 """
@@ -19,9 +18,6 @@ from typing import cast
 
 import pytest
 
-from team_board import bots
-from team_board.fmt import ELLIPSIS, display_width
-from team_board.model import TITLE_MAX
 from team_board.topology import ROLE_DISPLAY, ROLE_LEVEL, TopoCard, topology_payload
 
 _UNSET: object = object()
@@ -163,7 +159,7 @@ def test_nobody_skipped_on_both_sides_exact_match() -> None:
     assert "nobody" not in _names(payload)
     assert "Nobody" in _names(payload)
     assert set(_names(payload)) == {"pm", "Nobody"}
-    assert _edges(payload) == [{"from": "pm", "to": "Nobody", "cards": 1}]
+    assert _edges(payload) == [{"from": "pm", "to": "Nobody"}]
 
 
 # --------------------------------------------------------------------------- #
@@ -183,10 +179,7 @@ def test_blank_assignee_makes_no_edge_but_creator_still_a_node() -> None:
 
     assert _edges(payload) == []
     assert _names(payload) == ["pm"]
-    assert _by_name(payload)["pm"]["self_cards"] == 0
-    # assignee 被跳过的卡也不该给任何人记 running
-    assert _by_name(payload)["pm"]["running"] == 0
-    assert _by_name(payload)["pm"]["status"] == bots.STATUS_IDLE
+    assert _by_name(payload)["pm"]["active"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -194,8 +187,8 @@ def test_blank_assignee_makes_no_edge_but_creator_still_a_node() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_self_cards_counted_but_never_an_edge() -> None:
-    """pm→pm×3 → 不进 edges，``self_cards == 3``；无自环的节点是 0。"""
+def test_self_loops_never_become_edges_and_carry_no_counts() -> None:
+    """pm→pm×3 → 不进 edges，也不留自环计数；running 只体现为 active。"""
     cards = [
         _card("t_1", assignee="pm", created_by="pm", status="running"),
         _card("t_2", assignee="pm", created_by="pm"),
@@ -206,10 +199,10 @@ def test_self_cards_counted_but_never_an_edge() -> None:
     payload = topology_payload(cards)
 
     assert _edges(payload) == []
-    assert all(edge["from"] != edge["to"] for edge in _edges(payload))
     by_name = _by_name(payload)
-    assert by_name["pm"]["self_cards"] == 3
-    assert by_name["qa"]["self_cards"] == 0
+    assert by_name["pm"]["active"] is True
+    assert by_name["qa"]["active"] is False
+    assert set(by_name["pm"]) == {"name", "display", "level", "active"}
 
 
 # --------------------------------------------------------------------------- #
@@ -217,8 +210,8 @@ def test_self_cards_counted_but_never_an_edge() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_running_count_and_status_follow_bots_payload() -> None:
-    """有 running 卡 → ``working`` 且 ``running`` = 卡数；没有 → ``idle`` / 0。"""
+def test_active_is_boolean_and_has_no_counts() -> None:
+    """有 running 卡 → active=True；没有 → False；不输出 running/卡明细。"""
     cards = [
         _card("t_run_1", assignee="engineer", status="running"),
         _card("t_run_2", assignee="engineer", status="running"),
@@ -228,44 +221,34 @@ def test_running_count_and_status_follow_bots_payload() -> None:
 
     by_name = _by_name(topology_payload(cards))
 
-    assert by_name["engineer"]["status"] == bots.STATUS_WORKING
-    assert by_name["engineer"]["status"] == "working"
-    assert by_name["engineer"]["running"] == 2
-    assert isinstance(by_name["engineer"]["running"], int)
-    assert by_name["qa"]["status"] == bots.STATUS_IDLE
-    assert by_name["qa"]["status"] == "idle"
-    assert by_name["qa"]["running"] == 0
+    assert by_name["engineer"]["active"] is True
+    assert by_name["qa"]["active"] is False
+    for node in by_name.values():
+        assert set(node) == {"name", "display", "level", "active"}
 
 
 # --------------------------------------------------------------------------- #
-# E1-9 running_cards 排序与截断
+# E1-9 关系 payload 不带历史明细
 # --------------------------------------------------------------------------- #
 
 
-def test_running_cards_sorted_by_id_and_title_truncated() -> None:
-    """按 ``id`` 码位升序；超长标题以 ``ELLIPSIS`` 结尾且宽度 ≤ ``TITLE_MAX``。"""
-    long_title = "中文长标题截断验证" * 6
+def test_payload_has_no_history_fields() -> None:
+    """节点无 running/running_cards/self_cards；边无 cards；关系只留 from/to。"""
     cards = [
         _card("t_zz", assignee="engineer", status="running", title="后一张"),
-        _card("t_aa", assignee="engineer", status="running", title=long_title),
-        _card("t_mm", assignee="engineer", status="running", title=None),
+        _card("t_aa", assignee="engineer", status="running", title="前一张"),
         _card("t_idle", assignee="engineer", status="done", title="不在清单里"),
     ]
 
-    engineer = _by_name(topology_payload(cards))["engineer"]
-    running_cards = engineer["running_cards"]
-    assert isinstance(running_cards, list)
+    payload = topology_payload(cards)
 
-    assert [row["id"] for row in running_cards] == ["t_aa", "t_mm", "t_zz"]
-    assert list(running_cards[0]) == ["id", "title"]
-
-    truncated = cast(str, running_cards[0]["title"])
-    assert truncated.endswith(ELLIPSIS)
-    assert display_width(truncated) <= TITLE_MAX
-    # title 为 NULL 的卡：``title or ""`` → 空串
-    assert running_cards[1]["title"] == ""
-    # 未在跑的卡不进清单
-    assert "t_idle" not in [row["id"] for row in running_cards]
+    for node in _nodes(payload):
+        assert list(node) == ["name", "display", "level", "active"]
+        assert "running" not in node
+        assert "running_cards" not in node
+        assert "self_cards" not in node
+    for edge in _edges(payload):
+        assert list(edge) == ["from", "to"]
 
 
 # --------------------------------------------------------------------------- #
