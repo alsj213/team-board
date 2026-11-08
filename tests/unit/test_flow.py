@@ -111,6 +111,13 @@ class TestPathOverlap:
         order = {"t_aaaaaaaa": (1, "t_aaaaaaaa"), "t_bbbbbbbb": (2, "t_bbbbbbbb")}
         assert flow.later_card_overlap_findings("t_cccccccc", self._conflicts(), order) == ()
 
+    def test_active_card_wins_even_when_created_later(self) -> None:
+        order = {"t_aaaaaaaa": (1, "t_aaaaaaaa"), "t_bbbbbbbb": (2, "t_bbbbbbbb")}
+        findings = flow.later_card_overlap_findings(
+            "t_aaaaaaaa", self._conflicts(), order, frozenset({"t_bbbbbbbb"})
+        )
+        assert [item.code for item in findings] == ["path-claim-conflict"]
+
 
 class TestHandoff:
     def test_pass(self) -> None:

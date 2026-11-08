@@ -14,3 +14,7 @@ ts	phase	decision	why	evidence	result
 2026-11-08T06:50:26Z	unit2	review-markers-refresh workflow 静态解析通过，reviewmarkers 18 个单测通过；运行时触发等合并后在 wt 卡 PR 上验证	issue_comment 工作流无法在合并前对默认分支触发，只能先验证 YAML 与 helper	.github/workflows/review-markers-refresh.yml; tests/unit/test_reviewmarkers.py 18 passed	static VERIFIED, runtime open
 2026-11-08T06:50:26Z	unit4	删除 card-template 的合并状态叙述与未合标记，重装后 --check rc=0	状态括注会随 PR 状态腐烂；文件路径和命令足够	docs/card-template.md; install-card-template.sh --check rc=0; sha256 065fb380	VERIFIED
 2026-11-08T06:52:38Z	verify	最终全量 2770 passed, 2 skipped；ruff/mypy/bandit 全绿；worktree 定向 53 passed	提交前在真实工作树复跑，不靠早先结果	pytest -q exit 0; ruff/mypy/bandit rc=0; worktree tests 53 passed	VERIFIED
+2026-11-08T07:49:51Z	ship	PR #123 把 merge-audit 基线从 8cd790c 推进到 4d02196，4d02196 作为历史例外不再判定	PR #122 继承历史红，base 侧基线不变时无法通过；这是用户批准的一次性例外	PR #123; c1e4a0f; merge-audit --rev origin/main rc=0	VERIFIED
+2026-11-08T07:49:51Z	ship	PR #124 把 f1689e3 合入 main 28986c7；tests workflow 8/8 绿，refresh job 在非标记评论上 skipped	最终交付；refresh 只在含 REVIEW-VERDICT 的评论上执行	PR #124; 28986c7; check-runs 8 success	VERIFIED
+2026-11-08T07:49:51Z	verify	以最终全量 2770 passed, 2 skipped 为准；早先 90 passed 只是局部集合，不作为总证据	跨模型审查指出局部数字不可复现，补一条总证据	pytest -q exit 0; 2770 passed, 2 skipped	VERIFIED
+2026-11-08T07:49:51Z	review	cross-model 审查后补 checks:read / statuses:read 与评论者 OWNER/MEMBER/COLLABORATOR 限制；profile 改动路径明确为 ~/.hermes	gh pr checks 需要 checks:read；issue_comment 可触发 actions:write，需限制评论者	PR #125; .github/workflows/review-markers-refresh.yml	open
