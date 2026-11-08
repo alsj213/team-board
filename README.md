@@ -1589,6 +1589,8 @@ QA-SPEC: qa
 合并卡（标题命中合并语义 **且** 正文首行 `PR-CLAIM: #<n>`）豁免实现卡契约。
 `--sweep` 扫描 `ready` / `todo` 卡；带 `--apply` 时对缺契约的卡调用
 `hermes kanban block`（reason 以 `card-audit 机械拦截：` 开头），缺口派工。
+`--sweep` 还会用 PATH-CLAIM 判两张就绪卡的改动面是否相交。同一路径只 block
+后创建的卡，先到者继续派工；冲突卡报 `path-claim-conflict`。
 建议用 systemd timer 每 30 秒跑一次，作为 dispatcher 前的机械闸门。
 只带首行 `PR-CLAIM` 的实现卡照常受检（`kanban_claim_pr` 会给任何 PR 卡补这一行）。
 标题命中合并语义但首行没有认领行 → `[pr-claim-missing]` rc1。

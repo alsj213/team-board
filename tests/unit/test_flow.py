@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from team_board import flow
+from team_board import flow, pathclaim
 
 CARD = "t_1234abcd"
 HEAD = "a" * 40
@@ -86,6 +86,30 @@ class TestCardAudit:
         assert flow.render_card(report).splitlines()[-1] == "结论: 通过"
         payload = json.loads(flow.render_card_json(report))
         assert payload["ok"] is True
+
+
+class TestPathOverlap:
+    def _conflicts(self) -> tuple[pathclaim.Conflict, ...]:
+        claims = (
+            pathclaim.Claim(card_id="t_aaaaaaaa", status="ready", assignee="engineer", paths=("src/a.py",)),
+            pathclaim.Claim(card_id="t_bbbbbbbb", status="ready", assignee="engineer", paths=("src/a.py",)),
+        )
+        return pathclaim.audit(claims).conflicts
+
+    def test_later_card_gets_the_conflict(self) -> None:
+        order = {"t_aaaaaaaa": (1, "t_aaaaaaaa"), "t_bbbbbbbb": (2, "t_bbbbbbbb")}
+        findings = flow.later_card_overlap_findings("t_bbbbbbbb", self._conflicts(), order)
+        assert [item.code for item in findings] == ["path-claim-conflict"]
+        assert "t_aaaaaaaa" in findings[0].message
+        assert "src/a.py" in findings[0].message
+
+    def test_earlier_card_does_not_get_the_conflict(self) -> None:
+        order = {"t_aaaaaaaa": (1, "t_aaaaaaaa"), "t_bbbbbbbb": (2, "t_bbbbbbbb")}
+        assert flow.later_card_overlap_findings("t_aaaaaaaa", self._conflicts(), order) == ()
+
+    def test_unrelated_card_does_not_get_the_conflict(self) -> None:
+        order = {"t_aaaaaaaa": (1, "t_aaaaaaaa"), "t_bbbbbbbb": (2, "t_bbbbbbbb")}
+        assert flow.later_card_overlap_findings("t_cccccccc", self._conflicts(), order) == ()
 
 
 class TestHandoff:
