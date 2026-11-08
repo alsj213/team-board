@@ -62,11 +62,11 @@ def test_markup_position() -> None:
 
 
 def test_node_markup() -> None:
-    """节点：running>0 才 active，否则 idle（CSS opacity .45）；节点内只剩 .name。"""
+    """节点：active=true 才亮，否则 idle（CSS opacity .45）；节点内只剩 .name。"""
     html = _page()
     body = _render_body(html)
 
-    assert 'make("div", running > 0 ? "topo-node active" : "topo-node idle")' in body
+    assert 'make("div", active ? "topo-node active" : "topo-node idle")' in body
     assert 'make("span", "name", node.display)' in body
     # 团队关系图只画人：节点里没有在跑数、也没有卡 id
     assert 'make("span", "state"' not in body
@@ -140,16 +140,17 @@ def test_empty_state() -> None:
 
 
 def test_all_idle() -> None:
-    """全空闲：图照画、所有节点落 idle、无报错行（class 只由 running>0 决定）。"""
+    """全空闲：图照画、所有节点落 idle、无报错行（class 只由 active 决定）。"""
     body = _render_body(_page())
 
     assert body.count('"topo-node active"') == 1
     assert body.count('"topo-node idle"') == 1
-    assert 'make("div", running > 0 ? "topo-node active" : "topo-node idle")' in body
+    assert 'make("div", active ? "topo-node active" : "topo-node idle")' in body
     assert "graph.replaceChildren.apply(graph, lines.concat(boxes))" in body
     assert "showBotsError" not in body
-    # active 的条件只有 running，没有第二条按 status 涂亮的路径
-    assert "node.status === \"working\"" not in body
+    # 节点只消费关系 payload 的 active，不再读 running 计数或 card status
+    assert "node.running" not in body
+    assert "node.status ===" not in body
 
 
 def test_required_snippets() -> None:
@@ -167,6 +168,7 @@ def test_required_snippets() -> None:
         "TOPO_LAYOUT",
         '"topo-node active"',
         '"topo-node idle"',
+        "const active = node.active === true;",
         "const TOPO_LAYOUT = { nodeW: 148, nodeH: 52, gapX: 28, gapY: 86, padX: 16, padY: 12 };",
     ):
         assert needle in html, needle

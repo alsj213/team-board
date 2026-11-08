@@ -108,7 +108,7 @@ def test_load_topo_cards_missing_created_by_column_raises_board_error(tmp_path: 
 
 
 def test_load_topo_cards_feeds_payload_end_to_end(topo_board: Path) -> None:
-    """数据层 + 聚合层串起来：节点集是 assignee ∪ created_by，边按卡数聚合。"""
+    """数据层 + 聚合层串起来：节点集是 assignee ∪ created_by，边按派发关系去重。"""
     conn = db.connect(topo_board)
     try:
         payload = topology_payload(db.load_topo_cards(conn))
@@ -117,15 +117,14 @@ def test_load_topo_cards_feeds_payload_end_to_end(topo_board: Path) -> None:
 
     names = [node["name"] for node in payload["nodes"]]
     assert set(names) == {"user", "pm", "engineer", "qa", "chief"}
-    assert {"from": "user", "to": "pm", "cards": 1} in payload["edges"]
-    assert {"from": "pm", "to": "engineer", "cards": 1} in payload["edges"]
+    assert {"from": "user", "to": "pm"} in payload["edges"]
+    assert {"from": "pm", "to": "engineer"} in payload["edges"]
     by_name = {node["name"]: node for node in payload["nodes"]}
-    assert by_name["pm"]["self_cards"] == 1
-    # t_a 是 pm 名下的 running 卡 → working / 1；t_b 只是 review → idle / 0
-    assert by_name["pm"]["status"] == "working"
-    assert by_name["pm"]["running"] == 1
-    assert by_name["engineer"]["status"] == "idle"
-    assert by_name["engineer"]["running"] == 0
+    # t_a 是 pm 名下的 running 卡 → active；t_b 只是 review → 不亮
+    assert by_name["pm"]["active"] is True
+    assert by_name["engineer"]["active"] is False
+    assert set(by_name["pm"]) == {"name", "display", "level", "active"}
+    assert all("cards" not in edge for edge in payload["edges"])
 
 
 def test_load_topo_cards_is_readonly(topo_board: Path) -> None:

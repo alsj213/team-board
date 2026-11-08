@@ -529,11 +529,11 @@ function renderTopology(data) {
     lines.push(line);
   });
 
-  // 节点：running > 0 → active（亮起），否则 idle（CSS opacity .45）
+  // 节点：active=true → 亮起，否则 idle（CSS opacity .45）；不写运行数/卡号
   const boxes = nodes.map(function (node) {
     const spot = spots[node.name];
-    const running = node.running || 0;
-    const box = make("div", running > 0 ? "topo-node active" : "topo-node idle");
+    const active = node.active === true;
+    const box = make("div", active ? "topo-node active" : "topo-node idle");
     box.dataset.name = node.name;
     box.style.left = spot.left + "px";
     box.style.top = spot.top + "px";
@@ -657,8 +657,8 @@ def index_html() -> str:
       失败只写 ``#bots-error`` 并保留上一帧；
     - ``#view-bots`` 里 ``#bots-table`` 之后是只读拓扑图 ``#topology``：节点按
       ``level`` 分层排布、边是 ``created_by`` → ``assignee`` 的派发关系、不标卡数，
-      有 running 卡的节点亮起（运行态只有 active/idle）；页面上不列卡 id，也不列
-      运行卡清单，只画团队关系；只用 ``/api/topology``，失败同样复用
+      节点 ``active=true``（当前有 running 卡）亮起（运行态只有 active/idle）；
+      页面上不列卡 id，也不列运行卡清单，只画团队关系；只用 ``/api/topology``，失败同样复用
       ``#bots-error`` 并保留上一帧，节点上不挂任何交互监听；
     - 右上角 ``#autorefresh`` 复选框控制定时刷新（取消即 clearInterval）；
     - 四列 ``section.col[data-col]`` 的 ``<h2>`` 文本就是列名小写；
