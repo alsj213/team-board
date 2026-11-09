@@ -1,0 +1,194 @@
+{
+  "files": [
+    {
+      "source": "ops/playbook.md",
+      "target": "~/.hermes/profiles/ops/workspace/playbook.md",
+      "mode": "0664"
+    },
+    {
+      "source": "ops/scripts/ops/batch_gate_audit.py",
+      "target": "~/.hermes/profiles/ops/scripts/batch_gate_audit.py",
+      "mode": "0664"
+    },
+    {
+      "source": "ops/scripts/ops/core_patch_check.py",
+      "target": "~/.hermes/profiles/ops/scripts/core_patch_check.py",
+      "mode": "0664"
+    },
+    {
+      "source": "ops/scripts/ops/daily_metrics.py",
+      "target": "~/.hermes/profiles/ops/scripts/daily_metrics.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/guard_health.py",
+      "target": "~/.hermes/profiles/ops/scripts/guard_health.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/guard_run.sh",
+      "target": "~/.hermes/profiles/ops/scripts/guard_run.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/kanban_autoclose.py",
+      "target": "~/.hermes/profiles/ops/scripts/kanban_autoclose.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/kanban_autoclose_run.sh",
+      "target": "~/.hermes/profiles/ops/scripts/kanban_autoclose_run.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/kanban_status.py",
+      "target": "~/.hermes/profiles/ops/scripts/kanban_status.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/kanban_unstick.py",
+      "target": "~/.hermes/profiles/ops/scripts/kanban_unstick.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/patrol_quick.py",
+      "target": "~/.hermes/profiles/ops/scripts/patrol_quick.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/patrol_quick_guard.sh",
+      "target": "~/.hermes/profiles/ops/scripts/patrol_quick_guard.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/pause_dispatch_once.sh",
+      "target": "~/.hermes/profiles/ops/scripts/pause_dispatch_once.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/pr_merged_reaper.py",
+      "target": "~/.hermes/profiles/ops/scripts/pr_merged_reaper.py",
+      "mode": "0755"
+    },
+    {
+      "source": "ops/scripts/ops/pr_orphan_autoclose.py",
+      "target": "~/.hermes/profiles/ops/scripts/pr_orphan_autoclose.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/pr_orphan_check.sh",
+      "target": "~/.hermes/profiles/ops/scripts/pr_orphan_check.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/selfheal_guard.sh",
+      "target": "~/.hermes/profiles/ops/scripts/selfheal_guard.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/stall_alert.py",
+      "target": "~/.hermes/profiles/ops/scripts/stall_alert.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/stall_alert.sh",
+      "target": "~/.hermes/profiles/ops/scripts/stall_alert.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/stall_alert_guard.sh",
+      "target": "~/.hermes/profiles/ops/scripts/stall_alert_guard.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/ops/tb_serve_watchdog.sh",
+      "target": "~/.hermes/profiles/ops/scripts/tb_serve_watchdog.sh",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/paimeng/block_delivery.py",
+      "target": "~/.hermes/profiles/paimeng/scripts/block_delivery.py",
+      "mode": "0755"
+    },
+    {
+      "source": "ops/scripts/paimeng/kanban_autosubscribe.py",
+      "target": "~/.hermes/profiles/paimeng/scripts/kanban_autosubscribe.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/paimeng/kanban_daily_dump.py",
+      "target": "~/.hermes/profiles/paimeng/scripts/kanban_daily_dump.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/scripts/paimeng/md_to_feishu_doc.py",
+      "target": "~/.hermes/profiles/paimeng/scripts/md_to_feishu_doc.py",
+      "mode": "0664"
+    },
+    {
+      "source": "ops/scripts/paimeng/pm_touched_watch.py",
+      "target": "~/.hermes/profiles/paimeng/scripts/pm_touched_watch.py",
+      "mode": "0775"
+    },
+    {
+      "source": "ops/systemd/team-board-card-audit-sweep.service",
+      "target": "~/.config/systemd/user/team-board-card-audit-sweep.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-card-audit-sweep.timer",
+      "target": "~/.config/systemd/user/team-board-card-audit-sweep.timer",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-merge-card-sweep.service",
+      "target": "~/.config/systemd/user/team-board-merge-card-sweep.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-merge-card-sweep.timer",
+      "target": "~/.config/systemd/user/team-board-merge-card-sweep.timer",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-tier-handback.service",
+      "target": "~/.config/systemd/user/team-board-tier-handback.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-tier-handback.timer",
+      "target": "~/.config/systemd/user/team-board-tier-handback.timer",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-tip-broadcast.service",
+      "target": "~/.config/systemd/user/team-board-tip-broadcast.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-tip-broadcast.timer",
+      "target": "~/.config/systemd/user/team-board-tip-broadcast.timer",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-unblock-evidence.service",
+      "target": "~/.config/systemd/user/team-board-unblock-evidence.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-unblock-evidence.timer",
+      "target": "~/.config/systemd/user/team-board-unblock-evidence.timer",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-unblock-merged.service",
+      "target": "~/.config/systemd/user/team-board-unblock-merged.service",
+      "mode": "0644"
+    },
+    {
+      "source": "ops/systemd/team-board-unblock-merged.timer",
+      "target": "~/.config/systemd/user/team-board-unblock-merged.timer",
+      "mode": "0644"
+    }
+  ]
+}

@@ -59,6 +59,7 @@ EXPECTED_SUBCOMMANDS = (
     "merge-owner-audit",
     "verify-batch",
     "merge-train",
+    "mgmt",
     "serve",
 )
 
@@ -86,6 +87,7 @@ CN_DIGITS = {
     24: "二十四",
     25: "二十五",
     26: "二十六",
+    27: "二十七",
 }
 
 

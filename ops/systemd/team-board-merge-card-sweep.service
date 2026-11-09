@@ -1,0 +1,14 @@
+[Unit]
+Description=team-board merge-card sweep (auto-create repo merge cards for done cards)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/liu/project/team-board
+Environment=PATH=/home/liu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy PYTHONPATH=/home/liu/project/team-board/src /home/liu/project/team-board/.venv/bin/python -m team_board.cli merge-card --sweep --limit 2 --repo /home/liu/project/team-board --db /home/liu/.hermes/kanban/boards/devteam/kanban.db
+TimeoutStartSec=180
+TimeoutStopSec=15
+KillMode=control-group
+Nice=10

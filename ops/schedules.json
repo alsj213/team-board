@@ -1,0 +1,165 @@
+{
+  "crontab": [
+    {
+      "guard": "web_watchdog",
+      "period": 2,
+      "script": "tb_serve_watchdog.sh",
+      "args": []
+    },
+    {
+      "guard": "unstick",
+      "period": 5,
+      "script": "kanban_unstick.py",
+      "args": [
+        "--apply"
+      ]
+    },
+    {
+      "guard": "orphan_autoclose",
+      "period": 30,
+      "script": "pr_orphan_autoclose.py",
+      "args": [
+        "--apply"
+      ]
+    },
+    {
+      "guard": "orphan_check",
+      "period": 120,
+      "script": "pr_orphan_check.sh",
+      "args": []
+    },
+    {
+      "guard": "guard_health",
+      "period": 10,
+      "script": "guard_health.py",
+      "args": [
+        "--strict"
+      ]
+    },
+    {
+      "guard": "daily_metrics",
+      "period": 1440,
+      "script": "daily_metrics.py",
+      "args": []
+    },
+    {
+      "guard": "core_patch",
+      "period": 1440,
+      "script": "core_patch_check.py",
+      "args": []
+    },
+    {
+      "guard": "daily_metrics_weekly",
+      "period": 10080,
+      "script": "daily_metrics.py",
+      "args": [
+        "--weekly"
+      ]
+    },
+    {
+      "guard": "merged_reaper",
+      "period": 10,
+      "script": "pr_merged_reaper.py",
+      "args": [
+        "--apply"
+      ]
+    },
+    {
+      "guard": "mgmt_plane",
+      "period": 1440,
+      "script": "team-board",
+      "args": [
+        "mgmt",
+        "check",
+        "--root",
+        "/home/liu/project/team-board"
+      ]
+    }
+  ],
+  "systemd_timers": [
+    {
+      "name": "team-board-card-audit-sweep",
+      "enabled": true
+    },
+    {
+      "name": "team-board-merge-card-sweep",
+      "enabled": true
+    },
+    {
+      "name": "team-board-tier-handback",
+      "enabled": true
+    },
+    {
+      "name": "team-board-tip-broadcast",
+      "enabled": true
+    },
+    {
+      "name": "team-board-unblock-evidence",
+      "enabled": true
+    },
+    {
+      "name": "team-board-unblock-merged",
+      "enabled": true
+    }
+  ],
+  "hermes_jobs": {
+    "ops": [
+      {
+        "name": "每日巡检验复",
+        "schedule": "40 7 * * *",
+        "script": null,
+        "enabled": false
+      },
+      {
+        "name": "自检-定时器",
+        "schedule": "48 12 * * *",
+        "script": null,
+        "enabled": false
+      },
+      {
+        "name": "巡检-两时段（01:10/12:10）",
+        "schedule": "10 1,12 * * *",
+        "script": null,
+        "enabled": false
+      },
+      {
+        "name": "看板自愈-自动关父卡+滞留标记",
+        "schedule": "every 2m",
+        "script": "selfheal_guard.sh",
+        "enabled": true
+      },
+      {
+        "name": "卡死告警（超2小时静默）",
+        "schedule": "every 10m",
+        "script": "stall_alert_guard.sh",
+        "enabled": true
+      },
+      {
+        "name": "巡检快检（SQL 六条，命中投 ops）",
+        "schedule": "40 * * * *",
+        "script": "patrol_quick_guard.sh",
+        "enabled": true
+      }
+    ],
+    "paimeng": [
+      {
+        "name": "kanban 通知订阅守夜",
+        "schedule": "30 0,2,4,6 * * *",
+        "script": "kanban_autosubscribe.py",
+        "enabled": false
+      },
+      {
+        "name": "晨间团队简报",
+        "schedule": "20 8 * * *",
+        "script": "kanban_daily_dump.py",
+        "enabled": true
+      },
+      {
+        "name": "R8-4 执行者证据告警（pm 触碰生产代码）",
+        "schedule": "20 1,7,12,18 * * *",
+        "script": "pm_touched_watch.py",
+        "enabled": true
+      }
+    ]
+  }
+}
