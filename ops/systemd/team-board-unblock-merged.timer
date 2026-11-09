@@ -1,0 +1,11 @@
+[Unit]
+Description=Run team-board unblock-merged every 3 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

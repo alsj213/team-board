@@ -223,6 +223,7 @@ from . import (
     mergecard,
     mergeowner,
     merges,
+    mgmt,
     model,
     outputaudit,
     pathclaim,
@@ -340,10 +341,10 @@ def _parse_bind(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """建 CLI 前端：prog=team-board，共**二十六个**子命令（个数以
+    """建 CLI 前端：prog=team-board，共**二十七个**子命令（个数以
     ``len(build_parser()._subparsers._group_actions[0].choices)`` 实测为准，
     不手数；``tests/integration/test_web_server.py`` 的 ``EXPECTED_SUBCOMMANDS``
-    与 README 的「共二十六个子命令」同源）。
+    与 README 的「共二十七个子命令」同源）。
 
     - ``list`` / ``summary`` / ``member`` / ``export``：共享 ``--db`` / ``--now``
       （``summary`` 另有 ``--date``，``member`` 另有位置参数 ``name``）；
@@ -387,6 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
       环境错误），吃 ``--plan`` / ``--repo`` / ``--dry-run`` / ``--log-dir`` /
       ``--keep-worktrees``；stdout 只回摘要，全量输出落
       ``<log-dir>/batch-<batch_id>.log``；
+    - ``mgmt``：``check`` 比对仓库 ``ops/`` 与安装件、crontab、systemd timer、
+      hermes cron 清单（0 一致 / 1 有漂移 / 2 环境错误）；``install`` 从仓库写
+      安装件；``capture`` 反向写回仓库；三者都吃 ``--root`` / ``--home``；
     - ``serve``：只认 ``--db`` / ``--port`` / ``--bind``，**没有** ``--now``
       （快照时刻取服务进程的真实时钟，``web.make_server`` 的 clock 不用 CLI 传）。
     """
@@ -1405,6 +1409,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="以 JSON 输出每一步结果",
     )
 
+    mgmt_cmd = subparsers.add_parser(
+        "mgmt", help="管理面漂移检查与安装（唯一源在仓库 ops/）"
+    )
+    mgmt_sub = mgmt_cmd.add_subparsers(dest="mgmt_command", required=True)
+    for name, help_text in (
+        ("check", "比对源与安装件、crontab、timer、hermes cron 清单"),
+        ("install", "从仓库安装到 ~/.hermes 与 systemd 目录"),
+        ("capture", "把安装件反向写回仓库"),
+    ):
+        sub = mgmt_sub.add_parser(name, help=help_text)
+        sub.add_argument(
+            "--root",
+            default=None,
+            metavar="PATH",
+            help="仓库根（默认 TEAM_BOARD_ROOT 或从包位置反推）",
+        )
+        sub.add_argument(
+            "--home",
+            default=None,
+            metavar="PATH",
+            help="目标根（默认当前用户 home；测试或多用户安装时用）",
+        )
+        if name == "check":
+            mode = sub.add_mutually_exclusive_group()
+            mode.add_argument("--files-only", action="store_true", help="只查文件")
+            mode.add_argument("--schedules-only", action="store_true", help="只查计划清单")
+            sub.add_argument("--json", action="store_true", help="单行 JSON 输出")
+        elif name == "install":
+            sub.add_argument(
+                "--force", action="store_true", help="目标内容不同也覆盖（覆盖前备份）"
+            )
+            sub.add_argument("--dry-run", action="store_true", help="只列出动作，不写文件")
+        else:
+            sub.add_argument("--dry-run", action="store_true", help="只列出动作，不写文件")
+
     serve = subparsers.add_parser(
         "serve", help="启动只读 Web 看板（默认 127.0.0.1:8787）"
     )
@@ -1468,6 +1507,45 @@ def _write_stderr_error(message: str) -> None:
     """
 
     _write_stderr_line(f"错误: {message}")
+
+
+def _run_mgmt(args: argparse.Namespace) -> int:
+    """``mgmt``：check 只读；install / capture 是显式写操作。
+
+    rc：0 一致或写入成功 / 1 有漂移 / 2 参数、manifest 或环境错误。
+    """
+
+    root = Path(args.root).expanduser() if args.root else mgmt.repo_root()
+    home = Path(args.home).expanduser() if args.home else Path.home()
+    try:
+        if args.mgmt_command == "check":
+            report = mgmt.check(
+                root,
+                home,
+                check_files_flag=not args.schedules_only,
+                check_schedules_flag=not args.files_only,
+            )
+            text = mgmt.render_json(report) if args.json else mgmt.render(report)
+            if not _write_stdout(text + "\n"):
+                return 2
+            if report.errors:
+                return 2
+            return 0 if report.ok else 1
+        files = mgmt.load_manifest(root, home)
+        if args.mgmt_command == "install":
+            actions = mgmt.install(files, home, force=args.force, dry_run=args.dry_run)
+        else:
+            actions = mgmt.capture(files, dry_run=args.dry_run)
+    except mgmt.MgmtError as exc:
+        _write_stderr_error(str(exc))
+        return 2
+
+    changed = [(action, subject) for action, subject in actions if action != "same"]
+    lines = [f"{action}: {subject}" for action, subject in changed]
+    lines.append(f"未变 {len(actions) - len(changed)} 件，动作 {len(changed)} 条")
+    if not _write_stdout("\n".join(lines) + "\n"):
+        return 2
+    return 0
 
 
 def _run_serve(args: argparse.Namespace) -> int:
@@ -3766,6 +3844,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "merge-train":
         return _run_merge_train(args)
+
+    if args.command == "mgmt":
+        return _run_mgmt(args)
 
     if args.command == "serve":
         return _run_serve(args)

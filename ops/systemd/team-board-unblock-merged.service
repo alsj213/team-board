@@ -1,0 +1,11 @@
+[Unit]
+Description=team-board unblock cards whose cited PRs are merged
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/liu/project/team-board
+Environment=PATH=/home/liu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy PYTHONPATH=/home/liu/project/team-board/src /home/liu/project/team-board/.venv/bin/python -m team_board.unblockmerged --apply
+Nice=10

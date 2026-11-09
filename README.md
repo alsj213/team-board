@@ -22,11 +22,11 @@ team-board member engineer
 team-board export
 ```
 
-共二十六个子命令：`list` / `summary` / `member` / `export` / `health` / `branch-audit` / `merge-audit` /
+共二十七个子命令：`list` / `summary` / `member` / `export` / `health` / `branch-audit` / `merge-audit` /
 `commit-audit` / `merge-record` / `body-audit` / `gate` / `output-audit` / `push-guard` /
 `pr-claim-audit` / `path-claim-audit` / `path-claim-check` / `merge-card` / `card-audit` /
 `handoff-check` / `tip-broadcast` / `pr-review-head-audit` / `evidence` / `merge-owner-audit` /
-`verify-batch` / `merge-train` / `serve`
+`verify-batch` / `merge-train` / `mgmt` / `serve`
 （`serve` 见下面「Web 看板」一节，`branch-audit` 见「分支稽核」一节，`merge-audit` /
 `merge-record` 见「合并认账稽核」一节，`commit-audit` 见「提交身份稽核」一节，
 `pr-claim-audit` 见「PR 认领唯一性稽核」一节，`path-claim-audit` / `path-claim-check`
@@ -1722,6 +1722,32 @@ cards: 3 张有成本/返工（按分钟降序）
 退出码：`0` 正常（空库也是 0）/ `2` 参数或环境错误（`--since-days` 非法、
 `--now` 越界、库不存在 / 不是合法 SQLite、缺 `tasks` / `task_runs` /
 `task_events` 任一张表、读表失败；rc2 时 stdout 为空、stderr 恰一行 `错误: …`）。
+
+## 管理面（mgmt）
+
+`ops/` 是运维规则与看护脚本的唯一源。运行中的副本在 `~/.hermes/profiles/<profile>/`
+与 `~/.config/systemd/user/`，由 `mgmt install` 写入，`mgmt check` 比对。
+
+```bash
+team-board mgmt check [--files-only|--schedules-only] [--json] [--root PATH] [--home PATH]
+team-board mgmt install [--dry-run] [--force] [--root PATH] [--home PATH]
+team-board mgmt capture [--dry-run] [--root PATH] [--home PATH]
+```
+
+`check` 做两类判定：
+
+- **文件**：`ops/manifest.json` 里每条映射的源与安装件字节、权限是否一致。
+  `ops/scripts/` 与 `ops/systemd/` 下没登记的文件直接 rc2，防止加了脚本忘了安装。
+- **计划**：`ops/schedules.json` 与真实 crontab、systemd timer、hermes
+  `jobs.json` 对照。多一条、少一条、周期/脚本/参数/enabled 变了都报漂移。
+
+`install` 默认拒绝覆盖内容不同的安装件；`--force` 覆盖前备份到
+`~/.cache/team-board/mgmt-backup/<UTC>/`。`capture` 反向把线上内容写回仓库，
+供 ops 改完 playbook 后落盘。
+
+退出码：`0` 一致或写入成功 / `1` 有漂移 / `2` manifest、参数或环境错误。
+`--root` 默认 `TEAM_BOARD_ROOT` 或从包位置反推；`--home` 默认当前用户 home。
+脚本与 systemd 的版本化边界见 `ops/README.md`。
 
 ## 通用参数
 
