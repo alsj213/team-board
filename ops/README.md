@@ -15,6 +15,7 @@ ops/
   archive/paimeng/         # 已从线上移除的 paimeng 一次性脚本（只留历史）
   manifest.json            # 源 -> 安装件映射（scripts/systemd 必须全部登记）
   schedules.json           # crontab 看护件、systemd timer、hermes cron 任务清单
+  hooks.json               # 角色硬边界 hook 的注册期望（config.yaml 只查这几项）
 ```
 
 ## 命令
@@ -57,12 +58,16 @@ hermes cron）各跑各的：
   `timer-extra`。
 - `hermes_jobs`：按 profile + name 比对 schedule/script/enabled；多一个任务报
   `hermes-job-extra`。
+- `hooks.json`：只查角色硬边界 hook 还注册着（脚本名、matcher、`fail_closed: true`）。
+  `config.yaml` 整份是运行时配置，不入库；hook 被删或被改成 fail-open 会报
+  `hook-missing` / `hook-drift`。
 
 ## 不管什么
 
 - `SOUL.md` 章程：hatch 维护，改动走 `charter-log.md`；不在本目录。
 - `skills/`、`memories/`、workspace 日志与 `guard/*.ok`：运行时状态，不版本化。
-- `config.yaml` / `auth.json`：含机器身份或密钥，不入库。
+- `config.yaml` / `auth.json`：含机器身份或密钥，不入库；`hooks.json` 只核对 hook
+  注册，不接管整份配置。
 
 ## 2026-11-09 迁移记录
 

@@ -43,6 +43,7 @@ def make_repo(tmp_path: Path) -> tuple[Path, Path]:
     (root / "ops" / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
+    (root / "ops" / "hooks.json").write_text('{"hooks": []}', encoding="utf-8")
     return root, home
 
 
@@ -109,6 +110,8 @@ def test_repo_artifacts_are_loadable(tmp_path: Path) -> None:
     assert schedules["crontab"]
     assert schedules["systemd_timers"]
     assert schedules["hermes_jobs"]
+    hooks = mgmt.load_hooks(root)
+    assert [row["script"] for row in hooks] == ["block_delivery.py"]
 
 
 class TestManifest:
@@ -295,6 +298,63 @@ class TestSchedules:
             root, home, check_files_flag=False, crontab_text=GOOD_CRONTAB.splitlines()[1]
         )
         assert [item.code for item in report.schedule_drifts] == ["timer-extra"]
+
+
+class TestHooks:
+    def _root(self, tmp_path: Path) -> tuple[Path, Path]:
+        root, home = make_repo(tmp_path)
+        (root / "ops" / "hooks.json").write_text(
+            json.dumps(
+                {
+                    "hooks": [
+                        {
+                            "profile": "paimeng",
+                            "event": "pre_tool_call",
+                            "matcher": "^terminal$",
+                            "script": "block_delivery.py",
+                            "fail_closed": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return root, home
+
+    def test_registered_hook_passes(self, tmp_path: Path) -> None:
+        root, home = self._root(tmp_path)
+        config = home / ".hermes" / "profiles" / "paimeng" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text(
+            "hooks:\n  pre_tool_call:\n    - matcher: \"^terminal$\"\n"
+            "      command: \"python3 /x/block_delivery.py\"\n"
+            "      fail_closed: true\n",
+            encoding="utf-8",
+        )
+        assert mgmt.check_hooks(mgmt.load_hooks(root), home) == ()
+
+    def test_missing_hook_is_reported(self, tmp_path: Path) -> None:
+        root, home = self._root(tmp_path)
+        config = home / ".hermes" / "profiles" / "paimeng" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("hooks: {}\n", encoding="utf-8")
+        assert [item.code for item in mgmt.check_hooks(mgmt.load_hooks(root), home)] == [
+            "hook-missing"
+        ]
+
+    def test_fail_open_hook_is_reported(self, tmp_path: Path) -> None:
+        root, home = self._root(tmp_path)
+        config = home / ".hermes" / "profiles" / "paimeng" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text(
+            "hooks:\n  pre_tool_call:\n    - matcher: \"^terminal$\"\n"
+            "      command: \"python3 /x/block_delivery.py\"\n"
+            "      fail_closed: false\n",
+            encoding="utf-8",
+        )
+        assert [item.code for item in mgmt.check_hooks(mgmt.load_hooks(root), home)] == [
+            "hook-drift"
+        ]
 
 
 class TestReport:
