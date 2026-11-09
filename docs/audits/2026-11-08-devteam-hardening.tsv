@@ -18,3 +18,10 @@ ts	phase	decision	why	evidence	result
 2026-11-08T07:49:51Z	ship	PR #124 把 f1689e3 合入 main 28986c7；tests workflow 8/8 绿，refresh job 在非标记评论上 skipped	最终交付；refresh 只在含 REVIEW-VERDICT 的评论上执行	PR #124; 28986c7; check-runs 8 success	VERIFIED
 2026-11-08T07:49:51Z	verify	以最终全量 2770 passed, 2 skipped 为准；早先 90 passed 只是局部集合，不作为总证据	跨模型审查指出局部数字不可复现，补一条总证据	pytest -q exit 0; 2770 passed, 2 skipped	VERIFIED
 2026-11-08T07:49:51Z	review	cross-model 审查后补 checks:read / statuses:read 与评论者 OWNER/MEMBER/COLLABORATOR 限制；profile 改动路径明确为 ~/.hermes	gh pr checks 需要 checks:read；issue_comment 可触发 actions:write，需限制评论者	PR #125; .github/workflows/review-markers-refresh.yml	open
+2026-11-09T14:07:16Z	frame	管理面迁移拆成四个可验证单元：ops/ 入库、manifest 完整性、三套调度清单、脚本去重；hook 注册单列一单元	整体迁移是审计遗留项，一次做完无法逐项验证	docs/audits/2026-11-08-devteam-hardening.tsv:2; ops/manifest.json	VERIFIED
+2026-11-09T14:07:16Z	design	ops/ 为唯一源，安装件由 mgmt install 写；config.yaml 与 SOUL 不整份入库，只核对 hook 注册	整份运行时配置会随 Hermes 版本改写，必然假漂移；SOUL 归 hatch	ops/README.md; src/team_board/mgmt.py	VERIFIED
+2026-11-09T14:07:16Z	unit	paimeng 21 个历史脚本与归档副本逐字节比对一致后移出线上；两个停用的重复 hermes 任务删除	没有启用的 cron 任务或 crontab 行引用它们；8 个是 ops 脚本旧副本	ops/archive/paimeng/scripts; hermes -p paimeng cron list	VERIFIED
+2026-11-09T14:07:16Z	unit	mgmt check 增加安装目录多余脚本与 hook 注册两类漂移；hooks.json 只核对 script/matcher/fail_closed	脚本副本藏起来就绕过了唯一源；paimeng 的 terminal 硬边界必须可见	src/team_board/mgmt.py unmanaged_scripts/check_hooks; tests 27 passed	VERIFIED
+2026-11-09T14:07:16Z	verify	真实主机 mgmt check 文件 38 件、计划 0 漂移；guard_health selftest 12 件、--strict rc0	在安装后的真实路径复核，不只看单测	team-board mgmt check rc0; guard/guard_health.py --selftest rc0	VERIFIED
+2026-11-09T14:07:16Z	ship	PR #126 合并 53bc541，main push CI success；安装件对齐、21 个脚本与 2 个任务已清理、mgmt_plane 日检已入 crontab	管理面迁移的交付物是仓库与主机的同一状态	PR #126; 53bc541; gh run list main success	VERIFIED
+2026-11-09T14:07:16Z	state	hook 注册校验在 PR #127 提交，单测 27 passed、真实主机 check rc0；合并待办	最后一个单元，不混进已合并的 #126	ops/hooks.json; tests/unit/test_mgmt.py TestHooks	open

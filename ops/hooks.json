@@ -1,0 +1,11 @@
+{
+  "hooks": [
+    {
+      "profile": "paimeng",
+      "event": "pre_tool_call",
+      "matcher": "^terminal$",
+      "script": "block_delivery.py",
+      "fail_closed": true
+    }
+  ]
+}

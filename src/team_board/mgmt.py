@@ -33,6 +33,7 @@ __all__ = [
     "check",
     "check_files",
     "install",
+    "load_hooks",
     "load_manifest",
     "load_schedules",
     "parse_crontab",
@@ -44,6 +45,7 @@ __all__ = [
 
 MANIFEST_PATH = "ops/manifest.json"
 SCHEDULES_PATH = "ops/schedules.json"
+HOOKS_PATH = "ops/hooks.json"
 SCRIPTS_DIR = "ops/scripts"
 SYSTEMD_DIR = "ops/systemd"
 
@@ -204,6 +206,56 @@ def load_schedules(root: Path) -> dict:
     if not isinstance(payload["hermes_jobs"], dict):
         raise MgmtError(f"{path}: hermes_jobs 必须是对象")
     return payload
+
+
+def load_hooks(root: Path) -> list[dict]:
+    """读 ``ops/hooks.json``：角色硬边界 hook 的注册期望。"""
+
+    path = root / HOOKS_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MgmtError(f"读不到 {path}: {exc}") from exc
+    except ValueError as exc:
+        raise MgmtError(f"{path} 不是合法 JSON: {exc}") from exc
+    hooks = payload.get("hooks") if isinstance(payload, dict) else None
+    if not isinstance(hooks, list):
+        raise MgmtError(f"{path}: hooks 必须是数组")
+    for index, row in enumerate(hooks):
+        if not isinstance(row, dict) or not isinstance(row.get("profile"), str):
+            raise MgmtError(f"{path}: hooks[{index}] 缺 profile")
+        for key in ("event", "script"):
+            if not isinstance(row.get(key), str):
+                raise MgmtError(f"{path}: hooks[{index}] 缺 {key}")
+    return hooks
+
+
+def check_hooks(hooks: list[dict], home: Path) -> tuple[Drift, ...]:
+    """``config.yaml`` 是运行时配置，不整份版本化；只查硬边界 hook 还注册着。
+
+    文本级匹配足够发现「hook 被删/被改成 fail_closed: false」，不做 YAML 解析，
+    避免为一个字段引入依赖。
+    """
+
+    drifts: list[Drift] = []
+    for row in hooks:
+        profile = row["profile"]
+        path = home / ".hermes" / "profiles" / profile / "config.yaml"
+        subject = f"{profile}/{row['event']}:{row['script']}"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            drifts.append(Drift("hook-config-missing", subject, f"读不到 {path}"))
+            continue
+        if row["script"] not in text:
+            drifts.append(Drift("hook-missing", subject, "config.yaml 里没有这个脚本"))
+            continue
+        if row.get("fail_closed") and not re.search(r"fail_closed:\s*true", text):
+            drifts.append(Drift("hook-drift", subject, "fail_closed 不是 true"))
+        matcher = row.get("matcher")
+        if matcher and f'matcher: {matcher}' not in text and f'matcher: "{matcher}"' not in text:
+            drifts.append(Drift("hook-drift", subject, f"matcher 不是 {matcher}"))
+    return tuple(drifts)
 
 
 def _same_content(left: Path, right: Path) -> bool:
@@ -530,6 +582,7 @@ def check(
         schedule_drifts.extend(hermes_drifts)
         errors.extend(hermes_errors)
         schedule_drifts.extend(_systemd_drifts(home, schedules["systemd_timers"]))
+        schedule_drifts.extend(check_hooks(load_hooks(root), home))
 
     return CheckReport(
         root=root,
